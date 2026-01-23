@@ -1,0 +1,56 @@
+name: SEA
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch>=2.1.0
+  - pytorch-cuda=12.1
+  - pip
+  - numpy>=1.24.0
+  - scipy>=1.10.0
+  - scikit-image>=0.21.0
+  - scikit-learn>=1.3.0
+  - matplotlib>=3.7.0
+  - pandas>=2.0.0
+  - tifffile>=2023.4.12
+  - opencv>=4.8.0
+  - pillow>=10.0.0
+  - imagecodecs>=2023.1.23
+  - pip:
+    # Computer Vision & Image Processing
+    - kornia>=0.7.0
+    - kornia-moons>=0.2.8
+    
+    # Deep Learning Models
+    # Note: StarDist requires csbdeep>=0.8.0, but N2V requires csbdeep<0.8.0
+    # Solution: Install StarDist first, then N2V separately after environment creation
+    # See README for post-installation steps
+    - stardist>=0.9.0
+    - csbdeep>=0.8.0
+    # N2V will be installed separately due to csbdeep version conflict
+    # Run: pip install n2v --no-deps  (after environment creation)
+    # Note: CARE may require separate installation or use csbdeep
+    # Note: SuperPoint/SuperGlue are available via Kornia or custom repos
+    # See README for installation instructions
+    
+    # Image Registration
+    - imageio>=2.31.0
+    - imageio-ffmpeg>=0.4.9
+    
+    # LLM Integration (for high-level reasoning)
+    - openai>=1.3.0
+    - anthropic>=0.7.0
+    
+    # Utilities
+    - tqdm>=4.66.0
+    - pyyaml>=6.0.1
+    - loguru>=0.7.2
+    - psutil>=5.9.6
+    
+    # Data Analysis
+    - seaborn>=0.13.0
+    - plotly>=5.18.0
+
