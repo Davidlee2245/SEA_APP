@@ -1,0 +1,63 @@
+# Configuration file for SEA Exosome Analysis Pipeline
+
+# Hardware Configuration
+hardware:
+  device: "cuda"  # Use "cuda" for GPU, "cpu" for CPU fallback
+  gpu_id: 0
+  batch_size: 4
+  num_workers: 4
+
+# Paths
+paths:
+  input_root: "data/input"
+  output_root: "data/output"
+  models_dir: "models"
+  logs_dir: "logs"
+
+# Phase 1: Inspector Configuration
+inspector:
+  snr_threshold: 10.0  # Minimum SNR for acceptable quality
+  denoise_threshold: 5.0  # SNR below which denoising is mandatory
+  denoise_method: "n2v"  # Options: "n2v", "care"
+  n2v_patch_shape: [64, 64]
+  n2v_num_patches: 100
+  anchor_channel_method: "sharpness"  # Method to detect anchor channel
+
+# Phase 2: Aligner Configuration
+aligner:
+  feature_detector: "superpoint"  # Options: "superpoint", "sift"
+  matcher: "superglue"  # Options: "superglue", "bf"
+  initial_transform: "affine"  # Start with affine transformation
+  fallback_transform: "tps"  # Use TPS if affine residuals are high
+  residual_threshold: 2.0  # Pixel error threshold for switching to TPS
+  max_features: 1024
+  match_threshold: 0.7
+  llm_qa_enabled: true  # Enable LLM-based visual QA
+
+# Phase 3: Analyst Configuration
+analyst:
+  detection_model: "stardist"  # Options: "stardist", "yolov8"
+  stardist_model_type: "2D_versatile_fluo"  # Pre-trained model
+  min_object_size: 3  # Minimum pixel area for exosome detection
+  max_object_size: 1000  # Maximum pixel area
+  intensity_threshold: 0.1  # Relative intensity threshold (0-1)
+  morphology_filter: true
+  output_format: "csv"  # Options: "csv", "json"
+  llm_analysis_enabled: true  # Enable LLM-based statistical analysis
+
+# LLM Configuration (for high-level reasoning)
+llm:
+  provider: "openai"  # Options: "openai", "anthropic", "local"
+  model: "gpt-4-vision-preview"  # For visual QA
+  analysis_model: "gpt-4"  # For statistical analysis
+  api_key_env: "OPENAI_API_KEY"  # Environment variable name
+  temperature: 0.3
+  max_tokens: 2000
+
+# Logging
+logging:
+  level: "INFO"
+  format: "{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
+  rotation: "10 MB"
+  retention: "7 days"
+
