@@ -17,8 +17,8 @@ paths:
 # Phase 1: Inspector Configuration
 inspector:
   snr_threshold: 10.0  # Minimum SNR for acceptable quality
-  denoise_threshold: 5.0  # SNR below which denoising is mandatory
-  denoise_method: "n2v"  # Options: "n2v", "care"
+  denoise_threshold: 5.0  # SNR below which denoising is mandatory (disabled if denoise_method is "none")
+  denoise_method: "none"  # Options: "none", "n2v", "care" - set to "none" to disable denoising
   n2v_patch_shape: [64, 64]
   n2v_num_patches: 100
   anchor_channel_method: "sharpness"  # Method to detect anchor channel
@@ -32,24 +32,27 @@ aligner:
   residual_threshold: 2.0  # Pixel error threshold for switching to TPS
   max_features: 1024
   match_threshold: 0.7
+  min_matches: 4  # Minimum number of matches required for transform (lower = more lenient, but less robust)
   llm_qa_enabled: true  # Enable LLM-based visual QA
 
 # Phase 3: Analyst Configuration
 analyst:
   detection_model: "stardist"  # Options: "stardist", "yolov8"
   stardist_model_type: "2D_versatile_fluo"  # Pre-trained model
-  min_object_size: 3  # Minimum pixel area for exosome detection
-  max_object_size: 1000  # Maximum pixel area
-  intensity_threshold: 0.1  # Relative intensity threshold (0-1)
-  morphology_filter: true
+  stardist_prob_thresh: 0.3  # Probability threshold for StarDist (lower = more detections, default ~0.5)
+  min_object_size: 1  # Minimum pixel area for exosome detection (lowered from 3)
+  max_object_size: 5000  # Maximum pixel area (increased from 1000)
+  intensity_threshold: 0.05  # Relative intensity threshold (0-1, lowered from 0.1)
+  morphology_filter: false  # Temporarily disable for testing
   output_format: "csv"  # Options: "csv", "json"
   llm_analysis_enabled: true  # Enable LLM-based statistical analysis
+  colocalization_distance: 10.0  # Maximum distance for colocalization (pixels) - increased for chromatic aberration
 
 # LLM Configuration (for high-level reasoning)
 llm:
   provider: "openai"  # Options: "openai", "anthropic", "local"
-  model: "gpt-4-vision-preview"  # For visual QA
-  analysis_model: "gpt-4"  # For statistical analysis
+  model: "gpt-4o"  # For visual QA (updated from deprecated gpt-4-vision-preview)
+  analysis_model: "gpt-4o-mini"  # For statistical analysis (faster and cheaper)
   api_key_env: "OPENAI_API_KEY"  # Environment variable name
   temperature: 0.3
   max_tokens: 2000

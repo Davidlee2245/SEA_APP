@@ -29,6 +29,15 @@ def load_config(config_path: Path = None) -> Dict[str, Any]:
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
         logger.info(f"Loaded configuration from {config_path}")
+
+        # Allow runtime device override (set by api_server_extended.py when
+        # CUDA is not available, so agents fall back to CPU automatically).
+        import os
+        device_override = os.environ.get('SEA_DEVICE_OVERRIDE')
+        if device_override:
+            config.setdefault('hardware', {})['device'] = device_override
+            logger.warning(f"Device overridden to '{device_override}' via SEA_DEVICE_OVERRIDE")
+
         return config
     except Exception as e:
         logger.error(f"Failed to load config: {e}")

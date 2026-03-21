@@ -7,18 +7,20 @@ import tifffile
 from pathlib import Path
 from typing import Optional, Tuple
 from loguru import logger
+from PIL import Image
 
 
 def save_image(image: np.ndarray, output_path: Path, 
-               bit_depth: int = 16, normalize: bool = True) -> bool:
+               bit_depth: int = 8, normalize: bool = True, format: str = 'png') -> bool:
     """
-    Save image as TIFF preserving bit depth.
+    Save image as PNG (default) or TIFF.
     
     Args:
         image: Image array
         output_path: Output file path
         bit_depth: Target bit depth (8, 16, or 32)
         normalize: Whether to normalize to [0, 1] before conversion
+        format: Output format ('png' or 'tif')
         
     Returns:
         bool: True if successful
@@ -44,8 +46,33 @@ def save_image(image: np.ndarray, output_path: Path,
         else:
             raise ValueError(f"Unsupported bit depth: {bit_depth}")
         
-        tifffile.imwrite(str(output_path), img_out)
-        logger.debug(f"Saved image: {output_path}")
+        # Save based on format
+        if format.lower() == 'png':
+            # PNG: Use PIL for better compatibility
+            # Convert to 8-bit for PNG (PNG supports 16-bit but browsers don't)
+            if img_out.dtype == np.uint16:
+                # Normalize 16-bit to 8-bit for web compatibility
+                img_8bit = (img_out / 256).astype(np.uint8)
+            elif img_out.dtype == np.float32:
+                img_8bit = (np.clip(img_out, 0, 1) * 255).astype(np.uint8)
+            else:
+                img_8bit = img_out
+            
+            # Handle grayscale vs RGB
+            if len(img_8bit.shape) == 2:
+                pil_img = Image.fromarray(img_8bit, mode='L')
+            elif len(img_8bit.shape) == 3:
+                pil_img = Image.fromarray(img_8bit, mode='RGB')
+            else:
+                raise ValueError(f"Unsupported image shape: {img_8bit.shape}")
+            
+            pil_img.save(str(output_path), 'PNG', optimize=True)
+            logger.debug(f"Saved PNG image: {output_path}")
+        else:
+            # TIFF: Use tifffile for preserving bit depth
+            tifffile.imwrite(str(output_path), img_out)
+            logger.debug(f"Saved TIFF image: {output_path}")
+        
         return True
         
     except Exception as e:

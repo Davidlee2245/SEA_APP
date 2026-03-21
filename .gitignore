@@ -1,4 +1,4 @@
-# Python
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
@@ -6,7 +6,6 @@ __pycache__/
 .Python
 build/
 develop-eggs/
-dist/
 downloads/
 eggs/
 .eggs/
@@ -20,50 +19,57 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual environments
+# ── Virtual environments ──────────────────────────────────────────────────────
 venv/
 env/
 ENV/
-
-# Conda
 .conda/
 
-# IDE
+# ── Node / Electron ───────────────────────────────────────────────────────────
+node_modules/
+frontend/dist/
+electron/dist-electron/
+
+# ── Large model weights (copy manually to checkpoints/pretrained/) ────────────
+checkpoints/pretrained/*.pth
+checkpoints/pretrained/*.pt
+checkpoints/pretrained/*.bin
+checkpoints/pretrained/*.onnx
+
+# ── User data (large, machine-specific — not committed) ──────────────────────
+data/input/*
+data/output/
+data/processing/
+data/cache/
+data/label/
+!data/input/.gitkeep
+
+# ── Runtime artefacts ─────────────────────────────────────────────────────────
+previews/
+outputs/
+logs/
+*.log
+models/*
+!models/.gitkeep
+
+# ── OS / IDE ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# Data
-data/input/*
-!data/input/.gitkeep
-data/output/
-*.tif
-*.tiff
-
-# Models
-models/*
-!models/.gitkeep
-
-# Logs
-logs/
-*.log
-
-# Jupyter
-.ipynb_checkpoints/
-*.ipynb
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Temporary files
-*.tmp
-*.temp
-*.bak
-
-# API keys
+# ── Secrets ───────────────────────────────────────────────────────────────────
 .env
 *.key
 
+# ── Binary / generated ────────────────────────────────────────────────────────
+*.tif
+*.tiff
+*.tmp
+*.temp
+*.bak
+.ipynb_checkpoints/
+*.ipynb

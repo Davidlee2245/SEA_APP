@@ -1,0 +1,142 @@
+/* Before/After View Styles */
+
+.before-after-view.empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 300px;
+  color: #95a5a6;
+}
+
+.frame-info {
+  display: flex;
+  gap: 1rem;
+  margin: 1.5rem 0;
+  flex-wrap: wrap;
+}
+
+.info-badge {
+  padding: 0.5rem 1rem;
+  background: #ecf0f1;
+  border-radius: 4px;
+  font-size: 0.9rem;
+}
+
+.info-badge strong {
+  color: #2c3e50;
+  margin-right: 0.5rem;
+}
+
+/* Image Comparison Layout */
+.image-comparison {
+  display: flex;
+  align-items: center;
+  gap: 2rem;
+  margin: 2rem 0;
+}
+
+.image-container {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.image-container h4 {
+  margin: 0 0 1rem 0;
+  color: #34495e;
+  text-align: center;
+}
+
+.image-wrapper {
+  position: relative;
+  width: 100%;
+  background: #f8f9fa;
+  border: 2px solid #e0e0e0;
+  border-radius: 8px;
+  overflow: hidden;
+  min-height: 300px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.image-wrapper img {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.image-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem;
+  text-align: center;
+  color: #95a5a6;
+}
+
+.image-placeholder.error {
+  color: #e74c3c;
+}
+
+.image-placeholder code {
+  margin-top: 1rem;
+  padding: 0.5rem;
+  background: #ecf0f1;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  word-break: break-all;
+}
+
+/* Comparison Arrow */
+.comparison-arrow {
+  flex-shrink: 0;
+  color: #3498db;
+  font-size: 2rem;
+}
+
+/* Quick Stats */
+.quick-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1rem;
+  margin-top: 2rem;
+  padding: 1.5rem;
+  background: #f8f9fa;
+  border-radius: 8px;
+}
+
+.stat {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.8rem;
+  background: white;
+  border-radius: 4px;
+  border-left: 4px solid #3498db;
+}
+
+.stat-label {
+  font-weight: 500;
+  color: #34495e;
+}
+
+.stat-value {
+  font-weight: bold;
+  color: #2c3e50;
+  font-size: 1.1rem;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .image-comparison {
+    flex-direction: column;
+  }
+
+  .comparison-arrow {
+    transform: rotate(90deg);
+  }
+}
+
+

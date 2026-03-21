@@ -1,0 +1,257 @@
+/* Movement Quantification Styles */
+
+.movement-quantification {
+  width: 100%;
+}
+
+/* Summary Stats */
+.summary-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1.5rem;
+  margin-bottom: 2rem;
+}
+
+.stat-card {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  padding: 1.5rem;
+  border-radius: 8px;
+  text-align: center;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+.stat-card h4 {
+  margin: 0 0 0.5rem 0;
+  font-size: 0.9rem;
+  font-weight: 500;
+  opacity: 0.9;
+}
+
+.stat-card .stat-value {
+  font-size: 2rem;
+  font-weight: bold;
+  margin: 0;
+}
+
+/* Table Controls */
+.table-controls {
+  margin-bottom: 1rem;
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+}
+
+.table-controls label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.9rem;
+  color: #34495e;
+}
+
+.table-controls select {
+  padding: 0.5rem;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  font-size: 0.9rem;
+}
+
+/* Movement Table */
+.movement-table-container {
+  overflow-x: auto;
+  border-radius: 8px;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.movement-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: white;
+}
+
+.movement-table thead {
+  background: #34495e;
+  color: white;
+}
+
+.movement-table th {
+  padding: 1rem;
+  text-align: left;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.movement-table th:hover {
+  background: #2c3e50;
+}
+
+.movement-table tbody tr {
+  border-bottom: 1px solid #ecf0f1;
+  transition: background 0.2s ease;
+}
+
+.movement-table tbody tr:hover {
+  background: #f8f9fa;
+}
+
+.movement-table tbody tr.low {
+  border-left: 4px solid #27ae60;
+}
+
+.movement-table tbody tr.medium {
+  border-left: 4px solid #f39c12;
+}
+
+.movement-table tbody tr.high {
+  border-left: 4px solid #e74c3c;
+}
+
+.movement-table td {
+  padding: 1rem;
+  color: #2c3e50;
+}
+
+.frame-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.frame-id {
+  font-weight: 600;
+  color: #2c3e50;
+}
+
+.channel-name {
+  font-size: 0.85rem;
+  color: #7f8c8d;
+}
+
+.transform-badge {
+  display: inline-block;
+  padding: 0.25rem 0.6rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.transform-badge.affine {
+  background: #e8f5e9;
+  color: #2e7d32;
+}
+
+.transform-badge.tps {
+  background: #fff3e0;
+  color: #e65100;
+}
+
+.transform-badge.identity {
+  background: #eceff1;
+  color: #455a64;
+}
+
+.numeric {
+  text-align: right;
+  font-family: 'Courier New', monospace;
+}
+
+/* Magnitude Cell with Bar */
+.magnitude-cell {
+  min-width: 200px;
+}
+
+.magnitude-bar-container {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.magnitude-bar {
+  height: 24px;
+  border-radius: 4px;
+  transition: width 0.3s ease;
+  min-width: 2px;
+}
+
+.magnitude-bar.low {
+  background: linear-gradient(90deg, #27ae60, #2ecc71);
+}
+
+.magnitude-bar.medium {
+  background: linear-gradient(90deg, #f39c12, #f1c40f);
+}
+
+.magnitude-bar.high {
+  background: linear-gradient(90deg, #e74c3c, #c0392b);
+}
+
+.magnitude-value {
+  font-weight: 600;
+  font-family: 'Courier New', monospace;
+  white-space: nowrap;
+}
+
+/* Legend */
+.legend {
+  margin-top: 2rem;
+  padding: 1rem;
+  background: #f8f9fa;
+  border-radius: 8px;
+}
+
+.legend h4 {
+  margin: 0 0 1rem 0;
+  color: #34495e;
+  font-size: 0.9rem;
+}
+
+.legend-items {
+  display: flex;
+  gap: 2rem;
+  flex-wrap: wrap;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  color: #7f8c8d;
+}
+
+.legend-color {
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+}
+
+.legend-color.low {
+  background: #27ae60;
+}
+
+.legend-color.medium {
+  background: #f39c12;
+}
+
+.legend-color.high {
+  background: #e74c3c;
+}
+
+/* Responsive */
+@media (max-width: 1024px) {
+  .movement-table {
+    font-size: 0.85rem;
+  }
+
+  .movement-table th,
+  .movement-table td {
+    padding: 0.75rem 0.5rem;
+  }
+}
+
+

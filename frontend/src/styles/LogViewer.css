@@ -1,0 +1,79 @@
+.log-viewer {
+  margin-top: 2rem;
+}
+
+.log-viewer-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1rem;
+}
+
+.log-viewer-header h3 {
+  margin: 0;
+  color: #2c3e50;
+}
+
+.log-controls {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+}
+
+.log-controls label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.9rem;
+  color: #7f8c8d;
+}
+
+.log-controls button {
+  padding: 0.4rem 0.8rem;
+  background: #3498db;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.log-controls button:hover {
+  background: #2980b9;
+}
+
+.log-container {
+  height: 400px;
+  overflow-y: auto;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  padding: 1rem;
+  border-radius: 4px;
+  font-family: 'Courier New', monospace;
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+.log-line {
+  padding: 0.2rem 0;
+  word-wrap: break-word;
+}
+
+.log-container::-webkit-scrollbar {
+  width: 8px;
+}
+
+.log-container::-webkit-scrollbar-track {
+  background: #2d2d2d;
+}
+
+.log-container::-webkit-scrollbar-thumb {
+  background: #555;
+  border-radius: 4px;
+}
+
+.log-container::-webkit-scrollbar-thumb:hover {
+  background: #777;
+}
+
+
