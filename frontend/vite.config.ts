@@ -13,6 +13,7 @@ export default defineConfig({
       },
     },
   },
+  base: './',          // relative paths so file:// protocol works in Electron
   build: {
     outDir: 'dist',
     sourcemap: true,
