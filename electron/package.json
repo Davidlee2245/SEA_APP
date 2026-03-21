@@ -2,6 +2,11 @@
   "name": "sea-exosome-analysis",
   "version": "1.0.0",
   "description": "SEA — Semiautomated Exosome Analysis Desktop App",
+  "author": "SEA Lab",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Davidlee2245/SEA_APP.git"
+  },
   "main": "main.js",
   "scripts": {
     "start":      "electron .",
