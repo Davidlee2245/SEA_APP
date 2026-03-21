@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';" />
+  <title>SEA — First-Time Setup</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 13px;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ── */
+    .header {
+      background: linear-gradient(135deg, #16213e 0%, #0f3460 100%);
+      padding: 18px 24px 14px;
+      border-bottom: 1px solid #0f3460;
+    }
+    .header h1 {
+      font-size: 18px;
+      font-weight: 600;
+      color: #e94560;
+      letter-spacing: 0.5px;
+    }
+    .header p {
+      margin-top: 4px;
+      font-size: 12px;
+      color: #8899aa;
+    }
+
+    /* ── Body ── */
+    .body {
+      flex: 1;
+      padding: 20px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      overflow-y: auto;
+    }
+
+    /* ── Field ── */
+    .field label {
+      display: block;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: #7fa8c9;
+      margin-bottom: 6px;
+    }
+    .field .hint {
+      font-size: 11px;
+      color: #556677;
+      margin-bottom: 6px;
+    }
+    .input-row {
+      display: flex;
+      gap: 6px;
+    }
+    .input-row input {
+      flex: 1;
+      padding: 7px 10px;
+      background: #0d0d1a;
+      border: 1px solid #2a3a4a;
+      border-radius: 4px;
+      color: #c8d8e8;
+      font-size: 12px;
+      font-family: 'Cascadia Code', 'Consolas', monospace;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .input-row input:focus {
+      border-color: #e94560;
+    }
+    .input-row input.valid   { border-color: #2ecc71; }
+    .input-row input.invalid { border-color: #e74c3c; }
+
+    .browse-btn {
+      padding: 7px 14px;
+      background: #0f3460;
+      border: 1px solid #1a4a80;
+      border-radius: 4px;
+      color: #90b8d8;
+      font-size: 12px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.15s, color 0.15s;
+    }
+    .browse-btn:hover {
+      background: #1a5080;
+      color: #c8e0f8;
+    }
+
+    /* ── Validation message ── */
+    .validation {
+      font-size: 11px;
+      margin-top: 4px;
+      min-height: 14px;
+    }
+    .validation.ok  { color: #2ecc71; }
+    .validation.err { color: #e74c3c; }
+
+    /* ── Divider ── */
+    .divider {
+      border: none;
+      border-top: 1px solid #1e2e3e;
+    }
+
+    /* ── Footer ── */
+    .footer {
+      padding: 14px 24px;
+      border-top: 1px solid #1e2e3e;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: #111122;
+    }
+    .status-msg {
+      font-size: 11px;
+      color: #556677;
+    }
+    .status-msg.loading { color: #f39c12; }
+    .status-msg.error   { color: #e74c3c; }
+
+    .launch-btn {
+      padding: 9px 22px;
+      background: #e94560;
+      border: none;
+      border-radius: 4px;
+      color: #fff;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s, opacity 0.15s;
+    }
+    .launch-btn:hover:not(:disabled) { background: #c73650; }
+    .launch-btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    /* ── Spinner ── */
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner {
+      display: inline-block;
+      width: 12px; height: 12px;
+      border: 2px solid #f39c12;
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      margin-right: 6px;
+      vertical-align: middle;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <h1>🔬 SEA — First-Time Setup</h1>
+    <p>Configure your Python environment to get started. This is saved and won't be asked again.</p>
+  </div>
+
+  <div class="body">
+
+    <!-- Python Executable -->
+    <div class="field" id="field-python">
+      <label>Python Executable *</label>
+      <div class="hint">
+        Point to the <code>python</code> binary inside your SEA conda environment.<br>
+        Example: <code>/home/username/anaconda3/envs/SEA/bin/python</code><br>
+        <em>Tip: run <code>which python</code> in your terminal after activating the SEA environment to find the exact path.</em>
+      </div>
+      <div class="input-row">
+        <input type="text" id="pythonExe" placeholder="/path/to/anaconda3/envs/SEA/bin/python" spellcheck="false" />
+        <button class="browse-btn" id="browsePython">Browse…</button>
+      </div>
+      <div class="validation" id="val-python"></div>
+    </div>
+
+    <hr class="divider" />
+
+    <!-- Data Root (optional) -->
+    <div class="field" id="field-data">
+      <label>Data Root Folder <span style="font-weight:400;text-transform:none;color:#556677">(optional)</span></label>
+      <div class="hint" id="dataRootHint">
+        Where SEA stores your input images and analysis results.<br>
+        Leave blank to use the default location.
+      </div>
+      <div class="input-row">
+        <input type="text" id="dataRoot" placeholder="Leave blank for default" spellcheck="false" />
+        <button class="browse-btn" id="browseData">Browse…</button>
+      </div>
+    </div>
+
+    <hr class="divider" />
+
+    <!-- API Keys -->
+    <div class="field">
+      <label>OpenAI API Key <span style="font-weight:400;text-transform:none;color:#556677">(optional — required for LLM features)</span></label>
+      <div class="hint">
+        Used for visual QA and statistical analysis. Leave blank to disable LLM features.<br>
+        Keys are stored locally in your user profile and never transmitted except to the API.
+      </div>
+      <div class="input-row">
+        <input type="password" id="openaiKey" placeholder="sk-..." spellcheck="false" autocomplete="off" />
+      </div>
+    </div>
+
+    <div class="field">
+      <label>Anthropic API Key <span style="font-weight:400;text-transform:none;color:#556677">(optional)</span></label>
+      <div class="input-row">
+        <input type="password" id="anthropicKey" placeholder="sk-ant-..." spellcheck="false" autocomplete="off" />
+      </div>
+    </div>
+
+  </div>
+
+  <div class="footer">
+    <span class="status-msg" id="statusMsg"></span>
+    <button class="launch-btn" id="launchBtn" disabled>Launch SEA</button>
+  </div>
+
+  <script>
+    const api = window.electronAPI;
+
+    const pythonInput  = document.getElementById('pythonExe');
+    const dataInput    = document.getElementById('dataRoot');
+    const valPython    = document.getElementById('val-python');
+    const statusMsg    = document.getElementById('statusMsg');
+    const launchBtn    = document.getElementById('launchBtn');
+    const dataHint     = document.getElementById('dataRootHint');
+
+    // ── Pre-fill from saved config ────────────────────────────────────────
+
+    async function init() {
+      const [config, defaultRoot] = await Promise.all([
+        api.getConfig(),
+        api.getDefaultDataRoot(),
+      ]);
+
+      if (config.pythonExe) {
+        pythonInput.value = config.pythonExe;
+        validatePython(config.pythonExe);
+      }
+      if (config.dataRoot)     dataInput.value = config.dataRoot;
+      if (config.openaiKey)    document.getElementById('openaiKey').value    = config.openaiKey;
+      if (config.anthropicKey) document.getElementById('anthropicKey').value = config.anthropicKey;
+
+      // Update placeholder with resolved default path
+      dataInput.placeholder = `Default: ${defaultRoot}`;
+      dataHint.innerHTML =
+        `Where SEA stores your input images and analysis results.<br>` +
+        `Leave blank to use: <code style="color:#7fa8c9">${defaultRoot}</code>`;
+    }
+
+    init();
+
+    // ── Validation ───────────────────────────────────────────────────────
+
+    function validatePython(val) {
+      const trimmed = val.trim();
+      if (!trimmed) {
+        valPython.textContent = '';
+        valPython.className   = 'validation';
+        pythonInput.className = '';
+        launchBtn.disabled    = true;
+        return;
+      }
+
+      // Basic heuristic: ends with python, python3, python.exe, or pythonX.Y
+      const looksLikePython = /python[0-9.]*(\.exe)?$/i.test(trimmed);
+      if (looksLikePython) {
+        valPython.textContent = '✓ Looks good';
+        valPython.className   = 'validation ok';
+        pythonInput.className = 'valid';
+        launchBtn.disabled    = false;
+      } else {
+        valPython.textContent = 'Path should end with python, python3, or python.exe';
+        valPython.className   = 'validation err';
+        pythonInput.className = 'invalid';
+        launchBtn.disabled    = true;
+      }
+    }
+
+    pythonInput.addEventListener('input', (e) => validatePython(e.target.value));
+
+    // ── Browse buttons ────────────────────────────────────────────────────
+
+    document.getElementById('browsePython').addEventListener('click', async () => {
+      const selected = await api.selectPython();
+      if (selected) {
+        pythonInput.value = selected;
+        validatePython(selected);
+      }
+    });
+
+    document.getElementById('browseData').addEventListener('click', async () => {
+      const selected = await api.selectDataRoot();
+      if (selected) dataInput.value = selected;
+    });
+
+    // ── Launch ────────────────────────────────────────────────────────────
+
+    launchBtn.addEventListener('click', async () => {
+      const pythonExe    = pythonInput.value.trim();
+      const dataRoot     = dataInput.value.trim() || null;
+      const openaiKey    = document.getElementById('openaiKey').value.trim()    || null;
+      const anthropicKey = document.getElementById('anthropicKey').value.trim() || null;
+
+      if (!pythonExe) return;
+
+      // Disable UI while starting
+      launchBtn.disabled   = true;
+      pythonInput.disabled = true;
+      dataInput.disabled   = true;
+      document.getElementById('openaiKey').disabled    = true;
+      document.getElementById('anthropicKey').disabled = true;
+      document.getElementById('browsePython').disabled = true;
+      document.getElementById('browseData').disabled   = true;
+
+      statusMsg.innerHTML  = '<span class="spinner"></span>Starting backend… (may take 30–90 s for first run)';
+      statusMsg.className  = 'status-msg loading';
+
+      try {
+        await api.launchAfterSettings({ pythonExe, dataRoot, openaiKey, anthropicKey });
+        // If we reach here the main window opened — settings window closes itself
+      } catch (err) {
+        statusMsg.textContent = '✗ ' + (err.message || 'Unknown error. Check the console.');
+        statusMsg.className   = 'status-msg error';
+
+        // Re-enable UI so user can fix the path
+        launchBtn.disabled   = false;
+        pythonInput.disabled = false;
+        dataInput.disabled   = false;
+        document.getElementById('openaiKey').disabled    = false;
+        document.getElementById('anthropicKey').disabled = false;
+        document.getElementById('browsePython').disabled = false;
+        document.getElementById('browseData').disabled   = false;
+      }
+    });
+  </script>
+
+</body>
+</html>

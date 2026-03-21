@@ -11,6 +11,28 @@ from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 from loguru import logger
 
+try:
+    from scipy.ndimage import fourier_shift
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    fourier_shift = None
+    logger.warning("scipy not available, Phase Cross Correlation will not work")
+
+# FFT functions - use numpy if scipy not available
+try:
+    from scipy.fft import fft2, ifft2
+except ImportError:
+    # Fallback to numpy.fft (always available)
+    from numpy.fft import fft2, ifft2
+
+try:
+    from skimage.registration import phase_cross_correlation
+    SKIMAGE_AVAILABLE = True
+except ImportError:
+    SKIMAGE_AVAILABLE = False
+    logger.warning("skimage.registration not available, using manual PCC implementation")
+
 from .base_agent import BaseAgent
 
 
@@ -28,7 +50,9 @@ class Aligner(BaseAgent):
         self.residual_threshold = config.get('residual_threshold', 2.0)
         self.max_features = config.get('max_features', 1024)
         self.match_threshold = config.get('match_threshold', 0.7)
+        self.min_matches = config.get('min_matches', 4)  # Minimum matches needed for transform
         self.llm_qa_enabled = config.get('llm_qa_enabled', True)
+        self.interpolation_mode = config.get('interpolation_mode', 'bicubic')  # 'bilinear', 'bicubic', 'nearest'
         
         # Initialize device
         if device == "cuda" and not torch.cuda.is_available():
@@ -66,35 +90,46 @@ class Aligner(BaseAgent):
         return True
     
     def load_superpoint(self):
-        """Load SuperPoint feature detector."""
+        """Load feature detector (using LoFTR as modern alternative to SuperPoint)."""
         try:
             import kornia.feature as KF
             
-            self.logger.info("Loading SuperPoint model...")
-            # Kornia's SuperPoint implementation
-            self._superpoint_model = KF.SuperPoint(max_num_keypoints=self.max_features).to(self.device)
+            self.logger.info("Loading LoFTR model (SuperPoint alternative)...")
+            # LoFTR is a modern transformer-based matcher that works well for fluorescence microscopy
+            self._superpoint_model = KF.LoFTR(pretrained='indoor').to(self.device)
             self._superpoint_model.eval()
             return True
         except Exception as e:
-            self.logger.error(f"Failed to load SuperPoint: {e}")
-            return False
+            self.logger.error(f"Failed to load LoFTR: {e}")
+            # Fallback to KeyNet + HardNet
+            try:
+                self.logger.info("Trying KeyNet + HardNet as fallback...")
+                self._keynet_detector = KF.KeyNetDetector(pretrained=True, num_features=self.max_features).to(self.device)
+                self._hardnet_descriptor = KF.HardNet(pretrained=True).to(self.device)
+                self._keynet_detector.eval()
+                self._hardnet_descriptor.eval()
+                self._superpoint_model = 'keynet+hardnet'  # Flag to use alternative path
+                return True
+            except Exception as e2:
+                self.logger.error(f"Failed to load KeyNet+HardNet fallback: {e2}")
+                return False
     
     def load_superglue(self):
-        """Load SuperGlue matcher."""
+        """Load matcher (using DescriptorMatcher)."""
         try:
             import kornia.feature as KF
             
-            self.logger.info("Loading SuperGlue model...")
-            self._superglue_model = KF.SuperGlue().to(self.device)
-            self._superglue_model.eval()
+            self.logger.info("Loading DescriptorMatcher...")
+            # Use DescriptorMatcher directly with mutual nearest neighbor strategy
+            self._superglue_model = KF.DescriptorMatcher('smnn', self.match_threshold)
             return True
         except Exception as e:
-            self.logger.error(f"Failed to load SuperGlue: {e}")
+            self.logger.error(f"Failed to load matcher: {e}")
             return False
     
     def detect_features_superpoint(self, image: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Detect keypoints and descriptors using SuperPoint.
+        Detect keypoints and descriptors using LoFTR or KeyNet+HardNet.
         
         Args:
             image: Input image array (float32, [0, 1])
@@ -102,9 +137,11 @@ class Aligner(BaseAgent):
         Returns:
             Tuple of (keypoints, descriptors) tensors
         """
+        import kornia.feature as KF
+        
         if self._superpoint_model is None:
             if not self.load_superpoint():
-                raise RuntimeError("SuperPoint model not available")
+                raise RuntimeError("Feature detector not available")
         
         # Convert to tensor
         if isinstance(image, np.ndarray):
@@ -116,12 +153,138 @@ class Aligner(BaseAgent):
         if img_tensor.max() > 1.0:
             img_tensor = img_tensor / img_tensor.max()
         
-        with torch.no_grad():
-            out = self._superpoint_model(img_tensor)
-            keypoints = out['keypoints']  # [B, N, 2]
-            descriptors = out['descriptors']  # [B, 256, N]
+        # Check if using KeyNet+HardNet fallback
+        if self._superpoint_model == 'keynet+hardnet':
+            with torch.no_grad():
+                # Detect keypoints with KeyNet
+                lafs, scores = self._keynet_detector(img_tensor)  # LAFs: Local Affine Frames
+                
+                # Extract keypoint coordinates from LAFs
+                keypoints = lafs[:, :, :2, 2]  # Extract translation part [B, N, 2]
+                
+                # Compute descriptors with HardNet
+                patches = KF.extract_patches_from_pyramid(img_tensor, lafs, 32)
+                descriptors = self._hardnet_descriptor(patches)  # [B*N, 128]
+                descriptors = descriptors.view(img_tensor.size(0), -1, 128).transpose(1, 2)  # [B, 128, N]
+            
+            return keypoints[0], descriptors[0]
+        else:
+            # Using LoFTR (detection will be done in matching phase)
+            # For compatibility, return dummy values - LoFTR does joint detection+matching
+            self.logger.warning("LoFTR requires image pairs for matching. Use detect_and_match_loftr() instead.")
+            # Return empty tensors as placeholders
+            return torch.empty(0, 2, device=self.device), torch.empty(256, 0, device=self.device)
+    
+    def detect_and_match_loftr(self, image1: np.ndarray, image2: np.ndarray) -> Optional[torch.Tensor]:
+        """
+        Detect and match features using LoFTR (joint detection+matching).
         
-        return keypoints[0], descriptors[0]
+        Args:
+            image1: First image (anchor)
+            image2: Second image (to register)
+            
+        Returns:
+            torch.Tensor: Matched keypoints [M, 2, 2] or None
+        """
+        if self._superpoint_model is None or self._superpoint_model == 'keynet+hardnet':
+            return None
+        
+        import kornia.feature as KF
+        import torch.nn.functional as F
+        
+        try:
+            # Clear CUDA cache before processing
+            if self.device == "cuda":
+                torch.cuda.empty_cache()
+            
+            # Convert to tensors
+            img1_tensor = torch.from_numpy(self.ensure_float32(image1)).unsqueeze(0).unsqueeze(0)
+            img2_tensor = torch.from_numpy(self.ensure_float32(image2)).unsqueeze(0).unsqueeze(0)
+            
+            # Downsample large images to save memory (LoFTR works better on smaller images anyway)
+            max_size = 1024
+            h1, w1 = img1_tensor.shape[2:]
+            if max(h1, w1) > max_size:
+                scale = max_size / max(h1, w1)
+                new_h, new_w = int(h1 * scale), int(w1 * scale)
+                img1_tensor = F.interpolate(img1_tensor, size=(new_h, new_w), mode='bilinear', align_corners=False)
+                img2_tensor = F.interpolate(img2_tensor, size=(new_h, new_w), mode='bilinear', align_corners=False)
+                self.logger.info(f"Downsampled images from {h1}x{w1} to {new_h}x{new_w} for LoFTR")
+            else:
+                scale = 1.0
+            
+            # Move to device only when needed
+            img1_tensor = img1_tensor.to(self.device)
+            img2_tensor = img2_tensor.to(self.device)
+            
+            # Normalize to [0, 1]
+            if img1_tensor.max() > 1.0:
+                img1_tensor = img1_tensor / img1_tensor.max()
+            if img2_tensor.max() > 1.0:
+                img2_tensor = img2_tensor / img2_tensor.max()
+            
+            # Prepare input dict for LoFTR
+            input_dict = {
+                'image0': img1_tensor,
+                'image1': img2_tensor
+            }
+            
+            # Monitor memory usage
+            if self.device == "cuda":
+                mem_before = torch.cuda.memory_allocated() / 1e9
+                self.logger.debug(f"LoFTR memory before: {mem_before:.2f} GB")
+            
+            with torch.no_grad():
+                correspondences = self._superpoint_model(input_dict)
+            
+            # Check memory after inference
+            if self.device == "cuda":
+                mem_after = torch.cuda.memory_allocated() / 1e9
+                mem_peak = torch.cuda.max_memory_allocated() / 1e9
+                self.logger.debug(f"LoFTR memory after: {mem_after:.2f} GB (peak: {mem_peak:.2f} GB)")
+                torch.cuda.reset_peak_memory_stats()  # Reset for next measurement
+            
+            # Extract matched keypoints
+            mkpts0 = correspondences['keypoints0']  # [B, N, 2]
+            mkpts1 = correspondences['keypoints1']  # [B, N, 2]
+            
+            # Clear intermediate tensors
+            del img1_tensor, img2_tensor, input_dict
+            if self.device == "cuda":
+                torch.cuda.empty_cache()
+            
+            num_matches = mkpts0.shape[1]
+            if num_matches < self.min_matches:
+                self.logger.warning(
+                    f"LoFTR found only {num_matches} matches (need {self.min_matches}). "
+                    f"This may indicate: (1) images already well-aligned, "
+                    f"(2) low contrast/poor SNR, (3) different structures, or "
+                    f"(4) LoFTR model mismatch for fluorescence microscopy."
+                )
+                return None
+            
+            # Scale keypoints back to original resolution
+            if scale != 1.0:
+                mkpts0 = mkpts0 / scale
+                mkpts1 = mkpts1 / scale
+            
+            # Stack into [M, 2, 2] format: [match_idx, (src/dst), (x/y)]
+            matches = torch.stack([mkpts1[0], mkpts0[0]], dim=1)  # Note: mkpts1 is moving, mkpts0 is anchor
+            
+            return matches
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                self.logger.error(f"CUDA OOM in LoFTR. Falling back to KeyNet+HardNet")
+                # Clear cache and try fallback
+                if self.device == "cuda":
+                    torch.cuda.empty_cache()
+                # Load fallback
+                self._superpoint_model = 'keynet+hardnet'
+                self.load_superpoint()
+                return None
+            else:
+                raise
     
     def match_features_superglue(self, desc1: torch.Tensor, desc2: torch.Tensor,
                                  kpts1: torch.Tensor, kpts2: torch.Tensor) -> torch.Tensor:
@@ -275,33 +438,53 @@ class Aligner(BaseAgent):
             return None
     
     def apply_transform_kornia(self, image: np.ndarray, transform: torch.Tensor,
-                               transform_type: str = 'affine') -> np.ndarray:
+                               transform_type: str = 'affine', 
+                               interpolation_mode: str = 'bicubic') -> np.ndarray:
         """
-        Apply transformation using Kornia (GPU-accelerated).
+        Apply transformation using Kornia (GPU-accelerated) with controllable interpolation.
         
         Args:
-            image: Input image array
+            image: Input image array (preserves original dtype range)
             transform: Transformation matrix/parameters
-            transform_type: 'affine' or 'tps'
+            transform_type: 'affine', 'translation', 'euclidean', or 'tps'
+            interpolation_mode: 'bilinear', 'bicubic', or 'nearest' (default: 'bicubic' for sharpness)
             
         Returns:
-            np.ndarray: Warped image
+            np.ndarray: Warped image (normalized to [0,1] range, float32)
         """
         import kornia.geometry.transform as KGT
+        import torch.nn.functional as F
         
-        # Convert to tensor
-        img_tensor = torch.from_numpy(self.ensure_float32(image)).unsqueeze(0).unsqueeze(0).to(self.device)
+        # Convert to float32 [0, 1] for processing
+        img_float = self.ensure_float32(image)
+        img_tensor = torch.from_numpy(img_float).unsqueeze(0).unsqueeze(0).to(self.device)
+        
+        # Map interpolation mode to PyTorch mode
+        mode_map = {
+            'bilinear': 'bilinear',
+            'bicubic': 'bicubic',
+            'nearest': 'nearest'
+        }
+        interp_mode = mode_map.get(interpolation_mode, 'bicubic')
+        
+        # translation and euclidean use the same 3x3 homogeneous matrix format as affine
+        affine_types = ('affine', 'translation', 'euclidean')
         
         with torch.no_grad():
-            if transform_type == 'affine':
-                # Affine warping
-                warped = KGT.warp_affine(
+            if transform_type in affine_types:
+                theta_2x3 = transform[:2, :]  # [2, 3]
+                
+                h, w = img_tensor.shape[-2:]
+                grid = F.affine_grid(theta_2x3.unsqueeze(0), size=(1, 1, h, w), align_corners=False)
+                
+                warped = F.grid_sample(
                     img_tensor,
-                    transform.unsqueeze(0),
-                    dsize=img_tensor.shape[-2:]
+                    grid,
+                    mode=interp_mode,
+                    padding_mode='zeros',
+                    align_corners=False
                 )
             elif transform_type == 'tps':
-                # TPS warping
                 warped = KGT.warp_image_tps(
                     img_tensor,
                     transform,
@@ -310,8 +493,10 @@ class Aligner(BaseAgent):
             else:
                 raise ValueError(f"Unknown transform type: {transform_type}")
         
-        # Convert back to numpy
+        # Convert back to numpy and ensure valid range
         warped_np = warped[0, 0].cpu().numpy()
+        warped_np = np.clip(warped_np, 0.0, 1.0)
+        
         return warped_np
     
     def calculate_residual_error(self, src_points: torch.Tensor, dst_points: torch.Tensor,
@@ -323,20 +508,19 @@ class Aligner(BaseAgent):
             src_points: Source keypoints
             dst_points: Destination keypoints
             transform: Transformation matrix
-            transform_type: 'affine' or 'tps'
+            transform_type: 'affine', 'translation', 'euclidean', or 'tps'
             
         Returns:
             float: Mean residual error in pixels
         """
         # Apply transform to source points
-        if transform_type == 'affine':
-            # Convert to homogeneous coordinates
+        # translation and euclidean use the same 3x3 matrix format as affine
+        if transform_type in ('affine', 'translation', 'euclidean'):
             src_homogeneous = torch.cat([
                 src_points,
                 torch.ones(len(src_points), 1, device=self.device)
             ], dim=1)  # [N, 3]
             
-            # Apply transform
             transformed = (transform @ src_homogeneous.t()).t()  # [N, 3]
             transformed_xy = transformed[:, :2] / (transformed[:, 2:3] + 1e-8)
         else:
@@ -393,8 +577,11 @@ Respond in JSON:
     "reasoning": "brief explanation"
 }"""
             
+            import json
+            
+            # Vision models don't support response_format, so we'll parse JSON manually
             response = client.chat.completions.create(
-                model=self.config.get('llm', {}).get('model', 'gpt-4-vision-preview'),
+                model=self.config.get('llm', {}).get('model', 'gpt-4o'),
                 messages=[
                     {
                         "role": "user",
@@ -407,12 +594,18 @@ Respond in JSON:
                         ]
                     }
                 ],
-                temperature=self.config.get('llm', {}).get('temperature', 0.3),
-                response_format={"type": "json_object"}
+                temperature=self.config.get('llm', {}).get('temperature', 0.3)
             )
             
-            import json
-            result = json.loads(response.choices[0].message.content)
+            # Parse JSON from response (vision models return text, not structured JSON)
+            content = response.choices[0].message.content
+            # Try to extract JSON from markdown code blocks if present
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+            
+            result = json.loads(content)
             self.logger.info(f"LLM Visual QA: {result}")
             return result
             
@@ -420,13 +613,15 @@ Respond in JSON:
             self.logger.warning(f"LLM visual QA failed: {e}")
             return {'alignment_ok': True, 'reasoning': f'LLM error: {e}'}
     
-    def register_channels(self, images: Dict[str, np.ndarray], anchor_channel: str) -> Dict[str, Any]:
+    def register_channels_phase_cross_correlation(self, images: Dict[str, np.ndarray], anchor_channel: str, transform_type: str = 'translation') -> Dict[str, Any]:
         """
-        Register all channels to the anchor channel.
+        Register channels using Phase Cross Correlation (PCC).
+        PCC is good for rigid translations and can be more robust than feature-based methods.
         
         Args:
             images: Dict mapping channel names to image arrays
             anchor_channel: Name of the anchor channel
+            transform_type: 'translation' (default) or 'euclidean' (translation + rotation)
             
         Returns:
             Dict containing registered images and transformation metadata
@@ -438,9 +633,213 @@ Respond in JSON:
         registered_images = {anchor_channel: anchor_image}
         transformations = {}
         
-        # Detect features in anchor
-        self.logger.info(f"Detecting features in anchor channel: {anchor_channel}")
-        anchor_kpts, anchor_desc = self.detect_features_superpoint(anchor_image)
+        if not SCIPY_AVAILABLE:
+            self.logger.error("scipy not available, cannot use Phase Cross Correlation")
+            return {'error': 'scipy not available for Phase Cross Correlation'}
+        
+        self.logger.info(f"Using Phase Cross Correlation for registration (anchor: {anchor_channel}, transform: {transform_type})")
+        
+        for channel_name, image in images.items():
+            if channel_name == anchor_channel:
+                continue
+            
+            self.logger.info(f"Registering channel {channel_name} using Phase Cross Correlation")
+            img_norm = self.ensure_float32(image)
+            
+            try:
+                # Use skimage's phase_cross_correlation if available (more robust)
+                if SKIMAGE_AVAILABLE:
+                    shift, error, diffphase = phase_cross_correlation(
+                        anchor_image, 
+                        img_norm,
+                        upsample_factor=10  # Sub-pixel accuracy
+                    )
+                    # shift is (row, col) = (y, x), convert to (x, y)
+                    dx = float(shift[1])  # column shift
+                    dy = float(shift[0])  # row shift
+                    self.logger.info(f"PCC shift for {channel_name}: dx={dx:.3f}, dy={dy:.3f}, error={error:.6f}, phase_diff={diffphase:.6f}")
+                else:
+                    # Manual implementation using FFT
+                    # Compute cross-correlation in frequency domain
+                    fft_anchor = fft2(anchor_image)
+                    fft_image = fft2(img_norm)
+                    
+                    # Cross-power spectrum
+                    cross_power = fft_anchor * np.conj(fft_image)
+                    cross_power_norm = cross_power / (np.abs(cross_power) + 1e-10)
+                    
+                    # Inverse FFT to get correlation
+                    correlation = np.real(ifft2(cross_power_norm))
+                    
+                    # Find peak (shift)
+                    h, w = correlation.shape
+                    center = (h // 2, w // 2)
+                    peak = np.unravel_index(np.argmax(correlation), correlation.shape)
+                    
+                    # Calculate shift (accounting for FFT wrapping)
+                    dy = (peak[0] - center[0]) % h
+                    if dy > h // 2:
+                        dy -= h
+                    dx = (peak[1] - center[1]) % w
+                    if dx > w // 2:
+                        dx -= w
+                    
+                    error = 1.0 - correlation[peak]  # Normalized error
+                    diffphase = 0.0
+                    self.logger.info(f"PCC shift for {channel_name}: dx={dx:.3f}, dy={dy:.3f}, error={error:.6f}")
+                
+                # Check if shift is significant
+                magnitude = np.sqrt(dx**2 + dy**2)
+                if magnitude < 0.1:  # Very small shift, likely already aligned
+                    self.logger.info(f"Shift for {channel_name} is very small ({magnitude:.3f} px), using identity transform")
+                    registered_images[channel_name] = img_norm
+                    transformations[channel_name] = {
+                        'type': 'identity',
+                        'error': float(error) if 'error' in locals() else 0.0,
+                        'dx': 0.0,
+                        'dy': 0.0,
+                        'magnitude': 0.0
+                    }
+                    continue
+                
+                # Build transformation matrix based on transform_type
+                if transform_type.lower() in ['translation', 'euclidean']:
+                    # Translation-only or Euclidean (translation + rotation)
+                    # For now, implement translation-only (Euclidean with 0 rotation)
+                    # Translation matrix: [[1, 0, dx], [0, 1, dy], [0, 0, 1]]
+                    transform_matrix = np.array([
+                        [1.0, 0.0, dx],
+                        [0.0, 1.0, dy],
+                        [0.0, 0.0, 1.0]
+                    ], dtype=np.float32)
+                    
+                    transform_type_used = 'translation' if transform_type.lower() == 'translation' else 'euclidean'
+                    
+                    # Apply translation using scipy
+                    if SCIPY_AVAILABLE:
+                        # Use fourier_shift for sub-pixel accuracy
+                        shift_array = np.array([dy, dx])  # (row, col) = (y, x)
+                        shifted = fourier_shift(fft2(img_norm), shift_array)
+                        registered_img = np.real(ifft2(shifted))
+                        # Normalize back to [0, 1]
+                        registered_img = np.clip(registered_img, 0, 1)
+                    else:
+                        # Fallback: use kornia for translation
+                        transform_tensor = torch.tensor(transform_matrix, dtype=torch.float32, device=self.device)
+                        img_tensor = torch.from_numpy(img_norm).unsqueeze(0).unsqueeze(0).to(self.device)
+                        registered_tensor = self.apply_transform_kornia(
+                            img_norm,
+                            transform_tensor,
+                            'affine',
+                            self.interpolation_mode
+                        )
+                        registered_img = registered_tensor
+                    
+                    registered_images[channel_name] = registered_img
+                    transformations[channel_name] = {
+                        'type': transform_type_used,
+                        'transform': transform_matrix.tolist(),
+                        'error': float(error) if 'error' in locals() else 0.0,
+                        'dx': float(dx),
+                        'dy': float(dy),
+                        'magnitude': float(magnitude),
+                        'num_matches': 1,  # PCC doesn't use matches, but we have 1 "match" (the shift)
+                        'note': f'Phase Cross Correlation: error={error:.6f}, phase_diff={diffphase:.6f}' if 'diffphase' in locals() else f'Phase Cross Correlation: error={error:.6f}'
+                    }
+                    
+                    self.logger.info(f"✓ Registered {channel_name} using PCC: shift=({dx:.3f}, {dy:.3f}), magnitude={magnitude:.3f} px")
+                else:
+                    self.logger.warning(f"Transform type '{transform_type}' not supported for PCC, using translation")
+                    # Fall back to translation
+                    transform_matrix = np.array([
+                        [1.0, 0.0, dx],
+                        [0.0, 1.0, dy],
+                        [0.0, 0.0, 1.0]
+                    ], dtype=np.float32)
+                    
+                    if SCIPY_AVAILABLE:
+                        shift_array = np.array([dy, dx])
+                        shifted = fourier_shift(fft2(img_norm), shift_array)
+                        registered_img = np.real(ifft2(shifted))
+                        registered_img = np.clip(registered_img, 0, 1)
+                    else:
+                        transform_tensor = torch.tensor(transform_matrix, dtype=torch.float32, device=self.device)
+                        registered_tensor = self.apply_transform_kornia(
+                            img_norm,
+                            transform_tensor,
+                            'affine',
+                            self.interpolation_mode
+                        )
+                        registered_img = registered_tensor
+                    
+                    registered_images[channel_name] = registered_img
+                    transformations[channel_name] = {
+                        'type': 'translation',
+                        'transform': transform_matrix.tolist(),
+                        'error': float(error) if 'error' in locals() else 0.0,
+                        'dx': float(dx),
+                        'dy': float(dy),
+                        'magnitude': float(magnitude),
+                        'num_matches': 1
+                    }
+                    
+            except Exception as e:
+                self.logger.error(f"PCC failed for {channel_name}: {e}")
+                registered_images[channel_name] = img_norm
+                transformations[channel_name] = {
+                    'type': 'identity',
+                    'error': float('inf'),
+                    'dx': 0.0,
+                    'dy': 0.0,
+                    'magnitude': 0.0,
+                    'note': f'PCC failed: {str(e)}'
+                }
+        
+        return {
+            'registered_images': registered_images,
+            'transformations': transformations
+        }
+    
+    def register_channels(self, images: Dict[str, np.ndarray], anchor_channel: str, method: str = 'feature_based', transform_type: str = 'affine') -> Dict[str, Any]:
+        """
+        Register all channels to the anchor channel.
+        
+        Args:
+            images: Dict mapping channel names to image arrays
+            anchor_channel: Name of the anchor channel
+            method: 'feature_based' (default) or 'phase_cross_correlation'
+            transform_type: 'affine', 'translation', 'euclidean', 'tps' (for feature-based) or 'translation'/'euclidean' (for PCC)
+            
+        Returns:
+            Dict containing registered images and transformation metadata
+        """
+        # Route to appropriate method
+        if method.lower() in ['phase_cross_correlation', 'pcc', 'phase cross correlation']:
+            return self.register_channels_phase_cross_correlation(images, anchor_channel, transform_type)
+        
+        # Feature-based method (original implementation)
+        if not self.validate_input(images, anchor_channel):
+            return {'error': 'Input validation failed'}
+        
+        anchor_image = self.ensure_float32(images[anchor_channel])
+        registered_images = {anchor_channel: anchor_image}
+        transformations = {}
+        
+        # Initialize feature detector if not already loaded
+        if self._superpoint_model is None:
+            self.load_superpoint()
+        
+        # Check if using LoFTR (joint detection+matching)
+        use_loftr = (self._superpoint_model is not None and 
+                     self._superpoint_model != 'keynet+hardnet')
+        
+        # For KeyNet+HardNet: detect features in anchor
+        anchor_kpts, anchor_desc = None, None
+        if not use_loftr:
+            self.logger.info(f"Detecting features in anchor channel: {anchor_channel}")
+            anchor_kpts, anchor_desc = self.detect_features_superpoint(anchor_image)
+        else:
+            self.logger.info(f"Using LoFTR for registration (anchor: {anchor_channel})")
         
         for channel_name, image in images.items():
             if channel_name == anchor_channel:
@@ -449,14 +848,23 @@ Respond in JSON:
             self.logger.info(f"Registering channel: {channel_name}")
             img_norm = self.ensure_float32(image)
             
-            # Detect features
-            kpts, desc = self.detect_features_superpoint(img_norm)
+            # Match features using appropriate method
+            if use_loftr:
+                # LoFTR: joint detection and matching
+                self.logger.info(f"Using LoFTR for {channel_name}")
+                matches = self.detect_and_match_loftr(anchor_image, img_norm)
+            else:
+                # KeyNet+HardNet: separate detection and matching
+                kpts, desc = self.detect_features_superpoint(img_norm)
+                matches = self.match_features_superglue(anchor_desc, desc, anchor_kpts, kpts)
             
-            # Match features
-            matches = self.match_features_superglue(anchor_desc, desc, anchor_kpts, kpts)
-            
-            if matches is None or len(matches) < 4:
-                self.logger.warning(f"Insufficient matches for {channel_name}. Using identity transform.")
+            if matches is None or len(matches) < self.min_matches:
+                num_found = len(matches) if matches is not None else 0
+                self.logger.warning(
+                    f"Insufficient matches for {channel_name}: found {num_found}, need {self.min_matches}. "
+                    f"Using identity transform (no alignment). "
+                    f"This may be OK if channels are already aligned or have different structures."
+                )
                 registered_images[channel_name] = img_norm
                 transformations[channel_name] = {'type': 'identity', 'error': float('inf')}
                 continue
@@ -482,8 +890,13 @@ Respond in JSON:
                     transform_type = 'tps'
                     residual = self.calculate_residual_error(src_points, dst_points, transform, 'tps')
             
-            # Apply transformation
-            warped = self.apply_transform_kornia(img_norm, transform, transform_type)
+            # Apply transformation with specified interpolation mode
+            warped = self.apply_transform_kornia(
+                img_norm, 
+                transform, 
+                transform_type,
+                interpolation_mode=self.interpolation_mode
+            )
             registered_images[channel_name] = warped
             transformations[channel_name] = {
                 'type': transform_type,

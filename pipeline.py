@@ -160,8 +160,8 @@ class ExosomeAnalysisPipeline:
             # Save preprocessed images
             preprocessed_dir = self.output_root / sample_name / "preprocessed"
             for channel_name, image in images.items():
-                output_path = preprocessed_dir / f"{channel_name}_preprocessed.tif"
-                save_image(image, output_path, bit_depth=16)
+                output_path = preprocessed_dir / f"{channel_name}_preprocessed.png"
+                save_image(image, output_path, bit_depth=8, format='png')
             
             # Phase 2: Aligner
             logger.info("Phase 2: Registration and Alignment")
@@ -182,8 +182,8 @@ class ExosomeAnalysisPipeline:
             # Save registered images
             registered_dir = self.output_root / sample_name / "registered"
             for channel_name, image in registered_images.items():
-                output_path = registered_dir / f"{channel_name}_registered.tif"
-                save_image(image, output_path, bit_depth=16)
+                output_path = registered_dir / f"{channel_name}_registered.png"
+                save_image(image, output_path, bit_depth=8, format='png')
             
             # Create overlay
             overlay_path = self.output_root / sample_name / f"{sample_name}_overlay.png"
@@ -206,9 +206,14 @@ class ExosomeAnalysisPipeline:
             
             # Save label images
             label_dir = self.output_root / sample_name / "labels"
+            label_dir.mkdir(parents=True, exist_ok=True)  # Ensure directory exists
             for channel_name, label_image in analysis_result['label_images'].items():
-                output_path = label_dir / f"{channel_name}_labels.tif"
-                tifffile.imwrite(str(output_path), label_image.astype(np.uint16))
+                output_path = label_dir / f"{channel_name}_labels.png"
+                # Convert label image to 8-bit for PNG (labels are typically small integers)
+                label_8bit = (label_image.astype(np.float32) / label_image.max() * 255).astype(np.uint8) if label_image.max() > 0 else label_image.astype(np.uint8)
+                from PIL import Image
+                pil_img = Image.fromarray(label_8bit, mode='L')
+                pil_img.save(str(output_path), 'PNG', optimize=True)
             
             logger.info(f"✓ Sample {sample_name} processed successfully")
             results['status'] = 'success'

@@ -6,10 +6,6 @@ on:
       - 'v*'          # trigger on version tags: v1.0.0, v1.2.3, etc.
   workflow_dispatch:  # allow manual trigger from the GitHub UI
 
-env:
-  # All SEA source lives under this subdirectory of the repo root
-  SEA_DIR: .cursor-tutor/SEA
-
 jobs:
   # ── Windows installer (.exe) ───────────────────────────────────────────────
   build-windows:
@@ -27,24 +23,24 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~\AppData\Roaming\npm-cache
-          key: ${{ runner.os }}-npm-${{ hashFiles('.cursor-tutor/SEA/frontend/package-lock.json', '.cursor-tutor/SEA/electron/package-lock.json') }}
+          key: ${{ runner.os }}-npm-${{ hashFiles('frontend/package-lock.json', 'electron/package-lock.json') }}
           restore-keys: |
             ${{ runner.os }}-npm-
 
       - name: Install frontend dependencies
-        working-directory: ${{ env.SEA_DIR }}/frontend
+        working-directory: frontend
         run: npm ci
 
       - name: Build React frontend
-        working-directory: ${{ env.SEA_DIR }}/frontend
+        working-directory: frontend
         run: npm run build
 
       - name: Install Electron dependencies
-        working-directory: ${{ env.SEA_DIR }}/electron
+        working-directory: electron
         run: npm ci
 
       - name: Build Windows installer
-        working-directory: ${{ env.SEA_DIR }}/electron
+        working-directory: electron
         run: npm run dist:win
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -53,7 +49,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: SEA-Windows-Installer
-          path: ${{ env.SEA_DIR }}/electron/dist-electron/*.exe
+          path: electron/dist-electron/*.exe
           retention-days: 30
 
   # ── Linux AppImage ─────────────────────────────────────────────────────────
@@ -72,24 +68,24 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.npm
-          key: ${{ runner.os }}-npm-${{ hashFiles('.cursor-tutor/SEA/frontend/package-lock.json', '.cursor-tutor/SEA/electron/package-lock.json') }}
+          key: ${{ runner.os }}-npm-${{ hashFiles('frontend/package-lock.json', 'electron/package-lock.json') }}
           restore-keys: |
             ${{ runner.os }}-npm-
 
       - name: Install frontend dependencies
-        working-directory: ${{ env.SEA_DIR }}/frontend
+        working-directory: frontend
         run: npm ci
 
       - name: Build React frontend
-        working-directory: ${{ env.SEA_DIR }}/frontend
+        working-directory: frontend
         run: npm run build
 
       - name: Install Electron dependencies
-        working-directory: ${{ env.SEA_DIR }}/electron
+        working-directory: electron
         run: npm ci
 
       - name: Build Linux AppImage
-        working-directory: ${{ env.SEA_DIR }}/electron
+        working-directory: electron
         run: npm run dist:linux
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -98,7 +94,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: SEA-Linux-AppImage
-          path: ${{ env.SEA_DIR }}/electron/dist-electron/*.AppImage
+          path: electron/dist-electron/*.AppImage
           retention-days: 30
 
   # ── GitHub Release (only on version tags) ─────────────────────────────────

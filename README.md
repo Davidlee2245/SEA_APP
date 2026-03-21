@@ -251,6 +251,49 @@ The pipeline includes N2V support, but you may need to train custom models for y
 ### StarDist Custom Models
 Pre-trained StarDist models work well, but you can fine-tune on your data. See [StarDist documentation](https://github.com/stardist/stardist).
 
+## Visualization GUI
+
+A modern React TypeScript web interface for visualizing alignment results:
+
+- **3-Step Workflow**: Before/After comparison → Movement analysis → Final results
+- **Interactive**: Frame selection, sortable tables, image preview
+- **Mock Data Mode**: Test without running the pipeline
+
+### Quick Start
+
+```bash
+# Setup (one time)
+conda activate SEA
+bash setup_visualization.sh
+```
+
+### Running the GUI (2 terminals required)
+
+**Terminal 1 — Backend API server:**
+```bash
+conda activate SEA
+python api_server_extended.py
+# Runs on http://localhost:5000
+```
+
+> **Important:** Use `api_server_extended.py`, not `api_server.py`. The extended server provides all backend endpoints required by the GUI, including image preprocessing, alignment, and exosome detection. The basic `api_server.py` only serves raw file previews and will cause 404 errors for most GUI features.
+
+**Terminal 2 — Frontend dev server:**
+```bash
+cd frontend
+npm run dev
+# Open http://localhost:3000
+```
+
+See `QUICKSTART_VISUALIZATION.md` for detailed instructions.
+
+### Documentation
+
+- `QUICKSTART_VISUALIZATION.md` - Get started in 5 minutes
+- `VISUALIZATION_SETUP.md` - Comprehensive setup guide
+- `VISUALIZATION_README.md` - Features and architecture
+- `frontend/README.md` - Frontend development details
+
 ## Citation
 
 If you use SEA in your research, please cite:

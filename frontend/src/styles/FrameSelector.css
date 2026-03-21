@@ -1,0 +1,62 @@
+/* Frame Selector Styles */
+
+.frame-selector {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+
+.frame-selector-label {
+  font-weight: 600;
+  color: #34495e;
+  font-size: 0.95rem;
+}
+
+.frame-selector-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.frame-button {
+  padding: 0.75rem 1rem;
+  background: white;
+  border: 2px solid #e0e0e0;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  min-width: 120px;
+}
+
+.frame-button:hover {
+  border-color: #3498db;
+  transform: translateY(-2px);
+  box-shadow: 0 3px 6px rgba(0, 0, 0, 0.1);
+}
+
+.frame-button.selected {
+  background: #3498db;
+  border-color: #3498db;
+  color: white;
+  box-shadow: 0 3px 8px rgba(52, 152, 219, 0.3);
+}
+
+.frame-button-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.frame-id {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.channel-name {
+  font-size: 0.75rem;
+  opacity: 0.8;
+}
+
+

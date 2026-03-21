@@ -158,8 +158,10 @@ class Inspector(BaseAgent):
             
             return image
             
-        except ImportError:
-            self.logger.error("Noise2Void not available. Install with: pip install n2v")
+        except ImportError as e:
+            self.logger.error(f"Noise2Void not available: {e}")
+            self.logger.error("N2V requires TensorFlow. Install with: pip install tensorflow n2v")
+            self.logger.info("Skipping denoising (N2V is optional)")
             return image
         except Exception as e:
             self.logger.error(f"N2V denoising failed: {e}")
@@ -205,12 +207,15 @@ class Inspector(BaseAgent):
         Returns:
             np.ndarray: Denoised image
         """
-        if self.denoise_method == 'n2v':
+        if self.denoise_method == 'none':
+            # Denoising disabled
+            return image
+        elif self.denoise_method == 'n2v':
             return self.denoise_n2v(image)
         elif self.denoise_method == 'care':
             return self.denoise_care(image)
         else:
-            self.logger.warning(f"Unknown denoise method: {self.denoise_method}")
+            self.logger.warning(f"Unknown denoise method: {self.denoise_method}. Skipping denoising.")
             return image
     
     def detect_anchor_channel(self, images: Dict[str, np.ndarray]) -> str:
@@ -271,14 +276,27 @@ Respond in JSON format:
     "reasoning": "brief explanation"
 }}"""
             
-            response = client.chat.completions.create(
-                model=self.config.get('llm', {}).get('analysis_model', 'gpt-4'),
-                messages=[{"role": "user", "content": prompt}],
-                temperature=self.config.get('llm', {}).get('temperature', 0.3),
-                response_format={"type": "json_object"}
-            )
-            
             import json
+            
+            # Try with response_format first, fallback without it if not supported
+            try:
+                response = client.chat.completions.create(
+                    model=self.config.get('llm', {}).get('analysis_model', 'gpt-4'),
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=self.config.get('llm', {}).get('temperature', 0.3),
+                    response_format={"type": "json_object"}
+                )
+            except Exception as e:
+                if "response_format" in str(e):
+                    self.logger.info("Model doesn't support json_object format, retrying without it")
+                    response = client.chat.completions.create(
+                        model=self.config.get('llm', {}).get('analysis_model', 'gpt-4'),
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=self.config.get('llm', {}).get('temperature', 0.3)
+                    )
+                else:
+                    raise
+            
             result = json.loads(response.choices[0].message.content)
             self.logger.info(f"LLM QA Decision: {result}")
             return result
@@ -346,9 +364,11 @@ Respond in JSON format:
             snr = snr_values[channel_name]
             
             # Decision logic: LLM recommendation OR rule-based fallback
+            # Skip denoising if method is "none"
             should_denoise = (
-                llm_decision.get('denoise_needed', False) or
-                snr < self.denoise_threshold
+                self.denoise_method != 'none' and
+                (llm_decision.get('denoise_needed', False) or
+                 snr < self.denoise_threshold)
             )
             
             if should_denoise:
@@ -356,6 +376,8 @@ Respond in JSON format:
                 denoised = self.denoise_image(image)
                 processed_images[channel_name] = denoised
             else:
+                if self.denoise_method == 'none':
+                    self.logger.debug(f"Skipping denoising for {channel_name} (denoising disabled)")
                 processed_images[channel_name] = image
         
         # Detect anchor channel
