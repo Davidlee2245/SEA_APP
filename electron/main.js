@@ -281,6 +281,7 @@ function createMainWindow(port) {
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
     mainWindow.focus();
+    mainWindow.webContents.openDevTools();   // TODO: remove before release
   });
 
   mainWindow.on('closed', () => { mainWindow = null; });
