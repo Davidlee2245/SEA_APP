@@ -47,25 +47,19 @@ app = Flask(__name__)
 CORS(app)
 sock = Sock(app)
 
-# Configuration
-OUTPUT_ROOT = Path("data/output")
-INPUT_ROOT = Path("data/input")
-
-# Support env override for data root
+# Configuration — paths are placeholders; overwritten in __main__ after
+# --data-root is parsed.  Do NOT call .mkdir() here: when running from an
+# AppImage the working directory is a read-only squashfs mount.
 import os
-DATA_ROOT = Path(os.getenv('SEA_DATA_ROOT', 'data/input'))
+OUTPUT_ROOT       = Path("data/output")
+INPUT_ROOT        = Path("data/input")
+DATA_ROOT         = Path(os.getenv('SEA_DATA_ROOT', 'data/input'))
+PREVIEW_CACHE     = Path("previews")
+PROCESSING_OUTPUT = Path("data/processing")
 
 # Global state for WebSocket clients
 ws_clients = set()
 ws_lock = threading.Lock()
-
-# Preview cache directory
-PREVIEW_CACHE = Path("previews")
-PREVIEW_CACHE.mkdir(exist_ok=True)
-
-# Processing output directory (for intermediate preprocessing/alignment results)
-PROCESSING_OUTPUT = Path("data/processing")
-PROCESSING_OUTPUT.mkdir(exist_ok=True, parents=True)
 
 # Session state: Track preprocessing stages per position
 # Structure: {f"{sample}/{position}": {"raw": {...}, "contrast": {...}, "step1": {...}, ...}}
