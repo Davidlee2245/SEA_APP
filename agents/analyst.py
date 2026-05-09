@@ -58,11 +58,17 @@ class Analyst(BaseAgent):
         return True
     
     def load_stardist_model(self):
-        """Load StarDist model for object detection."""
+        """Load StarDist model for object detection (optional: requires stardist + csbdeep)."""
         try:
-            from stardist.models import StarDist2D
-            from csbdeep.utils import normalize
-            
+            from stardist.models import StarDist2D  # type: ignore
+        except ImportError:
+            self.logger.warning(
+                "stardist is not installed; StarDist detection is disabled. "
+                "Install optional packages stardist and csbdeep to enable it."
+            )
+            return False
+
+        try:
             self.logger.info(f"Loading StarDist model: {self.stardist_model_type}")
             self._stardist_model = StarDist2D.from_pretrained(self.stardist_model_type)
             self.logger.info("StarDist model loaded successfully")
@@ -83,9 +89,19 @@ class Analyst(BaseAgent):
             Tuple of (label_image, detections_list)
             detections_list contains dicts with 'coord', 'prob', 'points'
         """
+        try:
+            from csbdeep.utils import normalize  # type: ignore
+        except ImportError:
+            self.logger.warning(
+                "csbdeep is not installed; StarDist normalization unavailable. "
+                "Skipping detection for this channel (empty labels)."
+            )
+            return np.zeros(image.shape[:2], dtype=np.int32), []
+
         if self._stardist_model is None:
             if not self.load_stardist_model():
-                raise RuntimeError("StarDist model not available")
+                self.logger.warning("StarDist model not available; returning empty detection.")
+                return np.zeros(image.shape[:2], dtype=np.int32), []
         
         # Get probability threshold from config or use default
         if prob_thresh is None:
@@ -93,7 +109,6 @@ class Analyst(BaseAgent):
         
         # Normalize image for StarDist using percentile normalization (best practice)
         # This preserves contrast better than simple scaling, especially for wide dynamic range images
-        from csbdeep.utils import normalize
         
         # Ensure image is in a workable format
         if image.dtype == np.uint16:

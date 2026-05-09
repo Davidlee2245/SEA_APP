@@ -167,36 +167,6 @@ class Inspector(BaseAgent):
             self.logger.error(f"N2V denoising failed: {e}")
             return image
     
-    def denoise_care(self, image: np.ndarray) -> np.ndarray:
-        """
-        Denoise image using CARE.
-        
-        Args:
-            image: Input noisy image
-            
-        Returns:
-            np.ndarray: Denoised image
-        """
-        try:
-            from csbdeep.models import CARE
-            import torch
-            
-            self.logger.info("Initializing CARE model...")
-            
-            # Note: CARE requires a pre-trained model
-            # For now, return original image with a warning
-            self.logger.warning("CARE model not fully implemented. Returning original image.")
-            self.logger.info("To use CARE, train a model first or load pre-trained weights.")
-            
-            return image
-            
-        except ImportError:
-            self.logger.error("CARE not available. Install with: pip install csbdeep")
-            return image
-        except Exception as e:
-            self.logger.error(f"CARE denoising failed: {e}")
-            return image
-    
     def denoise_image(self, image: np.ndarray) -> np.ndarray:
         """
         Apply denoising based on configured method.
@@ -213,7 +183,10 @@ class Inspector(BaseAgent):
         elif self.denoise_method == 'n2v':
             return self.denoise_n2v(image)
         elif self.denoise_method == 'care':
-            return self.denoise_care(image)
+            self.logger.warning(
+                "Denoise method 'care' is not supported (CARE / csbdeep removed). Returning original image."
+            )
+            return image
         else:
             self.logger.warning(f"Unknown denoise method: {self.denoise_method}. Skipping denoising.")
             return image

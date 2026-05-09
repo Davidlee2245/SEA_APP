@@ -23,8 +23,6 @@ imageio>=2.31.0
 imageio-ffmpeg>=0.4.9
 
 # Deep Learning Models
-stardist>=0.9.0
-csbdeep>=0.7.0
 n2v>=0.3.1
 # Segment Anything Model (SAM) - install from GitHub
 # segment-anything @ git+https://github.com/facebookresearch/segment-anything.git
