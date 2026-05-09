@@ -74,3 +74,6 @@ Thumbs.db
 *.ipynb
 checkpoints/
 data/
+electron/dist-electron/
+electron/squashfs-root/
+electron/node_modules/
