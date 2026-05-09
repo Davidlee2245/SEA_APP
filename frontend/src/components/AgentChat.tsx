@@ -5,6 +5,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import '../styles/AgentChat.css';
 import { getAgentBase } from '../lib/apiBase';
+import { copyText } from '../lib/clipboard';
 
 interface UploadedImage {
   id: string;
@@ -90,7 +91,7 @@ const AgentChat: React.FC = () => {
 
   const checkApiHealth = async () => {
     try {
-      const response = await fetch('${getAgentBase()}/api/agent/health');
+      const response = await fetch(`${getAgentBase()}/api/agent/health`);
       const data = await response.json();
       setApiConfigured(data.openai_configured);
     } catch (err) {
@@ -157,7 +158,7 @@ const AgentChat: React.FC = () => {
           // If TIFF, call preview API to convert to PNG
           if (isTiff) {
             try {
-              const response = await fetch('${getAgentBase()}/api/preview', {
+              const response = await fetch(`${getAgentBase()}/api/preview`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -282,7 +283,7 @@ const AgentChat: React.FC = () => {
         }
       }
 
-      const response = await fetch('${getAgentBase()}/api/agent/chat', {
+      const response = await fetch(`${getAgentBase()}/api/agent/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody)
@@ -383,7 +384,7 @@ const AgentChat: React.FC = () => {
         run_id: runId
       };
 
-      const response = await fetch('${getAgentBase()}/api/agent/chat', {
+      const response = await fetch(`${getAgentBase()}/api/agent/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody)
@@ -533,9 +534,9 @@ const AgentChat: React.FC = () => {
             <div className="parameters-actions">
               <button 
                 className="btn-export-params"
-                onClick={() => {
-                  navigator.clipboard.writeText(JSON.stringify(params, null, 2));
-                  alert('Parameters copied to clipboard!');
+                onClick={async () => {
+                  const copied = await copyText(JSON.stringify(params, null, 2));
+                  alert(copied ? 'Parameters copied to clipboard!' : 'Failed to copy parameters to clipboard.');
                 }}
               >
                 📋 Copy Parameters

@@ -3,10 +3,14 @@ Flask API Server for SEA Alignment Visualization
 Serves alignment results and images to the React frontend
 """
 
-from flask import Flask, jsonify, send_file, abort
+from flask import Flask, jsonify, send_file, abort, request
 from flask_cors import CORS
 from pathlib import Path
 import json
+import os
+import shutil
+import tempfile
+import traceback
 import numpy as np
 from typing import Dict, Any, List, Optional
 import tifffile
@@ -339,12 +343,68 @@ def health_check():
     })
 
 
+@app.route('/api/cygnus/health', methods=['GET'])
+def cygnus_health():
+    return jsonify({"success": True, "message": "Cygnus API is ready."})
+
+
+@app.route('/api/cygnus/run', methods=['POST'])
+def run_cygnus_pipeline():
+    if 'file' not in request.files:
+        return jsonify({"success": False, "message": "No file provided."}), 400
+
+    f = request.files['file']
+    if not f.filename or not f.filename.lower().endswith(".csv"):
+        return jsonify({"success": False, "message": "Only CSV files are supported."}), 400
+
+    tmp_path = None
+    output_dir = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+            tmp_path = tmp.name
+        f.save(tmp_path)
+
+        output_dir = tempfile.mkdtemp()
+
+        from run_pipeline import run_full_pipeline
+
+        run_full_pipeline(filepath=tmp_path, output_dir=output_dir)
+
+        report_path = os.path.join(output_dir, "cygnus_report.html")
+        if not os.path.isfile(report_path):
+            return jsonify({"success": False, "message": "Report was not generated."}), 500
+
+        with open(report_path, encoding="utf-8") as rfile:
+            report_html = rfile.read()
+
+        return jsonify({"success": True, "report_html": report_html})
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "message": f"{str(e)}\n{traceback.format_exc()}",
+        }), 500
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        if output_dir:
+            try:
+                shutil.rmtree(output_dir, ignore_errors=True)
+            except OSError:
+                pass
+
+
 if __name__ == '__main__':
     print("Starting SEA API Server...")
     print(f"Output directory: {OUTPUT_ROOT.absolute()}")
     print(f"Server running on http://localhost:5000")
     print("\nAvailable endpoints:")
     print("  GET /api/health - Health check")
+    print("  GET /api/cygnus/health - Cygnus pipeline API health")
+    print("  POST /api/cygnus/run - Run Cygnus pipeline (multipart CSV)")
     print("  GET /api/samples - List all samples")
     print("  GET /api/alignment/<sample_name> - Get alignment data")
     print("  GET /api/images/<sample_name>/<subfolder>/<filename> - Get image")

@@ -9,6 +9,180 @@ from sklearn.ensemble import RandomForestClassifier
 from scipy import ndimage
 from skimage import filters, feature
 import cv2
+import json
+import pickle
+import logging
+import datetime
+from pathlib import Path
+import sklearn
+import os
+
+
+LOGGER = logging.getLogger(__name__)
+MAX_RF_MODEL_SIZE_BYTES = 200 * 1024 * 1024  # 200 MB safety ceiling
+DEFAULT_FEATURE_SIGMAS: Tuple[float, ...] = (1.0, 2.0, 4.0)
+FEATURE_NAMES: Tuple[str, ...] = (
+    "intensity_raw",
+    "gaussian_sigma_1.0",
+    "gaussian_sigma_2.0",
+    "gaussian_sigma_4.0",
+    "laplacian",
+    "gradient_magnitude",
+    "local_variance_5x5",
+)
+
+
+def get_feature_params() -> Dict[str, Any]:
+    """Return the canonical feature-extraction schema used for RF models."""
+    return {
+        "feature_names": list(FEATURE_NAMES),
+        "gaussian_sigmas": list(DEFAULT_FEATURE_SIGMAS),
+        "laplacian": {"enabled": True},
+        "gradient_magnitude": {"enabled": True},
+        "local_variance": {"window_size": 5},
+    }
+
+
+def _feature_schema_matches(saved_feature_params: Any) -> bool:
+    """Check whether saved feature schema matches current extraction schema."""
+    if not isinstance(saved_feature_params, dict):
+        return False
+    current = get_feature_params()
+    return (
+        saved_feature_params.get("feature_names") == current.get("feature_names")
+        and saved_feature_params.get("gaussian_sigmas") == current.get("gaussian_sigmas")
+        and saved_feature_params.get("local_variance", {}).get("window_size")
+        == current.get("local_variance", {}).get("window_size")
+    )
+
+
+def validate_feature_params(saved_feature_params: Any) -> bool:
+    """Public wrapper for feature-schema compatibility checks."""
+    return _feature_schema_matches(saved_feature_params)
+
+
+def save_rf_model(model: RandomForestClassifier, feature_params: Dict[str, Any], save_path: str) -> Dict[str, Any]:
+    """
+    Save a trained pixel-level Random Forest model and companion metadata.
+
+    Args:
+        model: Trained RandomForestClassifier.
+        feature_params: Metadata dictionary including at least feature schema and
+            optionally trained_on context.
+        save_path: Target path for the model pickle file (must end with .pkl).
+
+    Returns:
+        The metadata dictionary written to disk.
+
+    Failure modes:
+        Raises ValueError for invalid save path or missing model.
+        Raises OSError / IOError on filesystem write failures.
+        Raises TypeError for non-serializable metadata.
+    """
+    if model is None:
+        raise ValueError("model is required")
+
+    model_path = Path(save_path)
+    if model_path.suffix.lower() != ".pkl":
+        raise ValueError(f"save_path must end with .pkl, got: {model_path}")
+
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path = model_path.with_name(model_path.name.replace("_rf_model.pkl", "_metadata.json"))
+    if metadata_path == model_path:
+        metadata_path = model_path.with_suffix(".metadata.json")
+
+    metadata: Dict[str, Any] = {
+        "sklearn_version": sklearn.__version__,
+        "feature_params": feature_params.get("feature_params", feature_params),
+        "trained_on": feature_params.get("trained_on", {}),
+        "saved_at": datetime.datetime.now().isoformat(),
+    }
+
+    with open(model_path, "wb") as model_file:
+        pickle.dump(model, model_file)
+
+    with open(metadata_path, "w", encoding="utf-8") as metadata_file:
+        json.dump(metadata, metadata_file, indent=2)
+
+    return metadata
+
+
+def load_rf_model(load_path: str) -> Tuple[RandomForestClassifier, Dict[str, Any], Optional[str]]:
+    """
+    Load a previously saved pixel-level Random Forest model and metadata.
+
+    Args:
+        load_path: Path to model pickle file.
+
+    Returns:
+        (model, metadata, warning) where warning is a non-blocking message when
+        sklearn version differs, otherwise None.
+
+    Failure modes:
+        Raises FileNotFoundError if model or metadata files are missing.
+        Raises ValueError if model object is invalid.
+        Raises pickle.UnpicklingError / JSONDecodeError for malformed files.
+    """
+    model_path = Path(load_path)
+    if '..' in model_path.parts:
+        raise ValueError(f"Refusing to load model path containing '..': {load_path}")
+
+    data_root = Path(os.getenv('SEA_DATA_ROOT', 'data/input')).resolve()
+    resolved_model_path = model_path.resolve()
+    try:
+        resolved_model_path.relative_to(data_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Refusing to load RF model outside data root. "
+            f"model={resolved_model_path}, data_root={data_root}"
+        ) from exc
+
+    parts = resolved_model_path.parts
+    if 'rf_models' not in parts:
+        raise ValueError(
+            f"Refusing to load RF model outside rf_models directory: {resolved_model_path}"
+        )
+    rf_idx = parts.index('rf_models')
+    if rf_idx < 1 or rf_idx >= len(parts) - 2:
+        raise ValueError(
+            f"Invalid RF model path layout, expected data_root/<sample>/rf_models/<channel>/<file>.pkl: "
+            f"{resolved_model_path}"
+        )
+
+    if not resolved_model_path.exists():
+        raise FileNotFoundError(f"Model file does not exist: {resolved_model_path}")
+    if resolved_model_path.stat().st_size > MAX_RF_MODEL_SIZE_BYTES:
+        size_mb = resolved_model_path.stat().st_size / (1024 * 1024)
+        raise ValueError(
+            f"Refusing to load RF model larger than 200 MB "
+            f"({size_mb:.2f} MB): {resolved_model_path}"
+        )
+
+    model_path = resolved_model_path
+    metadata_path = model_path.with_name(model_path.name.replace("_rf_model.pkl", "_metadata.json"))
+    if metadata_path == model_path:
+        metadata_path = model_path.with_suffix(".metadata.json")
+
+    with open(model_path, "rb") as model_file:
+        model = pickle.load(model_file)
+
+    with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+        metadata = json.load(metadata_file)
+
+    if not hasattr(model, "predict_proba"):
+        raise ValueError("Loaded object is not a valid RandomForestClassifier-like model")
+
+    saved_version = str(metadata.get("sklearn_version", "")).strip()
+    current_version = sklearn.__version__
+    warning: Optional[str] = None
+    if saved_version and saved_version != current_version:
+        warning = (
+            f"Model saved with sklearn {saved_version}, "
+            f"current environment is sklearn {current_version}."
+        )
+        LOGGER.warning("[Random Forest] %s", warning)
+
+    return model, metadata, warning
 
 
 def extract_features(image: np.ndarray) -> np.ndarray:
@@ -26,7 +200,7 @@ def extract_features(image: np.ndarray) -> np.ndarray:
         image: Input image (H, W) numpy array
         
     Returns:
-        Feature array (H, W, N_features) where N_features = 8
+        Feature array (H, W, N_features) where N_features = 7
     """
     # Normalize image to [0, 1] if needed
     if image.dtype != np.float32 and image.dtype != np.float64:
@@ -46,7 +220,7 @@ def extract_features(image: np.ndarray) -> np.ndarray:
     features.append(image_norm)
     
     # 2. Gaussian blur (sigma 1, 2, 4)
-    for sigma in [1.0, 2.0, 4.0]:
+    for sigma in DEFAULT_FEATURE_SIGMAS:
         blurred = filters.gaussian(image_norm, sigma=sigma)
         features.append(blurred)
     
@@ -314,11 +488,23 @@ def segment_with_random_forest(
     for i in range(1, num_labels):  # Skip background
         area = stats[i, cv2.CC_STAT_AREA]
         x, y, w, h = stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP], stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
-        
+
+        # Compute perimeter and circularity from the component mask
+        component_mask = (labels == i).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            perimeter = float(cv2.arcLength(contours[0], True))
+            circularity = round(min(1.0, (4.0 * np.pi * float(area)) / (perimeter ** 2)), 4) if perimeter > 0 else 0.0
+        else:
+            perimeter = 0.0
+            circularity = 0.0
+
         detections.append({
-            'area': float(area),
-            'centroid': [float(centroids[i][0]), float(centroids[i][1])],
-            'bbox': [int(x), int(y), int(x + w), int(y + h)],
+            'area':        float(area),
+            'centroid':    [float(centroids[i][0]), float(centroids[i][1])],
+            'bbox':        [int(x), int(y), int(x + w), int(y + h)],
+            'perimeter':   round(perimeter, 2),
+            'circularity': circularity,
         })
     
     result['detections'] = detections
@@ -328,5 +514,71 @@ def segment_with_random_forest(
     # Random Forest returns a single mask (not a list of masks)
     result['masks'] = [(binary_mask > 0).tolist()]  # Single list: one mask entry containing 2D array
     
+    return result
+
+
+def segment_with_loaded_random_forest(
+    image: np.ndarray,
+    classifier: RandomForestClassifier,
+    confidence_threshold: float = 0.5,
+    min_area: int = 0,
+    apply_morphology: bool = False
+) -> Dict[str, Any]:
+    """
+    Run segmentation using a pre-trained Random Forest classifier.
+
+    Args:
+        image: Input image (H, W).
+        classifier: Pre-trained RandomForestClassifier.
+        confidence_threshold: Threshold for binary mask.
+        min_area: Minimum area for connected components.
+        apply_morphology: Whether to apply morphological closing.
+
+    Returns:
+        Dictionary with probability_map, binary_mask, overlay, detections, scores, and masks.
+    """
+    result = predict_segmentation(
+        image=image,
+        classifier=classifier,
+        confidence_threshold=confidence_threshold,
+        min_area=min_area,
+        apply_morphology=apply_morphology
+    )
+
+    binary_mask = np.array(result['binary_mask'])
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        (binary_mask > 0).astype(np.uint8) * 255,
+        connectivity=8
+    )
+
+    detections = []
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        x, y, w, h = (
+            stats[i, cv2.CC_STAT_LEFT],
+            stats[i, cv2.CC_STAT_TOP],
+            stats[i, cv2.CC_STAT_WIDTH],
+            stats[i, cv2.CC_STAT_HEIGHT],
+        )
+        component_mask = (labels == i).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            perimeter = float(cv2.arcLength(contours[0], True))
+            circularity = round(min(1.0, (4.0 * np.pi * float(area)) / (perimeter ** 2)), 4) if perimeter > 0 else 0.0
+        else:
+            perimeter = 0.0
+            circularity = 0.0
+
+        detections.append({
+            'area': float(area),
+            'centroid': [float(centroids[i][0]), float(centroids[i][1])],
+            'bbox': [int(x), int(y), int(x + w), int(y + h)],
+            'perimeter': round(perimeter, 2),
+            'circularity': circularity,
+        })
+
+    result['detections'] = detections
+    result['scores'] = [1.0] * len(detections)
+    result['masks'] = [(binary_mask > 0).tolist()]
     return result
 

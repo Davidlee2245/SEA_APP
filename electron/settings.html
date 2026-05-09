@@ -159,18 +159,78 @@
       margin-right: 6px;
       vertical-align: middle;
     }
+
+    /* ── Auto-setup progress ── */
+    .setup-progress-section {
+      display: none;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .progress-log {
+      max-height: 220px;
+      overflow-y: auto;
+      background: #0d0d1a;
+      border: 1px solid #2a3a4a;
+      border-radius: 4px;
+      padding: 10px 12px;
+      font-family: 'Cascadia Code', 'Consolas', monospace;
+      font-size: 11px;
+      line-height: 1.5;
+      color: #c8d8e8;
+    }
+    .progress-log > div {
+      margin-bottom: 6px;
+    }
+    .progress-log > div:last-child {
+      margin-bottom: 0;
+    }
+
+    .conda-banner {
+      display: none;
+      background: #2a1f24;
+      border: 1px solid #e74c3c;
+      border-radius: 4px;
+      padding: 12px 14px;
+      margin-bottom: 4px;
+      font-size: 12px;
+      line-height: 1.55;
+      color: #eec;
+    }
+    .conda-banner a {
+      color: #e94560;
+      cursor: pointer;
+      text-decoration: underline;
+    }
   </style>
 </head>
 <body>
 
   <div class="header">
-    <h1>🔬 SEA — First-Time Setup</h1>
-    <p>Configure your Python environment to get started. This is saved and won't be asked again.</p>
+    <h1 id="headerTitle">🔬 SEA — First-Time Setup</h1>
+    <p id="headerSubtitle">Configure your Python environment to get started. This is saved and won't be asked again.</p>
   </div>
 
   <div class="body">
 
+    <div id="condaBanner" class="conda-banner" role="alert">
+      Anaconda or Miniconda was not found in the usual install locations on this machine.
+      Please install it first, then restart SEA or set the Python path manually below.<br /><br />
+      <a href="#" id="anacondaDownloadLink">https://www.anaconda.com/download</a>
+    </div>
+
+    <div id="setupProgressSection" class="setup-progress-section">
+      <div class="field" style="margin-bottom: 0;">
+        <label>Automatic setup</label>
+        <div class="hint">
+          SEA will create the <code>SEA</code> conda environment (Python 3.10.19) and install bundled dependencies from <code>requirements.txt</code>.
+        </div>
+        <div id="setupProgressLog" class="progress-log" aria-live="polite"></div>
+      </div>
+      <hr class="divider" />
+    </div>
+
     <!-- Python Executable -->
+    <div id="manualFormSections">
     <div class="field" id="field-python">
       <label>Python Executable *</label>
       <div class="hint">
@@ -221,6 +281,8 @@
       </div>
     </div>
 
+    </div><!-- #manualFormSections -->
+
   </div>
 
   <div class="footer">
@@ -237,6 +299,51 @@
     const statusMsg    = document.getElementById('statusMsg');
     const launchBtn    = document.getElementById('launchBtn');
     const dataHint     = document.getElementById('dataRootHint');
+
+    const urlParams   = new URLSearchParams(window.location.search);
+    const mode        = urlParams.get('mode') || 'setup';
+    const isEditMode     = mode === 'edit';
+    const isAutoSetup    = mode === 'autosetup';
+    const isCondaMissing = mode === 'conda-missing';
+    const headerTitle = document.getElementById('headerTitle');
+    const headerSub   = document.getElementById('headerSubtitle');
+    const setupProgressSection = document.getElementById('setupProgressSection');
+    const setupProgressLog     = document.getElementById('setupProgressLog');
+    const manualFormSections   = document.getElementById('manualFormSections');
+    const condaBanner          = document.getElementById('condaBanner');
+
+    if (isEditMode) {
+      headerTitle.textContent = '🔬 SEA — Settings';
+      headerSub.textContent = 'Update Python path, data root, and API keys. Changes apply on next app launch.';
+      launchBtn.textContent = 'Save Settings';
+    } else if (isCondaMissing) {
+      headerTitle.textContent = '🔬 SEA — First-Time Setup';
+      headerSub.textContent = 'Anaconda or Miniconda was not found in the usual install locations. Install it from the link below, restart the app for automatic setup, or set your Python path manually.';
+      setupProgressSection.style.display = 'none';
+      condaBanner.style.display = 'block';
+      manualFormSections.style.display = 'flex';
+      launchBtn.disabled = true;
+      statusMsg.textContent = 'Install Anaconda / Miniconda, or browse to your Python executable.';
+      statusMsg.className = 'status-msg error';
+    } else if (isAutoSetup) {
+      headerTitle.textContent = '🔬 SEA — Setup';
+      headerSub.textContent = 'Preparing your Python environment. You can configure paths manually if automatic setup cannot finish.';
+      setupProgressSection.style.display = 'flex';
+      manualFormSections.style.display = 'none';
+      launchBtn.disabled = true;
+    }
+
+    function appendSetupLog(line) {
+      const row = document.createElement('div');
+      row.textContent = line;
+      setupProgressLog.appendChild(row);
+      setupProgressLog.scrollTop = setupProgressLog.scrollHeight;
+    }
+
+    document.getElementById('anacondaDownloadLink').addEventListener('click', (e) => {
+      e.preventDefault();
+      api.openExternal('https://www.anaconda.com/download');
+    });
 
     // ── Pre-fill from saved config ────────────────────────────────────────
 
@@ -259,6 +366,35 @@
       dataHint.innerHTML =
         `Where SEA stores your input images and analysis results.<br>` +
         `Leave blank to use: <code style="color:#7fa8c9">${defaultRoot}</code>`;
+    }
+
+    // ── First launch: conda + pip auto-setup ─────────────────────────────────
+    if (isAutoSetup) {
+      api.onAutoSetupProgress((msg) => appendSetupLog(msg));
+      api.startAutoSetup().then((result) => {
+        if (result && result.success) {
+          return;
+        }
+        manualFormSections.style.display = 'flex';
+        condaBanner.style.display = result && result.reason === 'conda-not-found' ? 'block' : 'none';
+        launchBtn.disabled = true;
+        if (pythonInput.value.trim()) validatePython(pythonInput.value.trim());
+        if (result && result.reason === 'error' && result.message) {
+          appendSetupLog('—');
+          appendSetupLog('Automatic setup failed. You can set the Python path manually below.');
+          appendSetupLog(result.message.length > 3000 ? result.message.slice(0, 3000) + '…' : result.message);
+        }
+        statusMsg.textContent = result && result.reason === 'conda-not-found'
+          ? 'Install Anaconda or choose your Python executable below.'
+          : 'Automatic setup failed — choose your Python executable below.';
+        statusMsg.className = 'status-msg error';
+      }).catch((err) => {
+        manualFormSections.style.display = 'flex';
+        condaBanner.style.display = 'none';
+        appendSetupLog(String(err.message || err));
+        statusMsg.textContent = 'Setup error — configure Python manually.';
+        statusMsg.className = 'status-msg error';
+      });
     }
 
     init();
@@ -307,7 +443,7 @@
       if (selected) dataInput.value = selected;
     });
 
-    // ── Launch ────────────────────────────────────────────────────────────
+    // ── Launch / Save ─────────────────────────────────────────────────────
 
     launchBtn.addEventListener('click', async () => {
       const pythonExe    = pythonInput.value.trim();
@@ -317,7 +453,7 @@
 
       if (!pythonExe) return;
 
-      // Disable UI while starting
+      // Disable UI while saving/starting
       launchBtn.disabled   = true;
       pythonInput.disabled = true;
       dataInput.disabled   = true;
@@ -326,10 +462,20 @@
       document.getElementById('browsePython').disabled = true;
       document.getElementById('browseData').disabled   = true;
 
-      statusMsg.innerHTML  = '<span class="spinner"></span>Starting backend… (may take 30–90 s for first run)';
+      statusMsg.innerHTML  = isEditMode
+        ? '<span class="spinner"></span>Saving settings…'
+        : '<span class="spinner"></span>Starting backend… (may take 30–90 s for first run)';
       statusMsg.className  = 'status-msg loading';
 
       try {
+        if (isEditMode) {
+          await api.saveSettings({ pythonExe, dataRoot, openaiKey, anthropicKey });
+          statusMsg.textContent = '✓ Settings saved. Restart app to apply backend path/data root changes.';
+          statusMsg.className = 'status-msg';
+          setTimeout(() => window.close(), 350);
+          return;
+        }
+
         await api.launchAfterSettings({ pythonExe, dataRoot, openaiKey, anthropicKey });
         // If we reach here the main window opened — settings window closes itself
       } catch (err) {

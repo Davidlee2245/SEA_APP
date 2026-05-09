@@ -3,14 +3,37 @@
  * Uses SAM (Segment Anything Model) for exosome segmentation
  */
 
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import '../styles/ExosomeDetection.css';
 import { getApiBase } from '../lib/apiBase';
+import { copyText } from '../lib/clipboard';
+import * as storage from '../lib/storage';
+
+interface NormStats {
+  dtype: string;
+  original_min: number;
+  original_max: number;
+  p0_5: number;
+  p99_5: number;
+  display_min: number;
+  display_max: number;
+  normalization: string;
+  cache_hit?: boolean;
+  preview_path?: string;
+}
 
 interface ChannelItem {
   key: string;
   display_label: string;
   preview_url?: string;
+  // Normalization / display-pipeline debug info
+  norm_stats?: NormStats;
+  display_source?: string;  // e.g. 'previews/abc123.png'
+  detection_source?: string; // e.g. 'crop_channels/def456.tif'
+  crop_mode?: boolean;
+  source_tiff?: string;
+  channel_index?: number;
+  label?: string;
 }
 
 interface DetectionResult {
@@ -19,6 +42,69 @@ interface DetectionResult {
   centroid: [number, number];
   bbox: [number, number, number, number]; // [x1, y1, x2, y2]
   score?: number;
+  perimeter?: number;
+  circularity?: number;
+}
+
+interface SavedRfModelItem {
+  position: string;
+  saved_at?: string | null;
+  trained_on?: {
+    sample?: string;
+    position?: string;
+    channel?: string;
+  };
+  sklearn_version?: string | null;
+  path: string;
+}
+
+interface GuidePoint {
+  id: number;
+  x: number;
+  y: number;
+}
+
+/** Mask foreground at (y,x); out-of-range is background — used for contour tests. */
+function maskPixelOn(mask: boolean[][], y: number, x: number): boolean {
+  if (y < 0 || x < 0) return false;
+  const row = mask[y];
+  if (!row || x >= row.length) return false;
+  return !!row[x];
+}
+
+function hexToRgb(hex: string): [number, number, number] {
+  return [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16)];
+}
+
+/**
+ * Visit every outline pixel (4-connected foreground with at least one off-mask neighbor).
+ * Scans full mask bounds inside the canvas (fixes the old loops that skipped y=0,x=0 and broke edge logic).
+ */
+function forEachContourPixel(
+  mask: boolean[][],
+  canvasWidth: number,
+  canvasHeight: number,
+  visit: (x: number, y: number) => void,
+): void {
+  const h = mask.length;
+  if (h === 0) return;
+  const w = mask[0]?.length ?? 0;
+  if (w === 0) return;
+  const maxY = Math.min(h, canvasHeight) - 1;
+  const maxX = Math.min(w, canvasWidth) - 1;
+  for (let y = 0; y <= maxY; y++) {
+    const row = mask[y];
+    if (!row) continue;
+    for (let x = 0; x <= maxX; x++) {
+      if (!row[x]) continue;
+      const border =
+        !maskPixelOn(mask, y - 1, x) ||
+        !maskPixelOn(mask, y + 1, x) ||
+        !maskPixelOn(mask, y, x - 1) ||
+        !maskPixelOn(mask, y, x + 1);
+      if (border) visit(x, y);
+    }
+  }
 }
 
 interface ExosomeDetectionState {
@@ -101,6 +187,7 @@ interface ExosomeDetectionState {
     offsetX: number;
     offsetY: number;
     annotationId?: string; // Link to annotation group for Random Forest
+    clickType?: 'exosome' | 'background';
   }>;
   
   // Brush preview (for Random Forest annotation)
@@ -126,6 +213,44 @@ interface ExosomeDetectionState {
   // Export
   exportStatus: string | null;
   exportPaths: string[];
+  rfModelStatus: string | null;
+  rfModelWarning: string | null;
+  rfModelSavedPath: string | null;
+  availableRfModels: SavedRfModelItem[];
+  selectedRfModelSourcePosition: string;
+
+  // Ground truth overlay
+  showGroundTruth: boolean;
+  groundTruthPoints: Array<{ x: number; y: number }>;
+  groundTruthCount: number;
+  groundTruthFile: string | null;
+  groundTruthPixelSizeUm: number; // µm/pixel from TIFF metadata (returned by backend)
+  gtImageWidth: number | null;    // raw TIFF width in pixels (from backend)
+  gtImageHeight: number | null;   // raw TIFF height in pixels (from backend)
+  // raw µm sample for debug display (first 20 CSV rows before conversion)
+  rawGtSampleUm: Array<{ x_um: number; y_um: number; x_px: number; y_px: number }>;
+
+  // GT transform controls (all diagnostic / togglable)
+  gtDebugMode: boolean;
+  gtSwapXY: boolean;    // swap CSV X↔Y before any other transform
+  gtYFlip: boolean;     // flip Y axis: y_final = imageHeight - y  (bottom-left origin correction)
+  gtOffsetX: number;    // add this pixel offset to every X after other transforms
+  gtOffsetY: number;    // add this pixel offset to every Y after other transforms
+
+  // Crop mode info (returned by backend when position contains 'crop')
+  cropMode: boolean;
+  cropTiffFile: string | null;
+  cropTiffShape: number[] | null;  // e.g. [14, 835, 900]
+  cropTiffAxes: string | null;     // e.g. 'CYX'
+  cropNumChannels: number | null;
+  cropPixelSizeUm: number | null;
+  cropPixelSizeSource: string | null; // 'metadata' | 'fallback'
+
+  // Exosome-detection-only display mode (does NOT affect detection pipeline)
+  displayMode: 'raw_16bit' | 'enhanced' | 'minmax';
+  displayLut: 'gray' | 'red';
+  // Normalization stats for the CURRENTLY displayed image (updated on every channel/mode change)
+  currentNormStats: NormStats | null;
 }
 
 // Helper component for slider + numeric input pair
@@ -434,11 +559,214 @@ const AreaHistogram: React.FC<{ detections: DetectionResult[] }> = ({ detections
       <h3>Area Distribution</h3>
       <canvas
         ref={histCanvasRef}
+        onContextMenu={(e) => e.preventDefault()}
         style={{ width: '100%', height: '220px', borderRadius: '4px' }}
       />
     </div>
   );
 };
+
+// ---------------------------------------------------------------------------
+// DetectionTable: sortable + filterable result table
+// ---------------------------------------------------------------------------
+type SortKey = 'id' | 'area' | 'perimeter' | 'circularity';
+type SortDir = 'asc' | 'desc';
+
+interface DetectionTableProps {
+  detections: DetectionResult[];
+  selectedIdx: number | null;
+  onRowClick: (idx: number) => void;
+  filterArea: { min: string; max: string };
+  filterCirc: { min: string; max: string };
+  onFilterAreaChange: React.Dispatch<React.SetStateAction<{ min: string; max: string }>>;
+  onFilterCircChange: React.Dispatch<React.SetStateAction<{ min: string; max: string }>>;
+  onFilteredIndicesChange: (indices: number[]) => void;
+  onApplyFilters: () => void;
+  onSaveFilter: () => void;
+  saveMessage?: string;
+}
+
+const DetectionTable: React.FC<DetectionTableProps> = React.memo(({
+  detections,
+  selectedIdx,
+  onRowClick,
+  filterArea,
+  filterCirc,
+  onFilterAreaChange,
+  onFilterCircChange,
+  onFilteredIndicesChange,
+  onApplyFilters,
+  onSaveFilter,
+  saveMessage,
+}) => {
+  const [sortKey, setSortKey] = React.useState<SortKey>('id');
+  const [sortDir, setSortDir] = React.useState<SortDir>('asc');
+
+  const handleHeaderClick = (key: SortKey) => {
+    if (sortKey === key) {
+      setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortKey(key);
+      setSortDir('asc');
+    }
+  };
+
+  const sortArrow = (key: SortKey) => sortKey === key ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '';
+
+  const filtered = React.useMemo(() => {
+    const aMin = filterArea.min !== '' ? parseFloat(filterArea.min) : -Infinity;
+    const aMax = filterArea.max !== '' ? parseFloat(filterArea.max) :  Infinity;
+    const cMin = filterCirc.min !== '' ? parseFloat(filterCirc.min) : -Infinity;
+    const cMax = filterCirc.max !== '' ? parseFloat(filterCirc.max) :  Infinity;
+
+    return detections
+      .map((d, origIdx) => ({ d, origIdx }))
+      .filter(({ d }) => {
+        if (d.area < aMin || d.area > aMax) return false;
+        const c = d.circularity ?? 0;
+        if (c < cMin || c > cMax) return false;
+        return true;
+      })
+      .sort((a, b) => {
+        let av = 0, bv = 0;
+        if (sortKey === 'id')          { av = a.d.id;                     bv = b.d.id; }
+        else if (sortKey === 'area')   { av = a.d.area;                   bv = b.d.area; }
+        else if (sortKey === 'perimeter') { av = a.d.perimeter ?? 0;      bv = b.d.perimeter ?? 0; }
+        else if (sortKey === 'circularity') { av = a.d.circularity ?? 0;  bv = b.d.circularity ?? 0; }
+        return sortDir === 'asc' ? av - bv : bv - av;
+      });
+  }, [detections, sortKey, sortDir, filterArea, filterCirc]);
+
+  const applyFilters = () => {
+    onFilteredIndicesChange(filtered.map(({ origIdx }) => origIdx));
+    onApplyFilters();
+  };
+
+  const thStyle: React.CSSProperties = {
+    cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap',
+    padding: '6px 8px', background: '#f0f0f0', borderBottom: '2px solid #ccc',
+  };
+  const filterInputStyle: React.CSSProperties = {
+    width: '60px', padding: '2px 4px', border: '1px solid #ccc',
+    borderRadius: '3px', fontSize: '0.75rem',
+  };
+
+  return (
+    <div className="results-table-container">
+      <h3>Detected Objects ({filtered.length} / {detections.length})</h3>
+
+      {/* Filter row */}
+      <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap', marginBottom: '0.5rem', fontSize: '0.8rem', alignItems: 'center' }}>
+        <span style={{ fontWeight: 600 }}>Filter:</span>
+        <label>Area min <input style={filterInputStyle} value={filterArea.min} onChange={e => onFilterAreaChange(p => ({ ...p, min: e.target.value }))} placeholder="—" /></label>
+        <label>Area max <input style={filterInputStyle} value={filterArea.max} onChange={e => onFilterAreaChange(p => ({ ...p, max: e.target.value }))} placeholder="—" /></label>
+        <label>Circ min <input style={filterInputStyle} value={filterCirc.min} onChange={e => onFilterCircChange(p => ({ ...p, min: e.target.value }))} placeholder="—" /></label>
+        <label>Circ max <input style={filterInputStyle} value={filterCirc.max} onChange={e => onFilterCircChange(p => ({ ...p, max: e.target.value }))} placeholder="—" /></label>
+        <button style={{ padding: '2px 8px', fontSize: '0.75rem' }} onClick={applyFilters}>Apply</button>
+        <button
+          style={{
+            padding: '2px 10px',
+            fontSize: '0.75rem',
+            background: '#2563eb',
+            color: 'white',
+            border: '1px solid #1d4ed8',
+            borderRadius: 4,
+            cursor: 'pointer',
+          }}
+          onClick={onSaveFilter}
+          title="Persist this filtered set for Results Viewer"
+        >
+          💾 Save Filter
+        </button>
+        <button style={{ padding: '2px 8px', fontSize: '0.75rem' }} onClick={() => { onFilterAreaChange({ min: '', max: '' }); onFilterCircChange({ min: '', max: '' }); }}>Reset</button>
+        {!!saveMessage && (
+          <span style={{ color: '#2563eb', fontWeight: 600 }}>
+            {saveMessage}
+          </span>
+        )}
+      </div>
+
+      <div style={{ maxHeight: '300px', overflowY: 'auto' }}>
+        <table className="detections-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <thead>
+            <tr>
+              <th style={thStyle} onClick={() => handleHeaderClick('id')}>ID{sortArrow('id')}</th>
+              <th style={thStyle} onClick={() => handleHeaderClick('area')}>Area (px²){sortArrow('area')}</th>
+              <th style={{ ...thStyle, cursor: 'default' }}>Centroid (x, y)</th>
+              <th style={thStyle} onClick={() => handleHeaderClick('perimeter')}>Perimeter{sortArrow('perimeter')}</th>
+              <th style={thStyle} onClick={() => handleHeaderClick('circularity')}>Circularity{sortArrow('circularity')}</th>
+              <th style={{ ...thStyle, cursor: 'default' }}>Score</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map(({ d, origIdx }) => (
+              <tr
+                key={d.id}
+                onClick={() => onRowClick(origIdx)}
+                className={selectedIdx === origIdx ? 'selected' : ''}
+                style={{ cursor: 'pointer' }}
+              >
+                <td style={{ padding: '4px 8px', textAlign: 'center' }}>{d.id}</td>
+                <td style={{ padding: '4px 8px', textAlign: 'right' }}>{d.area.toFixed(1)}</td>
+                <td style={{ padding: '4px 8px', textAlign: 'center' }}>({d.centroid[0].toFixed(1)}, {d.centroid[1].toFixed(1)})</td>
+                <td style={{ padding: '4px 8px', textAlign: 'right' }}>{d.perimeter != null ? d.perimeter.toFixed(1) : '—'}</td>
+                <td style={{ padding: '4px 8px', textAlign: 'right' }}>{d.circularity != null ? d.circularity.toFixed(3) : '—'}</td>
+                <td style={{ padding: '4px 8px', textAlign: 'right' }}>{d.score !== undefined ? d.score.toFixed(3) : 'N/A'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Exosome-detection-only display helper (does NOT touch any detection pipeline)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch the display-mode-correct preview URL for a channel.
+ * - enhanced + gray  → reuse pre-cached preview_url from items (no extra round-trip)
+ * - all other modes  → call /api/exosome/channel_display
+ */
+async function fetchChannelDisplay(
+  apiBase: string,
+  sample: string,
+  position: string,
+  channel: string,
+  mode: string,
+  lut: string,
+  availableItems: ChannelItem[],
+): Promise<{ url: string; normStats: NormStats | null } | null> {
+  if (!sample || !position || !channel) return null;
+
+  // enhanced + gray: the pre-generated preview from load_position is already correct
+  if (mode === 'enhanced' && lut === 'gray') {
+    const item = availableItems.find(i => i.key === channel);
+    if (item?.preview_url) {
+      return { url: item.preview_url, normStats: item.norm_stats || null };
+    }
+  }
+
+  try {
+    const resp = await fetch(`${apiBase}/api/exosome/channel_display`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sample, position, channel, mode, lut }),
+    });
+    const data = await resp.json();
+    if (data.success) {
+      return { url: data.preview_url, normStats: data.norm_stats || null };
+    }
+    console.error('[fetchChannelDisplay] backend error:', data.error);
+  } catch (err) {
+    console.error('[fetchChannelDisplay] fetch error:', err);
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 
 const ExosomeDetection: React.FC = () => {
   const [state, setState] = useState<ExosomeDetectionState>({
@@ -453,7 +781,7 @@ const ExosomeDetection: React.FC = () => {
     imageWidth: 0,
     imageHeight: 0,
     
-    detectionMethod: 'sam',
+    detectionMethod: 'random_forest',
     
     // Random Forest settings
     annotations: [],
@@ -507,6 +835,38 @@ const ExosomeDetection: React.FC = () => {
     
     exportStatus: null,
     exportPaths: [],
+    rfModelStatus: null,
+    rfModelWarning: null,
+    rfModelSavedPath: null,
+    availableRfModels: [],
+    selectedRfModelSourcePosition: '',
+
+    showGroundTruth: false,
+    groundTruthPoints: [],
+    groundTruthCount: 0,
+    groundTruthFile: null,
+    groundTruthPixelSizeUm: 0.21,
+    gtImageWidth: null,
+    gtImageHeight: null,
+    rawGtSampleUm: [],
+
+    gtDebugMode: false,
+    gtSwapXY: false,
+    gtYFlip: false,
+    gtOffsetX: 0,
+    gtOffsetY: 0,
+
+    cropMode: false,
+    cropTiffFile: null,
+    cropTiffShape: null,
+    cropTiffAxes: null,
+    cropNumChannels: null,
+    cropPixelSizeUm: null,
+    cropPixelSizeSource: null,
+
+    displayMode: 'raw_16bit',
+    displayLut: 'gray',
+    currentNormStats: null,
   });
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -524,30 +884,253 @@ const ExosomeDetection: React.FC = () => {
     offsetX: 0,
     offsetY: 0,
   });
+  const [filterArea, setFilterArea] = useState<{ min: string; max: string }>({ min: '', max: '' });
+  const [filterCirc, setFilterCirc] = useState<{ min: string; max: string }>({ min: '', max: '' });
+  const [showFilteredOnly, setShowFilteredOnly] = useState(false);
+  const [showGuideFromRef, setShowGuideFromRef] = useState(false);
+  const [guideRefPoints, setGuideRefPoints] = useState<GuidePoint[]>([]);
+  const [guideRefAvailable, setGuideRefAvailable] = useState(false);
+  const [filteredDetectionIndices, setFilteredDetectionIndices] = useState<number[]>([]);
+  const [filterApplyNonce, setFilterApplyNonce] = useState(0);
+  /** Bumps only on a fresh detection batch (new segmentation, clear, or load position) so filter indices are not reset on incidental state churn. */
+  const [detectionBatchId, setDetectionBatchId] = useState(0);
+  const [saveFilterMessage, setSaveFilterMessage] = useState<string>('');
   const isPanningRef = useRef<boolean>(false);
   const panStartRef = useRef<{ x: number; y: number } | null>(null);
+  const filteredDetectionIndexSet = useMemo(() => new Set(filteredDetectionIndices), [filteredDetectionIndices]);
+  const annotationLabelById = useMemo(() => {
+    const map = new Map<string, number>();
+    state.annotations.forEach((ann) => map.set(ann.id, ann.label));
+    return map;
+  }, [state.annotations]);
+  const getClickCategory = useCallback((click: ExosomeDetectionState['clickHistory'][number]): 'exosome' | 'background' => {
+    if (click.clickType) return click.clickType;
+    if (click.annotationId) {
+      const label = annotationLabelById.get(click.annotationId);
+      if (label === 0) return 'background';
+      if (label === 1) return 'exosome';
+    }
+    if ((click.predictedClass || '').toLowerCase() === 'background') return 'background';
+    return 'exosome';
+  }, [annotationLabelById]);
+  const filteredOutIndices = useMemo(() => {
+    if (state.detections.length === 0) return [];
+    const inSet = filteredDetectionIndexSet;
+    return state.detections.map((_, i) => i).filter(i => !inSet.has(i));
+  }, [filteredDetectionIndexSet, state.detections]);
+  const handleFilteredIndicesChange = useCallback((indices: number[]) => {
+    setFilteredDetectionIndices(prev => {
+      if (prev.length === indices.length && prev.every((v, i) => v === indices[i])) return prev;
+      return indices;
+    });
+  }, []);
+  const handleApplyFilters = useCallback(() => {
+    setFilterApplyNonce(v => v + 1);
+  }, []);
+  const handleSaveFilter = useCallback(async () => {
+    try {
+      const sample = state.selectedSample;
+      const position = state.selectedPosition;
+      const channel = state.selectedChannel;
+      if (!sample || !position || !channel) {
+        setSaveFilterMessage('Select sample/position/channel first');
+        return;
+      }
+      const storageKey = `sea_filtered_detections_${sample}_${position}_${channel}`;
+      const objectIds = filteredDetectionIndices
+        .map((i) => state.detections[i]?.id)
+        .filter((id): id is number => typeof id === 'number' && Number.isFinite(id));
+
+      await storage.set(
+        storageKey,
+        JSON.stringify({
+          enabled: true,
+          objectIds,
+          totalDetections: state.detections.length,
+          savedAt: Date.now(),
+        }),
+      );
+
+      // Investigation logs (remove after debugging)
+      try {
+        const raw = await storage.get(storageKey);
+        const parsed = raw ? JSON.parse(raw) : null;
+        const ids = Array.isArray(parsed?.objectIds) ? parsed.objectIds : [];
+        const uniq = new Set(ids.map((v: any) => String(v)));
+        console.log('[SaveFilter] key=', storageKey);
+        console.log('[SaveFilter] totalDetections=', parsed?.totalDetections, 'objectIds.length=', ids.length);
+        console.log('[SaveFilter] idTypeSample=', ids.slice(0, 5).map((v: any) => typeof v), 'idSample=', ids.slice(0, 5));
+        console.log('[SaveFilter] uniqueCount=', uniq.size, 'hasDuplicates=', uniq.size !== ids.length);
+      } catch (e) {
+        console.log('[SaveFilter] failed to log saved payload', e);
+      }
+
+      setSaveFilterMessage(`Saved ${objectIds.length} filtered detections`);
+      window.setTimeout(() => setSaveFilterMessage(''), 2500);
+    } catch {
+      setSaveFilterMessage('Save failed');
+      window.setTimeout(() => setSaveFilterMessage(''), 2500);
+    }
+  }, [filteredDetectionIndices, state.detections, state.selectedChannel, state.selectedPosition, state.selectedSample]);
+
+  useEffect(() => {
+    if (state.detections.length === 0) {
+      setFilteredDetectionIndices([]);
+      return;
+    }
+    setFilteredDetectionIndices(state.detections.map((_, idx) => idx));
+  }, [detectionBatchId]); // eslint-disable-line react-hooks/exhaustive-deps -- reset filters only when detectionBatchId bumps (fresh detection batch).
+
+  useEffect(() => {
+    // Guide overlay is only for non-reference channels.
+    if (state.selectedChannel === 'C0') {
+      setShowGuideFromRef(false);
+      setGuideRefPoints([]);
+      setGuideRefAvailable(false);
+      return;
+    }
+    const sample = state.selectedSample;
+    const position = state.selectedPosition;
+    if (!sample || !position) {
+      setGuideRefAvailable(false);
+      setGuideRefPoints([]);
+      setShowGuideFromRef(false);
+      return;
+    }
+    let cancelled = false;
+    const loadGuideAvailability = async () => {
+      const raw = await storage.get(`sea_filtered_detections_${sample}_${position}_C0`);
+      if (cancelled || !raw) {
+        setGuideRefAvailable(false);
+        setGuideRefPoints([]);
+        setShowGuideFromRef(false);
+        return;
+      }
+      try {
+        const parsed = JSON.parse(raw);
+        const ids = Array.isArray(parsed?.objectIds) ? parsed.objectIds : [];
+        const enabled = parsed?.enabled ?? true;
+        const available = enabled && ids.length > 0;
+        if (cancelled) return;
+        setGuideRefAvailable(available);
+        if (!available) {
+          setGuideRefPoints([]);
+          setShowGuideFromRef(false);
+        }
+      } catch {
+        if (!cancelled) {
+          setGuideRefAvailable(false);
+          setGuideRefPoints([]);
+          setShowGuideFromRef(false);
+        }
+      }
+    };
+    void loadGuideAvailability();
+    return () => { cancelled = true; };
+  }, [state.selectedSample, state.selectedPosition, state.selectedChannel]);
+
+  useEffect(() => {
+    const sample = state.selectedSample;
+    const position = state.selectedPosition;
+    if (!showGuideFromRef || !guideRefAvailable || !sample || !position || state.selectedChannel === 'C0') {
+      setGuideRefPoints([]);
+      return;
+    }
+
+    let cancelled = false;
+    const loadGuide = async () => {
+      const raw = await storage.get(`sea_filtered_detections_${sample}_${position}_C0`);
+      if (!raw) {
+        if (!cancelled) {
+          setGuideRefPoints([]);
+          setShowGuideFromRef(false);
+        }
+        return;
+      }
+      let objectIds: number[] = [];
+      try {
+        const parsed = JSON.parse(raw);
+        objectIds = Array.isArray(parsed?.objectIds)
+          ? parsed.objectIds.map((v: any) => Number(v)).filter((n: number) => Number.isFinite(n))
+          : [];
+      } catch {
+        if (!cancelled) {
+          setGuideRefPoints([]);
+          setShowGuideFromRef(false);
+        }
+        return;
+      }
+      if (objectIds.length === 0) {
+        if (!cancelled) {
+          setGuideRefPoints([]);
+          setShowGuideFromRef(false);
+        }
+        return;
+      }
+      try {
+        const resp = await fetch(
+          `${getApiBase()}/api/exosome/channel_detections?sample=${encodeURIComponent(sample)}&position=${encodeURIComponent(position)}&channel=${encodeURIComponent('C0')}`
+        );
+        const data = await resp.json();
+        if (!resp.ok || !data.success) {
+          throw new Error(data?.error || 'Failed to load reference detections');
+        }
+        if (cancelled) return;
+        const byId = new Map<number, { x: number; y: number }>();
+        (data.data?.detections || []).forEach((d: any) => {
+          const id = Number(d.id);
+          if (!Number.isFinite(id)) return;
+          byId.set(id, { x: Number(d.centroid_x) || 0, y: Number(d.centroid_y) || 0 });
+        });
+        const points: GuidePoint[] = objectIds
+          .map((id) => {
+            const p = byId.get(id);
+            if (!p) return null;
+            return { id, x: p.x, y: p.y };
+          })
+          .filter((p): p is GuidePoint => !!p);
+        setGuideRefPoints(points);
+      } catch {
+        if (!cancelled) {
+          setGuideRefPoints([]);
+        }
+      }
+    };
+    loadGuide();
+    return () => { cancelled = true; };
+  }, [showGuideFromRef, guideRefAvailable, state.selectedSample, state.selectedPosition, state.selectedChannel]);
   
   // Viewport and content refs (single source of truth)
   const viewportRef = useRef<HTMLDivElement>(null); // Captures pointer events
   const contentRef = useRef<HTMLDivElement>(null); // Gets transform (translate + scale)
 
-  // Fetch available samples on mount
+  // Default auto-load
+  const autoLoadFiredRef = useRef(false);
+  const [pendingAutoLoad, setPendingAutoLoad] = useState(false);
+
+  // Fetch available samples on mount; auto-select default
   useEffect(() => {
     const fetchSamples = async () => {
       try {
-        const response = await fetch('${getApiBase()}/api/input/samples');
+        const response = await fetch(`${getApiBase()}/api/input/samples`);
         const data = await response.json();
         if (data.success) {
-          setState(prev => ({ ...prev, availableSamples: data.data }));
+          setState(prev => {
+            const next = { ...prev, availableSamples: data.data };
+            if (!prev.selectedSample && data.data.includes('A2780Cis10'))
+              next.selectedSample = 'A2780Cis10';
+            return next;
+          });
         }
       } catch (err) {
         console.error('Failed to fetch samples:', err);
       }
     };
     fetchSamples();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Fetch positions when sample changes
+  // Fetch positions when sample changes; auto-select default
   useEffect(() => {
     if (!state.selectedSample) {
       setState(prev => ({
@@ -568,7 +1151,15 @@ const ExosomeDetection: React.FC = () => {
         );
         const data = await response.json();
         if (data.success) {
-          setState(prev => ({ ...prev, availablePositions: data.data }));
+          setState(prev => {
+            const next = { ...prev, availablePositions: data.data };
+            if (!prev.selectedPosition && data.data.includes('P1')) {
+              next.selectedPosition = 'P1';
+              if (prev.selectedSample === 'A2780Cis10' && !autoLoadFiredRef.current)
+                setPendingAutoLoad(true);
+            }
+            return next;
+          });
         }
       } catch (err) {
         console.error('Failed to fetch positions:', err);
@@ -585,7 +1176,7 @@ const ExosomeDetection: React.FC = () => {
     }
 
     try {
-      const response = await fetch('${getApiBase()}/api/input/load_position', {
+      const response = await fetch(`${getApiBase()}/api/input/load_position`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -602,7 +1193,9 @@ const ExosomeDetection: React.FC = () => {
 
       const items: ChannelItem[] = data.data.items || [];
       const firstItem = items[0];
+      const d = data.data;
       
+      setDetectionBatchId(b => b + 1);
       setState(prev => ({
         ...prev,
         availableItems: items,
@@ -616,25 +1209,62 @@ const ExosomeDetection: React.FC = () => {
         detections: [],
         clickHistory: [], // Reset click history when loading new image
         debugLogs: [], // Reset debug logs when loading new image
+        // Crop mode metadata
+        cropMode: d.crop_mode ?? false,
+        cropTiffFile: d.tiff_file ?? null,
+        cropTiffShape: d.tiff_shape ?? null,
+        cropTiffAxes: d.tiff_axes ?? null,
+        cropNumChannels: d.n_channels ?? null,
+        cropPixelSizeUm: d.pixel_size_um ?? null,
+        cropPixelSizeSource: d.pixel_size_source ?? null,
       }));
 
-      // Load image to get dimensions
-      if (firstItem?.preview_url) {
-        const img = new Image();
-        img.crossOrigin = 'anonymous';
-        img.onload = () => {
-          setState(prev => ({
-            ...prev,
-            imageWidth: img.width,
-            imageHeight: img.height,
-          }));
-          imageRef.current = img;
-          drawCanvas();
-        };
-        const absoluteUrl = firstItem.preview_url.startsWith('http')
-          ? firstItem.preview_url
-          : `${getApiBase()}${firstItem.preview_url}`;
-        img.src = absoluteUrl;
+      // Auto-load ground truth for this sample/position
+      fetch(`${getApiBase()}/api/exosome/ground_truth?sample=${encodeURIComponent(state.selectedSample)}&position=${encodeURIComponent(state.selectedPosition)}`)
+        .then(r => r.json())
+        .then(gt => {
+          if (gt.success) {
+            setState(prev => ({
+              ...prev,
+              groundTruthPoints: gt.data.points,
+              groundTruthCount: gt.data.count,
+              groundTruthFile: gt.data.file,
+              groundTruthPixelSizeUm: gt.data.pixel_size_um ?? 0.21,
+              gtImageWidth:  gt.data.image_width  ?? null,
+              gtImageHeight: gt.data.image_height ?? null,
+              rawGtSampleUm: gt.data.raw_sample_um ?? [],
+            }));
+          }
+        })
+        .catch(() => { /* no ground truth available */ });
+
+      // Load display image for the initial channel using the current display mode
+      if (firstItem) {
+        const result = await fetchChannelDisplay(
+          getApiBase(),
+          state.selectedSample,
+          state.selectedPosition,
+          firstItem.key,
+          state.displayMode,
+          state.displayLut,
+          items,
+        );
+        if (result) {
+          const img = new Image();
+          img.crossOrigin = 'anonymous';
+          img.onload = () => {
+            setState(prev => ({
+              ...prev,
+              imageWidth: img.width,
+              imageHeight: img.height,
+              currentNormStats: result.normStats,
+            }));
+            imageRef.current = img;
+            drawCanvas();
+          };
+          const url = result.url.startsWith('http') ? result.url : `${getApiBase()}${result.url}`;
+          img.src = url;
+        }
       }
     } catch (err) {
       console.error('Failed to load position:', err);
@@ -642,30 +1272,116 @@ const ExosomeDetection: React.FC = () => {
     }
   };
 
-  // Update image when channel changes
+  // Auto-load effect — placed after handleLoadPosition to avoid hoisting error
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!pendingAutoLoad || autoLoadFiredRef.current) return;
+    autoLoadFiredRef.current = true;
+    setPendingAutoLoad(false);
+    handleLoadPosition();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingAutoLoad]);
+
+  // ── Click history localStorage helpers ──────────────────────────────────────
+
+  const clickStorageKey = (sample: string, position: string, channel: string, method: string) =>
+    `sea_clicks_${sample}_${position}_${channel}_${method}`;
+
+  const saveClickHistory = () => {
+    const { selectedSample, selectedPosition, selectedChannel, detectionMethod, clickHistory, annotations } = state;
+    if (!selectedSample || !selectedPosition || !selectedChannel) return;
+    const payload = { clickHistory, annotations, savedAt: new Date().toISOString() };
+    void storage.set(clickStorageKey(selectedSample, selectedPosition, selectedChannel, detectionMethod), JSON.stringify(payload));
+  };
+
+  const loadClickHistory = () => {
+    const { selectedSample, selectedPosition, selectedChannel, detectionMethod } = state;
+    void (async () => {
+      const raw = await storage.get(clickStorageKey(selectedSample, selectedPosition, selectedChannel, detectionMethod));
+      if (!raw) { alert('No saved click history for this sample/position/channel/method.'); return; }
+      try {
+        const { clickHistory, annotations } = JSON.parse(raw);
+        setState(prev => ({ ...prev, clickHistory: clickHistory || [], annotations: annotations || [] }));
+      } catch { alert('Failed to parse saved click history.'); }
+    })();
+  };
+
+  const resetClickHistory = () => {
+    const { selectedSample, selectedPosition, selectedChannel, detectionMethod } = state;
+    void storage.remove(clickStorageKey(selectedSample, selectedPosition, selectedChannel, detectionMethod));
+    setState(prev => ({ ...prev, clickHistory: [], annotations: [] }));
+  };
+
+  // Auto-save click history whenever it changes
+  useEffect(() => {
+    const { selectedSample, selectedPosition, selectedChannel, detectionMethod, clickHistory } = state;
+    if (!selectedSample || !selectedPosition || !selectedChannel || clickHistory.length === 0) return;
+    const payload = { clickHistory, annotations: state.annotations, savedAt: new Date().toISOString() };
+    void storage.set(clickStorageKey(selectedSample, selectedPosition, selectedChannel, detectionMethod), JSON.stringify(payload));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.clickHistory]);
+
+  // Auto-restore click history when channel or method changes
+  useEffect(() => {
+    const { selectedSample, selectedPosition, selectedChannel, detectionMethod } = state;
+    if (!selectedSample || !selectedPosition || !selectedChannel) return;
+    let cancelled = false;
+    const restoreClickHistory = async () => {
+      const raw = await storage.get(clickStorageKey(selectedSample, selectedPosition, selectedChannel, detectionMethod));
+      if (cancelled) return;
+      if (!raw) {
+        setState(prev => ({ ...prev, clickHistory: [], annotations: [] }));
+        return;
+      }
+      try {
+        const { clickHistory, annotations } = JSON.parse(raw);
+        if (!cancelled) {
+          setState(prev => ({ ...prev, clickHistory: clickHistory || [], annotations: annotations || [] }));
+        }
+      } catch {
+        // ignore corrupt storage
+      }
+    };
+    void restoreClickHistory();
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.selectedChannel, state.detectionMethod]);
+
+  // Update image when channel, display mode, or LUT changes
   useEffect(() => {
     if (!state.loaded || !state.selectedChannel) return;
 
-    const item = state.availableItems.find(i => i.key === state.selectedChannel);
-    if (item?.preview_url) {
+    let cancelled = false;
+    fetchChannelDisplay(
+      getApiBase(),
+      state.selectedSample,
+      state.selectedPosition,
+      state.selectedChannel,
+      state.displayMode,
+      state.displayLut,
+      state.availableItems,
+    ).then(result => {
+      if (cancelled || !result) return;
       const img = new Image();
       img.crossOrigin = 'anonymous';
       img.onload = () => {
+        if (cancelled) return;
         setState(prev => ({
           ...prev,
-          currentImageUrl: item.preview_url || null,
+          currentImageUrl: result.url,
           imageWidth: img.width,
           imageHeight: img.height,
+          currentNormStats: result.normStats,
         }));
         imageRef.current = img;
         drawCanvas();
       };
-      const absoluteUrl = item.preview_url.startsWith('http')
-        ? item.preview_url
-        : `${getApiBase()}${item.preview_url}`;
-      img.src = absoluteUrl;
-    }
-  }, [state.selectedChannel, state.loaded]);
+      const url = result.url.startsWith('http') ? result.url : `${getApiBase()}${result.url}`;
+      img.src = url;
+    });
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.selectedChannel, state.loaded, state.displayMode, state.displayLut]);
 
   // Draw canvas with image, prompts, and masks
   const drawCanvas = useCallback(() => {
@@ -684,6 +1400,20 @@ const ExosomeDetection: React.FC = () => {
 
     // Draw image
     ctx.drawImage(img, 0, 0);
+
+    // Guide from reference (C0) overlay for non-reference channels.
+    if (showGuideFromRef && state.selectedChannel !== 'C0' && guideRefPoints.length > 0) {
+      ctx.save();
+      ctx.strokeStyle = 'rgba(0, 255, 255, 0.95)';
+      ctx.lineWidth = 2.5;
+      ctx.setLineDash([6, 3]);
+      guideRefPoints.forEach((p) => {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 9, 0, Math.PI * 2);
+        ctx.stroke();
+      });
+      ctx.restore();
+    }
 
     // Draw box prompt (SAM only)
     if (state.detectionMethod === 'sam' && state.boxPrompt) {
@@ -706,7 +1436,7 @@ const ExosomeDetection: React.FC = () => {
       });
     }
     
-    // Draw Random Forest annotations (semi-transparent with outline for visibility)
+    // Draw Random Forest annotations (fill only, no outline).
     // Use offscreen canvas so overlapping points don't compound opacity.
     if (state.detectionMethod === 'random_forest') {
       if (state.annotations.length > 0) {
@@ -719,23 +1449,12 @@ const ExosomeDetection: React.FC = () => {
             const fillColor = ann.label === 1 
               ? 'rgb(0, 255, 0)'
               : 'rgb(255, 0, 0)';
-            const strokeColor = ann.label === 1
-              ? 'rgb(0, 200, 0)'
-              : 'rgb(200, 0, 0)';
 
             offCtx.fillStyle = fillColor;
             ann.points.forEach(([x, y]) => {
               offCtx.beginPath();
               offCtx.arc(x, y, 2, 0, Math.PI * 2);
               offCtx.fill();
-            });
-
-            offCtx.strokeStyle = strokeColor;
-            offCtx.lineWidth = 1;
-            ann.points.forEach(([x, y]) => {
-              offCtx.beginPath();
-              offCtx.arc(x, y, 2, 0, Math.PI * 2);
-              offCtx.stroke();
             });
           });
 
@@ -745,6 +1464,32 @@ const ExosomeDetection: React.FC = () => {
           ctx.restore();
         }
       }
+
+      // Draw click-history markers with explicit class colors.
+      if (state.clickHistory.length > 0) {
+        const labelById = new Map<string, number>();
+        state.annotations.forEach((ann) => labelById.set(ann.id, ann.label));
+        state.clickHistory.forEach((click) => {
+          let clickType: 'exosome' | 'background' = 'exosome';
+          if (click.clickType) {
+            clickType = click.clickType;
+          } else if (click.annotationId) {
+            const label = labelById.get(click.annotationId);
+            if (label === 0) clickType = 'background';
+            if (label === 1) clickType = 'exosome';
+          } else if ((click.predictedClass || '').toLowerCase() === 'background') {
+            clickType = 'background';
+          }
+
+          ctx.save();
+          ctx.strokeStyle = clickType === 'background' ? '#ff2d2d' : '#00d95f';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(click.imageX, click.imageY, 5, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.restore();
+        });
+      }
       
       // Draw brush preview (semi-transparent circle following cursor)
       if (state.brushPreview.x !== null && state.brushPreview.y !== null) {
@@ -753,12 +1498,9 @@ const ExosomeDetection: React.FC = () => {
           : 'rgba(255, 0, 0, 0.4)';
         ctx.save();
         ctx.fillStyle = previewColor;
-        ctx.strokeStyle = state.annotationMode === 'exosome' ? 'rgba(0, 200, 0, 0.8)' : 'rgba(200, 0, 0, 0.8)';
-        ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.arc(state.brushPreview.x, state.brushPreview.y, state.brushSize, 0, Math.PI * 2);
         ctx.fill();
-        ctx.stroke();
         ctx.restore();
       }
       
@@ -793,131 +1535,93 @@ const ExosomeDetection: React.FC = () => {
           ctx.drawImage(cmCanvas, 0, 0);
           ctx.restore();
         }
-      } else if (state.masks && state.masks.length > 0) {
-        // Draw binary mask overlay (green semi-transparent)
-        ctx.save();
-        ctx.globalAlpha = state.maskOpacity;
-        ctx.fillStyle = 'rgba(0, 255, 0, 0.4)';
-        
-        const mask = state.masks[0];
-        for (let y = 0; y < Math.min(mask.length, canvas.height); y++) {
-          for (let x = 0; x < Math.min(mask[y].length, canvas.width); x++) {
-            if (mask[y][x]) {
-              ctx.fillRect(x, y, 1, 1);
-            }
-          }
-        }
-        
-        ctx.restore();
       }
     }
 
     // Draw detections: use masks if available, otherwise use bboxes
-    if (state.masks && state.masks.length > 0) {
-      // Draw masks on an offscreen canvas, then composite onto main canvas.
-      // This avoids putImageData which destroys the underlying image.
-      const maskCanvas = document.createElement('canvas');
-      maskCanvas.width = canvas.width;
-      maskCanvas.height = canvas.height;
-      const maskCtx = maskCanvas.getContext('2d');
-      
-      if (maskCtx) {
-        state.masks.forEach((mask, idx) => {
-          const maskHeight = mask.length;
-          const maskWidth = maskHeight > 0 ? mask[0].length : 0;
-          
-          if (maskWidth === 0 || maskHeight === 0) return;
-          
-          const hue = (idx * 137.5) % 360;
-          const [r, g, b] = hslToRgb(hue / 360, 0.7, 0.5);
-          
-          const imageData = maskCtx.createImageData(canvas.width, canvas.height);
-          const data = imageData.data;
-          
-          for (let y = 0; y < Math.min(maskHeight, canvas.height); y++) {
-            for (let x = 0; x < Math.min(maskWidth, canvas.width); x++) {
-              if (mask[y] && mask[y][x]) {
-                const i = (y * canvas.width + x) * 4;
-                data[i] = r;
-                data[i + 1] = g;
-                data[i + 2] = b;
-                data[i + 3] = 255;
+    console.log('[FILTER DEBUG] showFilteredOnly=', showFilteredOnly, 'applyNonce=', filterApplyNonce, 'appliedFilterIds.size=', filteredDetectionIndexSet.size, 'totalDetections=', state.detections.length);
+    // Render one group of detections (by original index) in a single color.
+    // Handles both mask path and bbox fallback; works regardless of showMaskOutlines.
+    const drawDetectionGroup = (indices: number[], color: string) => {
+      if (indices.length === 0) return;
+      const [cr, cg, cb] = hexToRgb(color);
+
+      if (state.masks && state.masks.length > 0) {
+        // state.masks[0] is a single combined binary mask; isolate each detection via its bbox.
+        const combinedMask = state.masks[0];
+        if (state.showMaskOutlines) {
+          // Can't extract per-object contours from a combined mask — use bbox strokes.
+          ctx.save();
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 2;
+          indices.forEach(idx => {
+            const det = state.detections[idx];
+            if (!det) return;
+            const [x1, y1, x2, y2] = det.bbox;
+            ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+          });
+          ctx.restore();
+        } else {
+          // Paint only the combined-mask pixels that fall within each detection's bbox.
+          const imgData = new ImageData(canvas.width, canvas.height);
+          const d = imgData.data;
+          indices.forEach(idx => {
+            const det = state.detections[idx];
+            if (!det) return;
+            const [x1, y1, x2, y2] = det.bbox;
+            for (let y = Math.floor(y1); y < Math.ceil(y2); y++) {
+              for (let x = Math.floor(x1); x < Math.ceil(x2); x++) {
+                if (combinedMask[y]?.[x]) {
+                  const i = (y * canvas.width + x) * 4;
+                  d[i] = cr; d[i + 1] = cg; d[i + 2] = cb; d[i + 3] = 255;
+                }
               }
             }
-          }
-          
-          maskCtx.putImageData(imageData, 0, 0);
-        });
-
+          });
+          const off = document.createElement('canvas');
+          off.width = canvas.width; off.height = canvas.height;
+          off.getContext('2d')!.putImageData(imgData, 0, 0);
+          ctx.save();
+          ctx.globalAlpha = showFilteredOnly ? 1.0 : state.maskOpacity;
+          ctx.drawImage(off, 0, 0);
+          ctx.restore();
+        }
+      } else if (state.detections.length > 0) {
         ctx.save();
         ctx.globalAlpha = state.maskOpacity;
-        ctx.drawImage(maskCanvas, 0, 0);
+        if (state.showMaskOutlines) {
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 2;
+          indices.forEach(idx => {
+            const det = state.detections[idx];
+            if (!det) return;
+            const [x1, y1, x2, y2] = det.bbox;
+            ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+          });
+        } else {
+          ctx.fillStyle = color;
+          indices.forEach(idx => {
+            const det = state.detections[idx];
+            if (!det) return;
+            const [x1, y1, x2, y2] = det.bbox;
+            ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
+          });
+        }
         ctx.restore();
       }
+    };
 
-      // Draw mask outlines
-      if (state.showMaskOutlines) {
-        ctx.strokeStyle = '#ffff00';
-        ctx.lineWidth = 1;
-        state.masks.forEach(mask => {
-          const maskHeight = mask.length;
-          const maskWidth = maskHeight > 0 ? mask[0].length : 0;
-          
-          if (maskWidth === 0 || maskHeight === 0) return;
-          
-          // Simple outline: draw border pixels
-          for (let y = 1; y < Math.min(maskHeight - 1, canvas.height - 1); y++) {
-            for (let x = 1; x < Math.min(maskWidth - 1, canvas.width - 1); x++) {
-              if (mask[y] && mask[y][x] && 
-                  (y === 0 || !mask[y - 1] || !mask[y - 1][x] || 
-                   y >= maskHeight - 1 || !mask[y + 1] || !mask[y + 1][x] ||
-                   x === 0 || !mask[y][x - 1] || 
-                   x >= maskWidth - 1 || !mask[y][x + 1])) {
-                ctx.fillStyle = '#ffff00';
-                ctx.fillRect(x, y, 1, 1);
-              }
-            }
-          }
-        });
-      }
+    const allIndices = state.detections.map((_, i) => i);
+    if (showFilteredOnly) {
+      drawDetectionGroup(filteredOutIndices, '#ff4444');  // red: filtered-out
+      drawDetectionGroup(filteredDetectionIndices, '#00ff00');  // green: filtered-in
+    } else {
+      drawDetectionGroup(allIndices, '#ff4444');  // red: all objects (no filter active)
+    }
 
-      // Highlight selected detection
-      if (selectedDetectionRef.current !== null && state.detections[selectedDetectionRef.current]) {
-        const det = state.detections[selectedDetectionRef.current];
-        ctx.strokeStyle = '#00ffff';
-        ctx.lineWidth = 3;
-        ctx.strokeRect(det.bbox[0], det.bbox[1], det.bbox[2] - det.bbox[0], det.bbox[3] - det.bbox[1]);
-      }
-    } else if (state.detections && state.detections.length > 0) {
-      // Draw bboxes when masks are not available (large response size)
-      ctx.save();
-      ctx.globalAlpha = state.maskOpacity;
-      
-      state.detections.forEach((detection, idx) => {
-        const [x1, y1, x2, y2] = detection.bbox;
-        const width = x2 - x1;
-        const height = y2 - y1;
-        
-        // Use different colors for different detections
-        const hue = (idx * 137.5) % 360;
-        const [r, g, b] = hslToRgb(hue / 360, 0.7, 0.5);
-        
-        // Draw filled rectangle
-        ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${state.maskOpacity})`;
-        ctx.fillRect(x1, y1, width, height);
-        
-        // Draw outline
-        if (state.showMaskOutlines) {
-          ctx.strokeStyle = '#ffff00';
-          ctx.lineWidth = 2;
-          ctx.strokeRect(x1, y1, width, height);
-        }
-      });
-      
-      ctx.restore();
-      
-      // Highlight selected detection
-      if (selectedDetectionRef.current !== null && state.detections[selectedDetectionRef.current]) {
+    // Highlight selected detection
+    if (selectedDetectionRef.current !== null && state.detections[selectedDetectionRef.current]) {
+      if (!showFilteredOnly || filteredDetectionIndexSet.has(selectedDetectionRef.current)) {
         const det = state.detections[selectedDetectionRef.current];
         ctx.strokeStyle = '#00ffff';
         ctx.lineWidth = 3;
@@ -925,13 +1629,168 @@ const ExosomeDetection: React.FC = () => {
       }
     }
 
+    // Draw ground-truth overlay
+    // Transform pipeline (applied in order):
+    //   Step 1  swapXY   — swap X↔Y from CSV (diagnose row/col transposition)
+    //   Step 2  yFlip    — y = imageH - y  (bottom-left → top-left origin)
+    //   Step 3  offset   — add (gtOffsetX, gtOffsetY)  (crop / ROI origin shift)
+    if (state.showGroundTruth && state.groundTruthPoints.length > 0) {
+      ctx.save();
+
+      const PIXEL_SIZE_UM = state.groundTruthPixelSizeUm;
+      // imageH used for Y-flip; fall back to canvas height if backend didn't return it
+      const imageH = state.gtImageHeight ?? canvas.height;
+      const imageW = state.gtImageWidth  ?? canvas.width;
+
+      // ── Build display points through the full transform chain ────────────
+      const applyGtTransform = (p: { x: number; y: number }) => {
+        let { x, y } = p;
+        if (state.gtSwapXY)  { const tmp = x; x = y; y = tmp; }
+        if (state.gtYFlip)   { y = imageH - y; }
+        x += state.gtOffsetX;
+        y += state.gtOffsetY;
+        return { x, y };
+      };
+
+      const gtDisplayPoints = state.groundTruthPoints.map(applyGtTransform);
+
+      // ── Build mapping-chain rows for the debug box ────────────────────────
+      // We use rawGtSampleUm (raw CSV µm) so users can see the full chain.
+      // If not available, reconstruct from the converted points.
+      const makeMappingChain = (idx: number) => {
+        const raw = state.rawGtSampleUm[idx];
+        const orig = state.groundTruthPoints[idx];
+        const display = gtDisplayPoints[idx];
+        const x_um = raw ? raw.x_um : (orig.x * PIXEL_SIZE_UM);
+        const y_um = raw ? raw.y_um : (orig.y * PIXEL_SIZE_UM);
+        const x_px = raw ? raw.x_px : orig.x;
+        const y_px = raw ? raw.y_px : orig.y;
+        // after swapXY
+        const [sx_px, sy_px] = state.gtSwapXY ? [y_px, x_px] : [x_px, y_px];
+        // after yFlip
+        const fy_px = state.gtYFlip ? imageH - sy_px : sy_px;
+        return { x_um, y_um, x_px, y_px, sx_px, sy_px, fy_px, final_x: display.x, final_y: display.y };
+      };
+
+      if (state.gtDebugMode) {
+        // ── Debug mode: large labeled magenta markers + full mapping chain ──
+
+        // Console: full mapping chain for first 10 points
+        console.group('[GT Debug] Full coordinate mapping chain');
+        console.log(`Canvas: ${canvas.width}×${canvas.height} px`);
+        console.log(`Image (from TIFF): ${imageW}×${imageH} px`);
+        console.log(`pixel_size_um: ${PIXEL_SIZE_UM} µm/px`);
+        console.log(`Transforms active: swapXY=${state.gtSwapXY} yFlip=${state.gtYFlip} offset=(${state.gtOffsetX},${state.gtOffsetY})`);
+        console.table(
+          state.groundTruthPoints.slice(0, 10).map((_, i) => {
+            const c = makeMappingChain(i);
+            return {
+              'CSV X (µm)':   c.x_um.toFixed(4),
+              'CSV Y (µm)':   c.y_um.toFixed(4),
+              '÷ px_size → X_px': c.x_px.toFixed(2),
+              '÷ px_size → Y_px': c.y_px.toFixed(2),
+              'after swapXY X': c.sx_px.toFixed(2),
+              'after swapXY Y': c.sy_px.toFixed(2),
+              'after yFlip  Y': c.fy_px.toFixed(2),
+              'final canvas X': c.final_x.toFixed(2),
+              'final canvas Y': c.final_y.toFixed(2),
+            };
+          })
+        );
+        console.groupEnd();
+
+        // Draw all GT points with large magenta cross+circle + index label
+        const rBig = 10;
+        gtDisplayPoints.forEach(({ x, y }, i) => {
+          ctx.strokeStyle = 'rgba(255, 0, 255, 0.9)';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(x, y, rBig, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(x - rBig, y); ctx.lineTo(x + rBig, y);
+          ctx.moveTo(x, y - rBig); ctx.lineTo(x, y + rBig);
+          ctx.stroke();
+          if (i < 30) {
+            ctx.fillStyle = 'yellow';
+            ctx.font = 'bold 10px monospace';
+            ctx.fillText(`${i}`, x + rBig + 2, y - 2);
+          }
+        });
+
+        // ── Info box in top-left: full mapping chain for 10 sample points ──
+        const lineH = 13;
+        const cols = ['idx', 'CSV_X_µm', 'CSV_Y_µm', 'px', 'py', 'swX', 'swY', 'flipY', 'finX', 'finY'];
+        const numRows = Math.min(10, state.groundTruthPoints.length);
+        const boxW = 580;
+        const boxH = lineH * (numRows + 3) + 6;
+        const boxX = 5, boxY = 5;
+
+        ctx.fillStyle = 'rgba(0,0,0,0.82)';
+        ctx.fillRect(boxX, boxY, boxW, boxH);
+
+        ctx.fillStyle = 'white';
+        ctx.font = 'bold 10px monospace';
+        const transforms = [
+          state.gtSwapXY ? 'SWAP-XY' : '',
+          state.gtYFlip  ? 'Y-FLIP' : '',
+          (state.gtOffsetX || state.gtOffsetY) ? `OFS(${state.gtOffsetX},${state.gtOffsetY})` : '',
+        ].filter(Boolean).join(' ');
+        ctx.fillText(
+          `GT Debug  imgSize=${imageW}×${imageH}  px_size=${PIXEL_SIZE_UM.toFixed(5)}µm  ${transforms || 'no transforms'}`,
+          boxX + 4, boxY + lineH
+        );
+
+        ctx.font = '9px monospace';
+        ctx.fillStyle = '#aaa';
+        ctx.fillText(
+          'idx  CSV_Xµm    CSV_Yµm    x_px     y_px   →swX   →swY   →flipY  finalX  finalY',
+          boxX + 4, boxY + lineH * 2 + 2
+        );
+
+        for (let i = 0; i < numRows; i++) {
+          const c = makeMappingChain(i);
+          const row = [
+            String(i).padStart(3),
+            c.x_um.toFixed(2).padStart(9),
+            c.y_um.toFixed(2).padStart(9),
+            c.x_px.toFixed(1).padStart(7),
+            c.y_px.toFixed(1).padStart(7),
+            c.sx_px.toFixed(1).padStart(7),
+            c.sy_px.toFixed(1).padStart(7),
+            c.fy_px.toFixed(1).padStart(8),
+            c.final_x.toFixed(1).padStart(7),
+            c.final_y.toFixed(1).padStart(7),
+          ].join('  ');
+          ctx.fillStyle = i % 2 === 0 ? 'cyan' : '#88eeff';
+          ctx.fillText(row, boxX + 4, boxY + lineH * (i + 3) + 4);
+        }
+
+      } else {
+        // ── Normal mode: circle-only (no crosshair) ──
+        ctx.strokeStyle = 'rgba(0, 230, 255, 0.85)';
+        ctx.lineWidth = 1.5;
+        const r = 5;
+        gtDisplayPoints.forEach(({ x, y }) => {
+          ctx.beginPath();
+          ctx.arc(x, y, r, 0, Math.PI * 2);
+          ctx.stroke();
+        });
+      }
+      ctx.restore();
+    }
+
     // Draw detection count
-    if (state.detections.length > 0) {
+    if (state.detections.length > 0 || (state.showGroundTruth && state.groundTruthPoints.length > 0)) {
+      const lines: string[] = [];
+      if (state.detections.length > 0) lines.push(`Detected: ${state.detections.length}`);
+      if (state.showGroundTruth && state.groundTruthPoints.length > 0) lines.push(`GT: ${state.groundTruthPoints.length}`);
+      const boxH = lines.length * 20 + 10;
       ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
-      ctx.fillRect(10, 10, 200, 30);
+      ctx.fillRect(10, 10, 200, boxH);
       ctx.fillStyle = '#ffffff';
-      ctx.font = '16px Arial';
-      ctx.fillText(`Detected: ${state.detections.length} exosomes`, 15, 30);
+      ctx.font = '14px Arial';
+      lines.forEach((line, i) => ctx.fillText(line, 15, 28 + i * 20));
     }
     
     // Draw calibration crosshairs if calibration mode is enabled
@@ -969,7 +1828,7 @@ const ExosomeDetection: React.FC = () => {
         }
       }
     }
-  }, [state.boxPrompt, state.pointPrompts, state.masks, state.maskOpacity, state.showMaskOutlines, state.detections, state.annotations, state.probabilityMap, state.showConfidenceMap, state.detectionMethod, state.calibrationMode, state.debugLogs, state.brushPreview, state.brushSize, state.annotationMode, zoomState]);
+  }, [state.boxPrompt, state.pointPrompts, state.masks, state.maskOpacity, state.showMaskOutlines, state.detections, state.annotations, state.probabilityMap, state.showConfidenceMap, state.detectionMethod, state.calibrationMode, state.debugLogs, state.brushPreview, state.brushSize, state.annotationMode, state.showGroundTruth, state.groundTruthPoints, state.groundTruthPixelSizeUm, state.gtImageWidth, state.gtImageHeight, state.rawGtSampleUm, state.gtDebugMode, state.gtSwapXY, state.gtYFlip, state.gtOffsetX, state.gtOffsetY, zoomState, showFilteredOnly, filteredDetectionIndices, filteredOutIndices, filterApplyNonce, showGuideFromRef, guideRefPoints, state.selectedChannel]);
 
   // Helper: HSL to RGB
   const hslToRgb = (h: number, s: number, l: number): [number, number, number] => {
@@ -1314,15 +2173,16 @@ const ExosomeDetection: React.FC = () => {
     // 1. Zoomed in (scale > 1.0)
     // 2. Not in annotation mode (Random Forest)
     // 3. Not drawing (SAM box mode)
-    // 4. Middle mouse button or left click when not in active drawing mode
-    const isMiddleButton = e.button === 1;
+    // 4. Shift + right-click drag
+    const isShiftRightDrag = e.button === 2 && e.shiftKey;
     const canPan = zoomState.scale > 1.0 && 
                    !isAnnotatingRef.current && 
                    !isDrawingRef.current &&
-                   (isMiddleButton || (e.button === 0 && state.detectionMethod !== 'random_forest' && (state.detectionMethod !== 'sam' || state.detectionMode !== 'box')));
+                   isShiftRightDrag;
     
     if (canPan) {
       e.preventDefault();
+      e.stopPropagation();
       isPanningRef.current = true;
       if (viewportRef.current) {
         const rect = viewportRef.current.getBoundingClientRect();
@@ -1337,13 +2197,16 @@ const ExosomeDetection: React.FC = () => {
   
   // Handle pan move
   const handlePanMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (isPanningRef.current && panStartRef.current && viewportRef.current) {
+    const panStart = panStartRef.current;
+    const viewport = viewportRef.current;
+    if (isPanningRef.current && panStart && viewport) {
       e.preventDefault();
-      const rect = viewportRef.current.getBoundingClientRect();
+      e.stopPropagation();
+      const rect = viewport.getBoundingClientRect();
       setZoomState(prev => ({
         ...prev,
-        offsetX: e.clientX - rect.left - panStartRef.current!.x,
-        offsetY: e.clientY - rect.top - panStartRef.current!.y,
+        offsetX: e.clientX - rect.left - panStart.x,
+        offsetY: e.clientY - rect.top - panStart.y,
       }));
     }
   };
@@ -1418,7 +2281,7 @@ const ExosomeDetection: React.FC = () => {
   // Canvas mouse handlers for box/point prompts (SAM only) and brush annotation (Random Forest)
   const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!canvasRef.current) return;
-    // Ignore middle-click — handled at viewport level to prevent browser auto-scroll
+    // Ignore middle-click entirely.
     if (e.button === 1) return;
 
     const { x, y } = getCanvasCoords(e);
@@ -1439,6 +2302,39 @@ const ExosomeDetection: React.FC = () => {
       
       // Add initial point with the tracked ID
       addBrushPoint(x, y, label, annId);
+
+      // Right-click does not emit the browser click event, so record history here.
+      if (e.button === 2 && canvasRef.current) {
+        const ctx = canvasRef.current.getContext('2d');
+        let intensity: number | null = null;
+        if (ctx) {
+          try {
+            const pixel = ctx.getImageData(Math.round(x), Math.round(y), 1, 1);
+            intensity = pixel.data[0] ?? null;
+          } catch {
+            intensity = null;
+          }
+        }
+        const clickId = `click_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        const clickEntry = {
+          id: clickId,
+          timestamp: Date.now(),
+          imageX: Math.round(x),
+          imageY: Math.round(y),
+          intensity,
+          confidence: null,
+          predictedClass: null,
+          scale: zoomState.scale,
+          offsetX: zoomState.offsetX,
+          offsetY: zoomState.offsetY,
+          annotationId: annId,
+          clickType: 'background' as const,
+        };
+        setState(prev => ({
+          ...prev,
+          clickHistory: [clickEntry, ...prev.clickHistory].slice(0, 100),
+        }));
+      }
     } else if (state.detectionMethod === 'sam') {
       if (state.detectionMode === 'box') {
         isDrawingRef.current = true;
@@ -1549,6 +2445,14 @@ const ExosomeDetection: React.FC = () => {
       offsetX: zoomState.offsetX,
       offsetY: zoomState.offsetY,
       annotationId,
+      clickType: (() => {
+        if (annotationId) {
+          const ann = state.annotations.find((a) => a.id === annotationId);
+          if (ann?.label === 0) return 'background' as const;
+          if (ann?.label === 1) return 'exosome' as const;
+        }
+        return (predictedClass === 'Background' ? 'background' : 'exosome') as const;
+      })(),
     };
     
     setState(prev => ({
@@ -1562,6 +2466,70 @@ const ExosomeDetection: React.FC = () => {
       },
       clickHistory: [clickEntry, ...prev.clickHistory].slice(0, 100), // Keep last 100 clicks
     }));
+
+    // ── GT nearest-point debug (always active when GT is loaded) ──
+    if (state.groundTruthPoints.length > 0) {
+      const PIXEL_SIZE_UM = state.groundTruthPixelSizeUm;
+      const canvasEl = canvasRef.current!;
+      const canvasRect = canvasEl.getBoundingClientRect();
+      const cssToInternal = canvasEl.width / canvasRect.width;
+      const imageH = state.gtImageHeight ?? canvasEl.height;
+      const imageW = state.gtImageWidth  ?? canvasEl.width;
+
+      // Apply the same full transform chain as drawCanvas
+      const applyGtTransform = (p: { x: number; y: number }) => {
+        let { x: px, y: py } = p;
+        if (state.gtSwapXY) { const tmp = px; px = py; py = tmp; }
+        if (state.gtYFlip)  { py = imageH - py; }
+        px += state.gtOffsetX;
+        py += state.gtOffsetY;
+        return { x: px, y: py };
+      };
+
+      const gtPtsForNearest = state.groundTruthPoints.map(applyGtTransform);
+
+      let nearestDist = Infinity;
+      let nearestIdx = -1;
+      gtPtsForNearest.forEach((pt, i) => {
+        const d = Math.hypot(pt.x - x, pt.y - y);
+        if (d < nearestDist) { nearestDist = d; nearestIdx = i; }
+      });
+
+      const nearest       = gtPtsForNearest[nearestIdx];
+      const nearestRaw    = state.groundTruthPoints[nearestIdx];
+      const nearestSample = state.rawGtSampleUm[nearestIdx];
+
+      console.group('[GT Click Debug] — click on image');
+      console.log('── Click coordinates ──────────────────────────────');
+      console.log('  Clicked CSS canvas:', {
+        cssX: (e.clientX - canvasRect.left).toFixed(1),
+        cssY: (e.clientY - canvasRect.top).toFixed(1),
+      });
+      console.log('  CSS→Internal ratio:', cssToInternal.toFixed(4));
+      console.log('  Mapped image pixel coord:', { x: x.toFixed(2), y: y.toFixed(2) });
+      console.log('── Canvas / image metadata ────────────────────────');
+      console.log('  Canvas internal:', canvasEl.width, '×', canvasEl.height, 'px');
+      console.log('  Canvas CSS:    ', canvasRect.width.toFixed(1), '×', canvasRect.height.toFixed(1), 'px');
+      console.log('  Image (TIFF):  ', imageW, '×', imageH, 'px');
+      console.log('  pixel_size_um: ', PIXEL_SIZE_UM, 'µm/px');
+      console.log('── Active GT transforms ───────────────────────────');
+      console.log('  gtSwapXY:', state.gtSwapXY,
+                  ' gtYFlip:', state.gtYFlip,
+                  ' gtOffset:', `(${state.gtOffsetX}, ${state.gtOffsetY})`);
+      console.log('── Nearest GT point ───────────────────────────────');
+      console.log('  Index:', nearestIdx);
+      if (nearestSample) {
+        console.log('  CSV raw:       ', `X=${nearestSample.x_um}µm  Y=${nearestSample.y_um}µm`);
+        console.log('  ÷ pixel_size → ', `X=${nearestSample.x_px}px  Y=${nearestSample.y_px}px`);
+      } else {
+        console.log('  ÷ pixel_size → ', `X=${nearestRaw.x.toFixed(2)}px  Y=${nearestRaw.y.toFixed(2)}px`);
+      }
+      if (state.gtSwapXY) console.log('  after swapXY: ', `X=${nearestRaw.y.toFixed(2)}px  Y=${nearestRaw.x.toFixed(2)}px`);
+      if (state.gtYFlip)  console.log('  after yFlip:  ', `Y=${(imageH - (state.gtSwapXY ? nearestRaw.x : nearestRaw.y)).toFixed(2)}px`);
+      console.log('  Final display: ', `X=${nearest.x.toFixed(2)}px  Y=${nearest.y.toFixed(2)}px`);
+      console.log('  Distance:      ', nearestDist.toFixed(2), 'px =', (nearestDist * PIXEL_SIZE_UM).toFixed(3), 'µm');
+      console.groupEnd();
+    }
   };
   
   // Remove a click history entry and its associated annotation
@@ -1586,6 +2554,139 @@ const ExosomeDetection: React.FC = () => {
   };
   
   // Canvas wheel handler removed - all wheel events handled by container
+
+  const refreshRfModelList = useCallback(async () => {
+    if (!state.selectedSample || !state.selectedChannel) {
+      setState(prev => ({ ...prev, availableRfModels: [], selectedRfModelSourcePosition: '' }));
+      return;
+    }
+    try {
+      const response = await fetch(
+        `${getApiBase()}/api/exosome/rf_model/list?sample=${encodeURIComponent(state.selectedSample)}&channel=${encodeURIComponent(state.selectedChannel)}`
+      );
+      const data = await response.json();
+      if (!data.success) {
+        throw new Error(data.error || 'Failed to load saved models');
+      }
+      const models: SavedRfModelItem[] = Array.isArray(data.data) ? data.data : [];
+      setState(prev => ({
+        ...prev,
+        availableRfModels: models,
+        selectedRfModelSourcePosition: models.some(m => m.position === prev.selectedRfModelSourcePosition)
+          ? prev.selectedRfModelSourcePosition
+          : (models[0]?.position || ''),
+      }));
+    } catch (err: any) {
+      setState(prev => ({ ...prev, rfModelStatus: `Failed to list RF models: ${err.message}` }));
+    }
+  }, [state.selectedSample, state.selectedChannel]);
+
+  const handleSaveRfModel = async () => {
+    if (!state.loaded || !state.selectedSample || !state.selectedPosition || !state.selectedChannel) {
+      alert('Please load an image first');
+      return;
+    }
+    if (state.annotations.length === 0) {
+      alert('Please annotate pixels before saving model');
+      return;
+    }
+    try {
+      setState(prev => ({ ...prev, rfModelStatus: 'Saving RF model...', rfModelWarning: null }));
+      const response = await fetch(`${getApiBase()}/api/exosome/rf_model/save`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sample: state.selectedSample,
+          position: state.selectedPosition,
+          channel: state.selectedChannel,
+          annotations: state.annotations,
+        }),
+      });
+      const data = await response.json();
+      if (!data.success) {
+        throw new Error(data.error || 'Failed to save RF model');
+      }
+      setState(prev => ({
+        ...prev,
+        rfModelStatus: `RF model saved: ${data.saved_path}`,
+        rfModelSavedPath: data.saved_path || null,
+      }));
+      await refreshRfModelList();
+    } catch (err: any) {
+      setState(prev => ({ ...prev, rfModelStatus: `Failed to save RF model: ${err.message}` }));
+      alert(`Failed to save RF model: ${err.message}`);
+    }
+  };
+
+  const handleLoadRfModelAndSegment = async () => {
+    if (!state.loaded || !state.selectedSample || !state.selectedPosition || !state.selectedChannel) {
+      alert('Please load an image first');
+      return;
+    }
+    if (!state.selectedRfModelSourcePosition) {
+      alert('Please select a saved model position');
+      return;
+    }
+    setState(prev => ({
+      ...prev,
+      isDetecting: true,
+      exportStatus: null,
+      rfModelStatus: `Running segmentation with model from ${state.selectedRfModelSourcePosition}...`,
+      rfModelWarning: null,
+    }));
+
+    try {
+      const response = await fetch(`${getApiBase()}/api/exosome/rf_model/load_and_segment`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sample: state.selectedSample,
+          position: state.selectedPosition,
+          channel: state.selectedChannel,
+          model_source_position: state.selectedRfModelSourcePosition,
+          confidence_threshold: state.confidenceThreshold,
+          min_area: state.minArea,
+          apply_morphology: state.fillHoles,
+        }),
+      });
+      const data = await response.json();
+      if (!data.success) {
+        throw new Error(data.error || 'RF model segmentation failed');
+      }
+
+      const masksRaw = data.data.masks || [];
+      const scores = data.data.scores || [];
+      const detections: DetectionResult[] = (data.data.detections || []).map((d: any, idx: number) => ({
+        id: idx + 1,
+        area: d.area || 0,
+        centroid: d.centroid || [0, 0],
+        bbox: d.bbox || [0, 0, 0, 0],
+        score: idx < scores.length ? scores[idx] : undefined,
+        perimeter: d.perimeter != null ? d.perimeter : undefined,
+        circularity: d.circularity != null ? d.circularity : undefined,
+      }));
+
+      setDetectionBatchId(b => b + 1);
+      setState(prev => ({
+        ...prev,
+        masks: masksRaw.length > 0 ? masksRaw : null,
+        scores,
+        detections,
+        probabilityMap: data.data.probability_map || null,
+        isDetecting: false,
+        rfModelStatus: `Loaded model from ${state.selectedRfModelSourcePosition} and segmented ${state.selectedPosition}`,
+        rfModelWarning: data.model_warning || data.data._model_warning || null,
+      }));
+      drawCanvas();
+    } catch (err: any) {
+      setState(prev => ({
+        ...prev,
+        isDetecting: false,
+        rfModelStatus: `Failed to run loaded model: ${err.message}`,
+      }));
+      alert(`RF model load-and-segment failed: ${err.message}`);
+    }
+  };
 
   // Run segmentation
   const handleRunSegmentation = async () => {
@@ -1664,7 +2765,7 @@ const ExosomeDetection: React.FC = () => {
 
       console.log('[ExosomeDetection] Sending request:', { method: state.detectionMethod, ...requestBody });
       
-      const response = await fetch('${getApiBase()}/api/exosome/segment', {
+      const response = await fetch(`${getApiBase()}/api/exosome/segment`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody),
@@ -1707,6 +2808,8 @@ const ExosomeDetection: React.FC = () => {
         centroid: d.centroid || [0, 0],
         bbox: d.bbox || [0, 0, 0, 0],
         score: idx < scores.length ? scores[idx] : undefined,
+        perimeter: d.perimeter != null ? d.perimeter : undefined,
+        circularity: d.circularity != null ? d.circularity : undefined,
       }));
 
       console.log('[ExosomeDetection] Processed detections:', detections.length);
@@ -1718,12 +2821,13 @@ const ExosomeDetection: React.FC = () => {
         console.log('[ExosomeDetection] Received probability map');
       }
 
+      setDetectionBatchId(b => b + 1);
       setState(prev => ({
         ...prev,
         masks: masks.length > 0 ? masks : null, // null if masks omitted
         scores: scores,
         detections: detections,
-        probabilityMap: probabilityMap || prev.probabilityMap,
+        probabilityMap: probabilityMap ?? null,
         isDetecting: false,
       }));
 
@@ -1736,6 +2840,11 @@ const ExosomeDetection: React.FC = () => {
     }
   };
 
+  useEffect(() => {
+    if (state.detectionMethod !== 'random_forest') return;
+    refreshRfModelList();
+  }, [state.detectionMethod, state.selectedSample, state.selectedChannel, refreshRfModelList]);
+
   // Clear prompts
   const handleClearPrompts = () => {
     setState(prev => ({
@@ -1747,6 +2856,7 @@ const ExosomeDetection: React.FC = () => {
 
   // Clear masks
   const handleClearMasks = () => {
+    setDetectionBatchId(b => b + 1);
     setState(prev => ({
       ...prev,
       masks: null,
@@ -1765,7 +2875,7 @@ const ExosomeDetection: React.FC = () => {
     setState(prev => ({ ...prev, exportStatus: 'Exporting...' }));
 
     try {
-      const response = await fetch('${getApiBase()}/api/exosome/export', {
+      const response = await fetch(`${getApiBase()}/api/exosome/export`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1832,7 +2942,14 @@ const ExosomeDetection: React.FC = () => {
               <label>Sample:</label>
               <select
                 value={state.selectedSample}
-                onChange={(e) => setState(prev => ({ ...prev, selectedSample: e.target.value }))}
+                onChange={(e) => setState(prev => ({
+                  ...prev,
+                  selectedSample: e.target.value,
+                  availableRfModels: [],
+                  selectedRfModelSourcePosition: '',
+                  rfModelStatus: null,
+                  rfModelWarning: null,
+                }))}
               >
                 <option value="">-- Select sample --</option>
                 {state.availableSamples.map(sample => (
@@ -1844,7 +2961,14 @@ const ExosomeDetection: React.FC = () => {
               <label>Position:</label>
               <select
                 value={state.selectedPosition}
-                onChange={(e) => setState(prev => ({ ...prev, selectedPosition: e.target.value }))}
+                onChange={(e) => setState(prev => ({
+                  ...prev,
+                  selectedPosition: e.target.value,
+                  availableRfModels: [],
+                  selectedRfModelSourcePosition: '',
+                  rfModelStatus: null,
+                  rfModelWarning: null,
+                }))}
                 disabled={!state.selectedSample}
               >
                 <option value="">-- Select position --</option>
@@ -1857,7 +2981,26 @@ const ExosomeDetection: React.FC = () => {
               <label>Channel:</label>
               <select
                 value={state.selectedChannel}
-                onChange={(e) => setState(prev => ({ ...prev, selectedChannel: e.target.value }))}
+                onChange={(e) => {
+                  // Persist current channel annotations/history before switching context.
+                  saveClickHistory();
+                  // Clear previous-channel segmentation artifacts on channel switch.
+                  setFilteredDetectionIndices([]);
+                  setState(prev => ({
+                    ...prev,
+                    selectedChannel: e.target.value,
+                    masks: null,
+                    scores: null,
+                    detections: [],
+                    probabilityMap: null,
+                    boxPrompt: null,
+                    pointPrompts: [],
+                    availableRfModels: [],
+                    selectedRfModelSourcePosition: '',
+                    rfModelStatus: null,
+                    rfModelWarning: null,
+                  }));
+                }}
                 disabled={!state.loaded}
               >
                 <option value="">-- Select channel --</option>
@@ -1870,6 +3013,139 @@ const ExosomeDetection: React.FC = () => {
               Load Image
             </button>
           </div>
+
+          {/* Image Source & Display Pipeline Debug Info */}
+          {state.loaded && (() => {
+            const selItem = state.availableItems.find(i => i.key === state.selectedChannel);
+            // Prefer currentNormStats (from most-recent display refresh); fall back to item stats
+            const ns = state.currentNormStats || selItem?.norm_stats;
+            return (
+              <div className="control-section" style={{ fontSize: '0.73rem', lineHeight: 1.6 }}>
+                <h3 style={{ fontSize: '0.8rem', marginBottom: 4 }}>Image Info</h3>
+
+                {/* Load mode */}
+                <div style={{ color: state.cropMode ? '#27ae60' : '#555', fontWeight: 600, marginBottom: 2 }}>
+                  {state.cropMode ? '🟢 Crop mode (multi-ch TIFF)' : '⬜ Normal (per-channel TIFFs)'}
+                </div>
+
+                <div><strong>Sample:</strong> {state.selectedSample}</div>
+                <div><strong>Position:</strong> {state.selectedPosition}</div>
+
+                {state.cropMode && (
+                  <>
+                    <div><strong>TIFF:</strong> {state.cropTiffFile}</div>
+                    <div>
+                      <strong>Stack shape:</strong>{' '}
+                      {state.cropTiffShape ? `[${state.cropTiffShape.join('×')}]` : '–'}
+                      {state.cropTiffAxes ? ` (${state.cropTiffAxes})` : ''}
+                    </div>
+                    <div><strong>Channels:</strong> {state.cropNumChannels ?? '–'}</div>
+                    <div>
+                      <strong>Pixel size:</strong>{' '}
+                      {state.cropPixelSizeUm != null ? `${state.cropPixelSizeUm.toFixed(4)} µm/px` : '–'}
+                      {state.cropPixelSizeSource
+                        ? <span style={{ color: state.cropPixelSizeSource === 'fallback' ? '#e67e22' : '#27ae60', marginLeft: 4 }}>
+                            ({state.cropPixelSizeSource})
+                          </span>
+                        : null}
+                    </div>
+                  </>
+                )}
+
+                <div style={{ marginTop: 6, borderTop: '1px solid #ddd', paddingTop: 4 }}>
+                  <strong>Selected channel:</strong> {state.selectedChannel || '–'}
+                  {selItem?.label ? (
+                    <div style={{ color: '#888', fontSize: '0.68rem' }}>{selItem.label.split(' aligned')[0]}</div>
+                  ) : null}
+                </div>
+
+                {/* Display pipeline box */}
+                {ns && (
+                  <div style={{
+                    marginTop: 6, background: '#f0f4ff', border: '1px solid #b0c4de',
+                    borderRadius: 4, padding: '4px 6px',
+                  }}>
+                    <div style={{ fontWeight: 700, color: '#2c3e50', marginBottom: 2 }}>📊 Display pipeline</div>
+                    <div>
+                      <span style={{ color: '#555' }}>mode:</span>{' '}
+                      <strong style={{ color: state.displayMode === 'raw_16bit' ? '#1565c0' : state.displayMode === 'enhanced' ? '#e65100' : '#4a148c' }}>
+                        {state.displayMode === 'raw_16bit' ? 'ImageJ-like raw 16-bit' :
+                         state.displayMode === 'enhanced'  ? 'Enhanced (p0.5–p99.5)' :
+                         'Raw min→max'}
+                      </strong>
+                      {state.displayMode === 'raw_16bit' && (
+                        <span style={{ fontSize: '0.68rem', color: '#27ae60', marginLeft: 4 }}>(default)</span>
+                      )}
+                    </div>
+                    <div>
+                      <span style={{ color: '#555' }}>LUT:</span>{' '}
+                      <strong style={{ color: state.displayLut === 'red' ? '#c0392b' : '#333' }}>
+                        {state.displayLut === 'red' ? 'Red (ImageJ-like)' : 'Grayscale'}
+                      </strong>
+                    </div>
+                    <div><span style={{ color: '#555' }}>dtype:</span> <strong>{ns.dtype}</strong></div>
+                    <div><span style={{ color: '#555' }}>raw range:</span> [{ns.original_min?.toFixed(0)}, {ns.original_max?.toFixed(0)}]</div>
+                    <div><span style={{ color: '#555' }}>p0.5 / p99.5:</span> {ns.p0_5?.toFixed(0)} / {ns.p99_5?.toFixed(0)}</div>
+                    <div>
+                      <span style={{ color: '#555' }}>display stretch:</span>{' '}
+                      <strong>[{ns.display_min?.toFixed(0)}, {ns.display_max?.toFixed(0)}]</strong>{' '}
+                      → 8-bit
+                    </div>
+                    <div><span style={{ color: '#555' }}>method:</span> {ns.normalization}</div>
+                    {ns.cache_hit != null && (
+                      <div>
+                        <span style={{ color: '#555' }}>preview cache:</span>{' '}
+                        <span style={{ color: ns.cache_hit ? '#888' : '#27ae60' }}>
+                          {ns.cache_hit ? 'reused' : 'generated'}
+                        </span>
+                      </div>
+                    )}
+                    {state.displayMode !== 'raw_16bit' && (
+                      <div style={{ marginTop: 4, color: '#e65100', fontSize: '0.68rem' }}>
+                        ⚠ Not default — switch to "ImageJ-like" for faithful comparison
+                      </div>
+                    )}
+                    {state.displayMode === 'raw_16bit' && (
+                      <div style={{ marginTop: 4, color: '#1565c0', fontSize: '0.68rem' }}>
+                        ✓ Raw 16-bit linear — matches ImageJ default display
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Display vs Detection source */}
+                {selItem && (
+                  <div style={{
+                    marginTop: 6, background: '#fff8e1', border: '1px solid #ffe082',
+                    borderRadius: 4, padding: '4px 6px',
+                  }}>
+                    <div style={{ fontWeight: 700, color: '#795548', marginBottom: 2 }}>🔍 Display vs Detection</div>
+                    <div>
+                      <span style={{ color: '#555' }}>Display:</span>{' '}
+                      <span title={selItem.display_source} style={{ color: '#1565c0', wordBreak: 'break-all' }}>
+                        preview PNG (8-bit, stretched)
+                      </span>
+                    </div>
+                    <div>
+                      <span style={{ color: '#555' }}>Detection:</span>{' '}
+                      <span style={{ color: '#2e7d32' }}>
+                        {state.cropMode ? 'raw TIFF slice (16-bit)' : 'raw TIFF (16-bit)'}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: '0.68rem', color: '#888', marginTop: 2 }}>
+                      RF/SAM/Blob use the raw 16-bit data, not the display image.
+                    </div>
+                  </div>
+                )}
+
+                {state.groundTruthPixelSizeUm ? (
+                  <div style={{ marginTop: 4 }}>
+                    <strong>GT pixel size:</strong> {state.groundTruthPixelSizeUm.toFixed(4)} µm/px
+                  </div>
+                ) : null}
+              </div>
+            );
+          })()}
 
           {/* Detection Method */}
           <div className="control-section">
@@ -2128,12 +3404,127 @@ const ExosomeDetection: React.FC = () => {
             <button onClick={handleExport} disabled={state.detections.length === 0}>
               Export Results
             </button>
+            {state.detectionMethod === 'random_forest' && (
+              <>
+                <button
+                  onClick={handleSaveRfModel}
+                  disabled={!state.loaded || state.isDetecting || state.annotations.length === 0}
+                  style={{ marginTop: '0.4rem' }}
+                  title="Train and save RF model for this sample/position/channel"
+                >
+                  Save Model
+                </button>
+                <div style={{ marginTop: '0.6rem', border: '1px solid #ddd', borderRadius: 6, padding: '0.55rem' }}>
+                  <div style={{ fontWeight: 600, marginBottom: 4 }}>Load Model from Another Position</div>
+                  <select
+                    value={state.selectedRfModelSourcePosition}
+                    onChange={(e) => setState(prev => ({ ...prev, selectedRfModelSourcePosition: e.target.value }))}
+                    style={{ width: '100%', marginBottom: 6 }}
+                    disabled={!state.selectedSample || !state.selectedChannel}
+                  >
+                    <option value="">-- Select saved RF model --</option>
+                    {state.availableRfModels.map((model) => (
+                      <option key={model.path} value={model.position}>
+                        {`${model.position} | ${model.saved_at ? new Date(model.saved_at).toLocaleString() : 'unknown time'} | ${model.trained_on?.position || model.position}`}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    onClick={handleLoadRfModelAndSegment}
+                    disabled={!state.selectedRfModelSourcePosition || state.isDetecting}
+                    style={{ width: '100%' }}
+                  >
+                    Segment with Loaded Model
+                  </button>
+                </div>
+                {state.rfModelStatus && (
+                  <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: '#1a237e', wordBreak: 'break-all' }}>
+                    {state.rfModelStatus}
+                  </div>
+                )}
+                {state.rfModelSavedPath && (
+                  <div style={{ marginTop: '0.25rem', fontSize: '0.75rem', color: '#555', wordBreak: 'break-all' }}>
+                    Saved path: {state.rfModelSavedPath}
+                  </div>
+                )}
+                {state.rfModelWarning && (
+                  <div style={{
+                    marginTop: '0.5rem',
+                    background: '#fff8e1',
+                    border: '1px solid #fbc02d',
+                    borderRadius: 4,
+                    color: '#8d6e00',
+                    padding: '0.5rem',
+                    fontSize: '0.8rem',
+                  }}>
+                    {state.rfModelWarning}
+                  </div>
+                )}
+              </>
+            )}
           </div>
         </div>
 
         {/* CENTER: Image Viewer */}
         <div className="exosome-viewer">
           <div className="viewer-controls">
+            {/* ── Exosome-Detection Display Mode (does NOT affect detection) ── */}
+            <div style={{
+              background: '#f0f4ff', border: '1px solid #b0c4de',
+              borderRadius: 6, padding: '6px 10px', marginBottom: 8,
+            }}>
+              <div style={{ fontWeight: 700, fontSize: '0.78rem', color: '#1a237e', marginBottom: 4 }}>
+                🎨 Display Mode
+                <span style={{ fontWeight: 400, color: '#888', marginLeft: 6, fontSize: '0.68rem' }}>
+                  (visualisation only — detection unaffected)
+                </span>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                {(
+                  [
+                    ['raw_16bit', 'ImageJ-like raw 16-bit', '(default — arr/65535×255, dark)'],
+                    ['enhanced',  'Enhanced stretch',       '(p0.5–p99.5, bright)'],
+                    ['minmax',    'Raw min→max',            '(arr.min→arr.max)'],
+                  ] as [string, string, string][]
+                ).map(([val, label, hint]) => (
+                  <label key={val} style={{ display: 'flex', alignItems: 'baseline', gap: 5, cursor: 'pointer', fontSize: '0.78rem' }}>
+                    <input
+                      type="radio"
+                      name="exo-display-mode"
+                      value={val}
+                      checked={state.displayMode === val}
+                      onChange={() => setState(prev => ({ ...prev, displayMode: val as 'raw_16bit' | 'enhanced' | 'minmax' }))}
+                    />
+                    <span style={{ fontWeight: state.displayMode === val ? 700 : 400 }}>{label}</span>
+                    {state.displayMode === val && (
+                      <span style={{ color: '#555', fontSize: '0.68rem' }}>{hint}</span>
+                    )}
+                    {val === 'raw_16bit' && state.displayMode !== val && (
+                      <span style={{ color: '#888', fontSize: '0.68rem' }}>(default)</span>
+                    )}
+                  </label>
+                ))}
+              </div>
+              {/* LUT toggle */}
+              <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{ fontSize: '0.75rem', fontWeight: 600, color: '#333' }}>LUT:</span>
+                {(['gray', 'red'] as const).map(l => (
+                  <label key={l} style={{ fontSize: '0.75rem', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 3 }}>
+                    <input
+                      type="radio"
+                      name="exo-lut"
+                      value={l}
+                      checked={state.displayLut === l}
+                      onChange={() => setState(prev => ({ ...prev, displayLut: l }))}
+                    />
+                    <span style={{ color: l === 'red' ? '#c0392b' : '#333' }}>
+                      {l === 'gray' ? 'Grayscale' : 'Red (ImageJ-like)'}
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </div>
+
             <SliderInput
               label="Mask Opacity"
               value={state.maskOpacity}
@@ -2153,6 +3544,37 @@ const ExosomeDetection: React.FC = () => {
                 Show Mask Outlines
               </label>
             </div>
+            <div className="input-group">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={showFilteredOnly}
+                  onChange={(e) => setShowFilteredOnly(e.target.checked)}
+                  disabled={state.detections.length === 0}
+                />
+                Show Filtered Only
+                {state.detections.length > 0 && (
+                  <span style={{ fontSize: '0.75rem', color: '#666', marginLeft: 6 }}>
+                    ({filteredDetectionIndices.length} / {state.detections.length})
+                  </span>
+                )}
+              </label>
+            </div>
+            <div className="input-group">
+              <label title={
+                state.selectedChannel === 'C0'
+                  ? 'Switch to another channel to use this guide'
+                  : (!guideRefAvailable ? 'Save filtered detections from C0 first' : '')
+              }>
+                <input
+                  type="checkbox"
+                  checked={showGuideFromRef}
+                  onChange={(e) => setShowGuideFromRef(e.target.checked)}
+                  disabled={state.selectedChannel === 'C0' || !guideRefAvailable}
+                />
+                Guide from Ref
+              </label>
+            </div>
             {state.detectionMethod === 'random_forest' && (
             <div className="input-group">
               <label>
@@ -2165,28 +3587,117 @@ const ExosomeDetection: React.FC = () => {
               </label>
             </div>
             )}
+            <div className="input-group">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={state.showGroundTruth}
+                  onChange={(e) => setState(prev => ({ ...prev, showGroundTruth: e.target.checked }))}
+                  disabled={state.groundTruthPoints.length === 0}
+                />
+                Show Ground Truth
+                {state.groundTruthFile && (
+                  <span style={{ fontSize: '0.75rem', color: '#666', marginLeft: 6 }}>
+                    ({state.groundTruthCount} pts)
+                  </span>
+                )}
+                {!state.groundTruthFile && state.loaded && (
+                  <span style={{ fontSize: '0.75rem', color: '#aaa', marginLeft: 6 }}>
+                    (no CSV found)
+                  </span>
+                )}
+              </label>
+            </div>
+            {state.showGroundTruth && state.groundTruthPoints.length > 0 && (
+              <div className="input-group" style={{ marginLeft: 16 }}>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={state.gtDebugMode}
+                    onChange={(e) => setState(prev => ({ ...prev, gtDebugMode: e.target.checked }))}
+                  />
+                  <span style={{ fontSize: '0.8rem', color: '#c0392b', fontWeight: 600 }}> GT Debug Mode</span>
+                  <span style={{ fontSize: '0.72rem', color: '#888', marginLeft: 4 }}>
+                    (magenta markers + labels + console log)
+                  </span>
+                </label>
+                <div style={{ fontSize: '0.72rem', color: '#888', marginTop: 2, marginLeft: 20 }}>
+                  Click on any spot → nearest GT printed to console
+                </div>
+                {(state.gtImageHeight != null) && (
+                  <div style={{ fontSize: '0.72rem', color: '#888', marginTop: 4, marginLeft: 2 }}>
+                    TIFF: {state.gtImageWidth}×{state.gtImageHeight} px
+                    &nbsp;|&nbsp; px_size: {state.groundTruthPixelSizeUm.toFixed(5)} µm/px
+                  </div>
+                )}
+              </div>
+            )}
+            {state.showGroundTruth && state.groundTruthPoints.length > 0 && state.detections.length > 0 && (() => {
+              // Match stats using the same transform applied in drawCanvas
+              const imgH = state.gtImageHeight ?? 0;
+              const applyT = (p: { x: number; y: number }) => {
+                let { x, y } = p;
+                if (state.gtSwapXY) { const t = x; x = y; y = t; }
+                if (state.gtYFlip)  y = imgH - y;
+                x += state.gtOffsetX;
+                y += state.gtOffsetY;
+                return { x, y };
+              };
+              const transformedGt = state.groundTruthPoints.map(applyT);
+              const TOL = 10;
+              let matched = 0;
+              transformedGt.forEach(gt => {
+                const hit = state.detections.some(d => {
+                  const cx = (d.bbox[0] + d.bbox[2]) / 2;
+                  const cy = (d.bbox[1] + d.bbox[3]) / 2;
+                  return Math.hypot(cx - gt.x, cy - gt.y) < TOL;
+                });
+                if (hit) matched++;
+              });
+              const fp = state.detections.length - matched;
+              const missed = state.groundTruthPoints.length - matched;
+              const pct = ((matched / state.groundTruthPoints.length) * 100).toFixed(1);
+              return (
+                <div style={{ background: '#e8f5e9', padding: '6px 8px', borderRadius: 4,
+                  fontSize: '0.78rem', lineHeight: 1.7, marginTop: 4 }}>
+                  <strong>GT Stats</strong><br />
+                  GT: {state.groundTruthPoints.length} &nbsp;|&nbsp; Detected: {state.detections.length}<br />
+                  Matched: {matched} ({pct}%)<br />
+                  False positives: {fp} &nbsp;|&nbsp; Missed: {missed}
+                </div>
+              );
+            })()}
           </div>
+          {/* Image source label — clarifies what is displayed vs what is used for detection */}
+          {state.loaded && (
+            <div style={{
+              fontSize: '0.72rem', color: '#888', padding: '2px 4px',
+              borderTop: '1px solid #eee', background: '#fafafa',
+            }}>
+              Display: raw image (percentile-normalized for browser) &nbsp;|&nbsp;
+              Detection: raw TIFF
+              {state.groundTruthFile && (
+                <>&nbsp;|&nbsp; GT pixel size: {state.groundTruthPixelSizeUm.toFixed(5)} µm/px</>
+              )}
+            </div>
+          )}
           {/* Viewport: Single source of truth for pointer events */}
-          <div 
+          <div
             ref={viewportRef}
             className="canvas-container"
-            onAuxClick={(e) => { e.preventDefault(); e.stopPropagation(); }}
             onPointerDown={(e) => {
-              // Suppress all default middle-click browser behavior (auto-scroll, new-tab, etc.)
-              if (e.button === 1) { e.preventDefault(); e.stopPropagation(); }
-              // Only start panning if:
-              // 1. Zoomed in
-              // 2. Not in annotation/drawing mode
-              // 3. Middle mouse button or left click when not in active drawing mode
-              if (zoomState.scale > 1.0 &&
-                  !isAnnotatingRef.current && 
-                  !isDrawingRef.current &&
-                  (e.button === 1 || (e.button === 0 && state.detectionMethod !== 'random_forest' && (state.detectionMethod !== 'sam' || state.detectionMode !== 'box')))) {
+              // Ignore middle-click entirely to avoid browser auto-scroll conflicts.
+              if (e.button === 1) return;
+              // Shift + right-click drag starts pan mode.
+              if (e.button === 2 && e.shiftKey) {
+                e.preventDefault();
+                e.stopPropagation();
                 handlePanStart(e);
-              } else {
-                // Let canvas handle the event for annotations/drawing
-                handleCanvasMouseDown(e as any);
+                return;
               }
+              // All other pointer downs are handled by the canvas (annotation/drawing).
+              // Regular right-click remains unaffected.
+              handleCanvasMouseDown(e as any);
             }}
             onPointerMove={(e) => {
               if (isPanningRef.current) {
@@ -2203,14 +3714,23 @@ const ExosomeDetection: React.FC = () => {
               handlePanEnd();
               handleCanvasMouseLeave();
             }}
-            onContextMenu={(e) => e.preventDefault()}
+            onPointerCancel={() => {
+              handlePanEnd();
+              handleCanvasMouseUp();
+            }}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+            }}
             onDoubleClick={handleDoubleClick}
             style={{
               position: 'relative',
               overflow: 'hidden',
               width: '100%',
               height: '100%',
-              cursor: zoomState.scale > 1.0 && !isAnnotatingRef.current && !isDrawingRef.current ? 'grab' : 'default',
+              cursor: isPanningRef.current
+                ? 'grabbing'
+                : (zoomState.scale > 1.0 && !isAnnotatingRef.current && !isDrawingRef.current ? 'grab' : 'default'),
             }}
           >
             {state.currentImageUrl ? (
@@ -2247,6 +3767,7 @@ const ExosomeDetection: React.FC = () => {
                   <canvas
                     ref={canvasRef}
                     onClick={handleCanvasClick}
+                    onContextMenu={(e) => e.preventDefault()}
                     style={{ 
                       display: 'block',
                       maxWidth: 'none',
@@ -2295,38 +3816,19 @@ const ExosomeDetection: React.FC = () => {
               <AreaHistogram detections={state.detections} />
 
               {/* Detected Objects Table */}
-              <div className="results-table-container">
-                <h3>Detected Objects ({state.detections.length})</h3>
-                <div style={{ maxHeight: '300px', overflowY: 'auto' }}>
-                  <table className="detections-table">
-                    <thead>
-                      <tr>
-                        <th>ID</th>
-                        <th>Area (px²)</th>
-                        <th>Centroid (x, y)</th>
-                        <th>Score</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {state.detections.map((det, idx) => (
-                        <tr
-                          key={det.id}
-                          onClick={() => {
-                            selectedDetectionRef.current = idx;
-                            drawCanvas();
-                          }}
-                          className={selectedDetectionRef.current === idx ? 'selected' : ''}
-                        >
-                          <td>{det.id}</td>
-                          <td>{det.area.toFixed(1)}</td>
-                          <td>({det.centroid[0].toFixed(1)}, {det.centroid[1].toFixed(1)})</td>
-                          <td>{det.score !== undefined ? det.score.toFixed(3) : 'N/A'}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
+              <DetectionTable
+                detections={state.detections}
+                selectedIdx={selectedDetectionRef.current}
+                onRowClick={(idx) => { selectedDetectionRef.current = idx; drawCanvas(); }}
+                filterArea={filterArea}
+                filterCirc={filterCirc}
+                onFilterAreaChange={setFilterArea}
+                onFilterCircChange={setFilterCirc}
+                onFilteredIndicesChange={handleFilteredIndicesChange}
+                onApplyFilters={handleApplyFilters}
+                onSaveFilter={handleSaveFilter}
+                saveMessage={saveFilterMessage}
+              />
 
               {/* Export Status */}
               {state.exportStatus && (
@@ -2385,10 +3887,10 @@ const ExosomeDetection: React.FC = () => {
                     Clear Logs
                   </button>
                   <button 
-                    onClick={() => {
+                    onClick={async () => {
                       const json = JSON.stringify(state.debugLogs, null, 2);
-                      navigator.clipboard.writeText(json);
-                      alert('Debug logs copied to clipboard');
+                      const copied = await copyText(json);
+                      alert(copied ? 'Debug logs copied to clipboard' : 'Failed to copy debug logs to clipboard');
                     }}
                     style={{ padding: '0.25rem 0.5rem', fontSize: '0.8rem' }}
                   >
@@ -2478,36 +3980,42 @@ const ExosomeDetection: React.FC = () => {
             <div style={{ marginTop: '1rem' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
                 <h4 style={{ margin: 0, fontSize: '0.95rem' }}>Click History ({state.clickHistory.length})</h4>
-                <div>
-                  <button 
-                    onClick={() => {
-                      setState(prev => ({ ...prev, clickHistory: [], annotations: [] }));
-                      drawCanvas();
-                    }}
-                    style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem', marginRight: '0.25rem' }}
-                  >
-                    Clear All
-                  </button>
-                  <button 
-                    onClick={() => {
+                <div style={{ display: 'flex', gap: '0.25rem', flexWrap: 'wrap' }}>
+                  <button
+                    onClick={saveClickHistory}
+                    style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem', background: '#1976d2', color: '#fff', border: 'none', borderRadius: 3, cursor: 'pointer' }}
+                    title="Save click history to localStorage"
+                  >Save</button>
+                  <button
+                    onClick={loadClickHistory}
+                    style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem', cursor: 'pointer' }}
+                    title="Load click history from localStorage"
+                  >Load</button>
+                  <button
+                    onClick={resetClickHistory}
+                    style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem', background: '#fff3e0', color: '#b71c1c', cursor: 'pointer' }}
+                    title="Clear history and remove from localStorage"
+                  >Reset</button>
+                  <button
+                    onClick={async () => {
                       const json = JSON.stringify(state.clickHistory, null, 2);
-                      navigator.clipboard.writeText(json);
-                      alert('Click history copied to clipboard as JSON');
+                      const copied = await copyText(json);
+                      alert(copied ? 'Click history copied to clipboard as JSON' : 'Failed to copy click history JSON');
                     }}
-                    style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem', marginRight: '0.25rem' }}
+                    style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }}
                   >
                     JSON
                   </button>
-                  <button 
-                    onClick={() => {
+                  <button
+                    onClick={async () => {
                       const csv = [
                         'Timestamp,ImageX,ImageY,Intensity,Confidence,PredictedClass,Scale,OffsetX,OffsetY',
-                        ...state.clickHistory.map(h => 
+                        ...state.clickHistory.map(h =>
                           `${h.timestamp},${h.imageX},${h.imageY},${h.intensity || ''},${h.confidence || ''},${h.predictedClass || ''},${h.scale},${h.offsetX},${h.offsetY}`
                         )
                       ].join('\n');
-                      navigator.clipboard.writeText(csv);
-                      alert('Click history copied to clipboard as CSV');
+                      const copied = await copyText(csv);
+                      alert(copied ? 'Click history copied to clipboard as CSV' : 'Failed to copy click history CSV');
                     }}
                     style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }}
                   >
@@ -2515,64 +4023,89 @@ const ExosomeDetection: React.FC = () => {
                   </button>
                 </div>
               </div>
-              <div style={{ 
-                maxHeight: '200px', 
-                overflowY: 'auto', 
-                border: '1px solid #ddd', 
-                borderRadius: '4px',
-                padding: '0.5rem',
-                fontSize: '0.85rem',
-                backgroundColor: '#f9f9f9'
-              }}>
-                {state.clickHistory.length === 0 ? (
-                  <p style={{color: '#999', fontSize: '0.85rem', margin: 0}}>No clicks yet</p>
-                ) : (
-                  state.clickHistory.map((click, idx) => (
-                    <div key={click.id} style={{ 
-                      padding: '0.5rem',
-                      borderBottom: idx < state.clickHistory.length - 1 ? '1px solid #eee' : 'none',
-                      backgroundColor: 'white',
-                      borderRadius: '4px',
-                      marginBottom: '0.25rem'
+              {(() => {
+                const exosomeClicks = state.clickHistory.filter((click) => getClickCategory(click) === 'exosome');
+                const backgroundClicks = state.clickHistory.filter((click) => getClickCategory(click) === 'background');
+                const renderPanel = (
+                  title: string,
+                  clicks: ExosomeDetectionState['clickHistory'],
+                  accent: string,
+                ) => (
+                  <div style={{
+                    border: '1px solid #ddd',
+                    borderRadius: '4px',
+                    backgroundColor: '#f9f9f9',
+                    marginBottom: '0.6rem',
+                  }}>
+                    <div style={{
+                      fontWeight: 700,
+                      color: accent,
+                      padding: '0.45rem 0.55rem',
+                      borderBottom: '1px solid #e5e5e5',
                     }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-                        <div style={{ flex: 1 }}>
-                          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.25rem' }}>
-                            <span style={{ fontWeight: 'bold' }}>#{idx + 1} ({click.imageX}, {click.imageY})</span>
-                            <span style={{ color: '#666', fontSize: '0.75rem' }}>
-                              {new Date(click.timestamp).toLocaleTimeString()}
-                            </span>
-                          </div>
-                          <div style={{ fontSize: '0.75rem', color: '#666' }}>
-                            <div><strong>Intensity:</strong> {click.intensity !== null ? click.intensity : 'N/A'}</div>
-                            {click.confidence !== null && <div><strong>Confidence:</strong> {click.confidence.toFixed(3)}</div>}
-                            {click.predictedClass && <div><strong>Class:</strong> {click.predictedClass}</div>}
-                            <div style={{ fontSize: '0.7rem', color: '#999', marginTop: '0.25rem' }}>
-                              Zoom: {Math.round(click.scale * 100)}% | Pan: ({Math.round(click.offsetX)}, {Math.round(click.offsetY)})
+                      {title} ({clicks.length})
+                    </div>
+                    <div style={{
+                      maxHeight: '180px',
+                      overflowY: 'auto',
+                      padding: '0.45rem',
+                      fontSize: '0.85rem',
+                    }}>
+                      {clicks.length === 0 ? (
+                        <div style={{ color: '#999', fontSize: '0.8rem', paddingLeft: '0.25rem' }}>(empty)</div>
+                      ) : (
+                        clicks.map((click, idx) => (
+                          <div key={click.id} style={{
+                            padding: '0.5rem',
+                            borderBottom: idx < clicks.length - 1 ? '1px solid #eee' : 'none',
+                            backgroundColor: 'white',
+                            borderRadius: '4px',
+                            marginBottom: '0.25rem'
+                          }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                              <div style={{ flex: 1 }}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.25rem' }}>
+                                  <span style={{ fontWeight: 'bold' }}>#{idx + 1} ({click.imageX}, {click.imageY})</span>
+                                  <span style={{ color: '#666', fontSize: '0.75rem' }}>
+                                    {new Date(click.timestamp).toLocaleTimeString()}
+                                  </span>
+                                </div>
+                                <div style={{ fontSize: '0.75rem', color: '#666' }}>
+                                  <div><strong>Intensity:</strong> {click.intensity !== null ? click.intensity : 'N/A'}</div>
+                                  {click.confidence !== null && <div><strong>Confidence:</strong> {click.confidence.toFixed(3)}</div>}
+                                  <div><strong>Class:</strong> {getClickCategory(click) === 'background' ? 'Background' : 'Exosome'}</div>
+                                </div>
+                              </div>
+                              <button
+                                onClick={() => handleRemoveClick(click.id, click.annotationId)}
+                                style={{
+                                  padding: '0.25rem 0.5rem',
+                                  fontSize: '0.7rem',
+                                  marginLeft: '0.5rem',
+                                  backgroundColor: '#ff4444',
+                                  color: 'white',
+                                  border: 'none',
+                                  borderRadius: '4px',
+                                  cursor: 'pointer',
+                                }}
+                                title="Remove this point"
+                              >
+                                Remove
+                              </button>
                             </div>
                           </div>
-                        </div>
-                        <button
-                          onClick={() => handleRemoveClick(click.id, click.annotationId)}
-                          style={{
-                            padding: '0.25rem 0.5rem',
-                            fontSize: '0.7rem',
-                            marginLeft: '0.5rem',
-                            backgroundColor: '#ff4444',
-                            color: 'white',
-                            border: 'none',
-                            borderRadius: '4px',
-                            cursor: 'pointer',
-                          }}
-                          title="Remove this point"
-                        >
-                          Remove
-                        </button>
-                      </div>
+                        ))
+                      )}
                     </div>
-                  ))
-                )}
-              </div>
+                  </div>
+                );
+                return (
+                  <>
+                    {renderPanel('🟢 Exosome', exosomeClicks, '#0b8f3a')}
+                    {renderPanel('⬜ Background', backgroundClicks, '#c0392b')}
+                  </>
+                );
+              })()}
             </div>
           </div>
           )}

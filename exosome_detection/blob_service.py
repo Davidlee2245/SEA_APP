@@ -186,9 +186,11 @@ def detect_blobs(
         
         masks.append(mask.tolist())
         detections.append({
-            'area': float(area),
-            'centroid': centroid,
-            'bbox': bbox,
+            'area':        float(area),
+            'centroid':    centroid,
+            'bbox':        bbox,
+            'perimeter':   round(perimeter, 2),
+            'circularity': round(min(1.0, circularity), 4),
         })
         scores.append(1.0)  # Blob detection doesn't have confidence scores
     

@@ -116,9 +116,16 @@ const computeHistogramFromPng = async (url: string): Promise<ChannelStats> => {
 
     // Ensure URL is absolute (add backend server if relative)
     const absoluteUrl = url.startsWith('http') ? url : `${getApiBase()}${url}`;
-    // Add cache-busting param (use & if URL already has query params, otherwise ?)
-    const separator = absoluteUrl.includes('?') ? '&' : '?';
-    img.src = `${absoluteUrl}${separator}t=${Date.now()}`;
+    try {
+      const u = new URL(absoluteUrl);
+      // Keep existing token if present; avoid duplicate t=...&t=...
+      if (!u.searchParams.has('t')) {
+        u.searchParams.set('t', String(Date.now()));
+      }
+      img.src = u.toString();
+    } catch {
+      img.src = absoluteUrl;
+    }
   });
 };
 

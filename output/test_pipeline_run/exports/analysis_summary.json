@@ -1,0 +1,108 @@
+{
+  "total_objects": 3264,
+  "samples": [
+    "A549",
+    "H2228",
+    "KP"
+  ],
+  "positions": [
+    "1",
+    "2",
+    "3"
+  ],
+  "markers": [
+    "EpCAM",
+    "MET",
+    "SDC1",
+    "EGFR",
+    "ADAM10",
+    "CTSH",
+    "PDL1",
+    "HER2"
+  ],
+  "threshold_table": [
+    {
+      "marker": "EpCAM",
+      "threshold_value": 0.2872358253414976,
+      "method": "percentile"
+    },
+    {
+      "marker": "MET",
+      "threshold_value": 0.4254181378832288,
+      "method": "percentile"
+    },
+    {
+      "marker": "SDC1",
+      "threshold_value": 0.37237811304651847,
+      "method": "percentile"
+    },
+    {
+      "marker": "EGFR",
+      "threshold_value": 0.23307531748609012,
+      "method": "percentile"
+    },
+    {
+      "marker": "ADAM10",
+      "threshold_value": 0.5814363067529386,
+      "method": "percentile"
+    },
+    {
+      "marker": "CTSH",
+      "threshold_value": 0.23877269308818583,
+      "method": "percentile"
+    },
+    {
+      "marker": "PDL1",
+      "threshold_value": 0.30598764998570827,
+      "method": "percentile"
+    },
+    {
+      "marker": "HER2",
+      "threshold_value": 0.3171036097142186,
+      "method": "percentile"
+    }
+  ],
+  "export_paths": {
+    "Cleaned data (CSV)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/cleaned_data.csv",
+    "Cleaned data (XLSX)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/cleaned_data.xlsx",
+    "Filtered data (CSV)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/filtered_data.csv",
+    "Filtered data (XLSX)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/filtered_data.xlsx",
+    "Raw marker matrix (CSV)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/raw_score_matrix.csv",
+    "Raw marker matrix (XLSX)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/raw_score_matrix.xlsx",
+    "Normalized marker matrix (CSV)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/normalized_exp_mat.csv",
+    "Normalized marker matrix (XLSX)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/normalized_exp_mat.xlsx",
+    "Scaled marker matrix (CSV)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/scaled_exp_matrix.csv",
+    "Scaled marker matrix (XLSX)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/scaled_exp_matrix.xlsx",
+    "Binary marker matrix (CSV)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/binary_exp_matrix.csv",
+    "Binary marker matrix (XLSX)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/binary_exp_matrix.xlsx",
+    "Morphology table (CSV)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/morphology_table.csv",
+    "Morphology table (XLSX)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/morphology_table.xlsx",
+    "Metadata table (CSV)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/metadata_table.csv",
+    "Metadata table (XLSX)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/metadata_table.xlsx",
+    "Threshold table (CSV)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/threshold_table.csv",
+    "Threshold table (XLSX)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/threshold_table.xlsx",
+    "Colocalization results (CSV)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/colocalization_all.csv",
+    "Colocalization results (XLSX)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/colocalization_all.xlsx",
+    "Reference-centered colocalization (EpCAM) (CSV)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/colocalization_reference_EpCAM.csv",
+    "Reference-centered colocalization (EpCAM) (XLSX)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/colocalization_reference_EpCAM.xlsx",
+    "PCA coordinates (CSV)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/dim_red_pca.csv",
+    "PCA coordinates (XLSX)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/dim_red_pca.xlsx",
+    "t-SNE coordinates (CSV)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/dim_red_tsne.csv",
+    "t-SNE coordinates (XLSX)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/dim_red_tsne.xlsx",
+    "UMAP coordinates (CSV)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/dim_red_umap.csv",
+    "UMAP coordinates (XLSX)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/dim_red_umap.xlsx",
+    "Clustering results (CSV)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/clustering_labels.csv",
+    "Clustering results (XLSX)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/clustering_labels.xlsx",
+    "Sample comparison summary (CSV)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/sample_comparison_summary.csv",
+    "Sample comparison summary (XLSX)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/sample_comparison_summary.xlsx",
+    "Sample pairwise tests (CSV)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/sample_pairwise_tests.csv",
+    "Sample pairwise tests (XLSX)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/sample_pairwise_tests.xlsx",
+    "Position QC summary (CSV)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/position_qc_summary.csv",
+    "Position QC summary (XLSX)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/position_qc_summary.xlsx",
+    "Average expression by sample (CSV)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/avg_expression_by_sample.csv",
+    "Average expression by sample (XLSX)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/avg_expression_by_sample.xlsx",
+    "Average expression by position (CSV)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/avg_expression_by_position.csv",
+    "Average expression by position (XLSX)": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/avg_expression_by_position.xlsx",
+    "Pickle analysis object": "/home/david/.cursor-tutor/SEA/output/test_pipeline_run/exports/analysis_object.pkl"
+  }
+}

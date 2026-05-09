@@ -9,6 +9,7 @@ import ImageProcessing from './components/ImageProcessing';
 import Alignment from './components/Alignment';
 import AgentChat from './components/AgentChat';
 import ExosomeDetection from './components/ExosomeDetection';
+import DataAnalysis from './components/DataAnalysis';
 import './styles/App.css';
 
 const App: React.FC = () => {
@@ -22,15 +23,9 @@ const App: React.FC = () => {
     });
   }, []);
 
-  const [sampleName, setSampleName] = useState<string>('1');
-  const [useMockData, setUseMockData] = useState<boolean>(false);  // Default to real data
-  const [inputValue, setInputValue] = useState<string>('1');
-  const [activeTab, setActiveTab] = useState<'agent' | 'processing' | 'alignment' | 'exosome' | 'viewer'>('agent');
-
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    setSampleName(inputValue);
-  };
+  const [activeTab, setActiveTab] = useState<
+    'agent' | 'processing' | 'alignment' | 'exosome' | 'dataAnalysis' | 'viewer'
+  >('agent');
 
   return (
     <div className="app">
@@ -66,6 +61,12 @@ const App: React.FC = () => {
         >
           📊 Results Viewer
         </button>
+        <button
+          className={`nav-tab ${activeTab === 'dataAnalysis' ? 'active' : ''}`}
+          onClick={() => setActiveTab('dataAnalysis')}
+        >
+          📉 Data Analysis
+        </button>
       </nav>
 
       {/* All tabs are always mounted (hidden via CSS) to preserve state across tab switches */}
@@ -93,31 +94,11 @@ const App: React.FC = () => {
       </div>
 
       <div className="tab-content" style={{ display: activeTab === 'viewer' ? 'block' : 'none' }}>
-        <div className="app-controls">
-          <form onSubmit={handleSubmit} className="sample-selector">
-            <label>
-              Sample Name:
-              <input
-                type="text"
-                value={inputValue}
-                onChange={(e) => setInputValue(e.target.value)}
-                placeholder="Enter sample name (e.g., 1, 2, Sample_01)"
-              />
-            </label>
-            <button type="submit">Load Sample</button>
-          </form>
+        <AlignmentViewer />
+      </div>
 
-          <label className="mock-data-toggle">
-            <input
-              type="checkbox"
-              checked={useMockData}
-              onChange={(e) => setUseMockData(e.target.checked)}
-            />
-            Use Mock Data (enable for development without backend)
-          </label>
-        </div>
-
-        <AlignmentViewer sampleName={sampleName} useMockData={useMockData} />
+      <div className="tab-content" style={{ display: activeTab === 'dataAnalysis' ? 'block' : 'none' }}>
+        <DataAnalysis />
       </div>
     </div>
   );

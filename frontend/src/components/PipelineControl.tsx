@@ -2,7 +2,7 @@
  * Main Pipeline Control Component
  */
 
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useWebSocket } from '../hooks/useWebSocket';
 import ProgressBar from './ProgressBar';
 import AlignmentColorOverlay from './AlignmentColorOverlay';
@@ -104,6 +104,10 @@ const PipelineControl: React.FC = () => {
   // Ref to track if we're currently auto-triggering preprocessing (to prevent loops)
   const autoTriggeringRef = useRef<string>('');
 
+  // Default auto-load
+  const autoLoadFiredRef = useRef(false);
+  const [pendingAutoLoad, setPendingAutoLoad] = useState(false);
+
   // Unified pipeline state
   const [pipelineState, setPipelineState] = useState<PipelineState>({
     selectedSample: '',
@@ -130,7 +134,7 @@ const PipelineControl: React.FC = () => {
   // Fetch status function - defined first
   const fetchStatus = useCallback(async () => {
     try {
-      const response = await fetch('${getApiBase()}/api/pipeline/status');
+      const response = await fetch(`${getApiBase()}/api/pipeline/status`);
       const data = await response.json();
       if (data.success) {
         setStatus(data.data);
@@ -189,28 +193,34 @@ const PipelineControl: React.FC = () => {
   // Apply to all channels or just selected channel
   const [applyToAllChannels, setApplyToAllChannels] = useState<boolean>(false);  // Default: apply to selected only
 
-  // Fetch input samples on mount
+  // Fetch input samples on mount; auto-select default
   useEffect(() => {
     const fetchSamples = async () => {
       try {
-        const response = await fetch('${getApiBase()}/api/input/samples');
+        const response = await fetch(`${getApiBase()}/api/input/samples`);
         const data = await response.json();
         if (data.success) {
-          setPipelineState(prev => ({ ...prev, availableSamples: data.data }));
+          setPipelineState(prev => {
+            const next = { ...prev, availableSamples: data.data };
+            if (!prev.selectedSample && data.data.includes('A2780Cis10'))
+              next.selectedSample = 'A2780Cis10';
+            return next;
+          });
         }
       } catch (err) {
         console.error('Failed to fetch input samples:', err);
       }
     };
     fetchSamples();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Fetch positions when sample changes
+  // Fetch positions when sample changes; auto-select default
   useEffect(() => {
     if (!pipelineState.selectedSample) {
-      setPipelineState(prev => ({ 
-        ...prev, 
-        availablePositions: [], 
+      setPipelineState(prev => ({
+        ...prev,
+        availablePositions: [],
         selectedPosition: '',
         loaded: false,
         stages: {},
@@ -225,7 +235,15 @@ const PipelineControl: React.FC = () => {
         );
         const data = await response.json();
         if (data.success) {
-          setPipelineState(prev => ({ ...prev, availablePositions: data.data }));
+          setPipelineState(prev => {
+            const next = { ...prev, availablePositions: data.data };
+            if (!prev.selectedPosition && data.data.includes('P1')) {
+              next.selectedPosition = 'P1';
+              if (prev.selectedSample === 'A2780Cis10' && !autoLoadFiredRef.current)
+                setPendingAutoLoad(true);
+            }
+            return next;
+          });
         }
       } catch (err) {
         console.error('Failed to fetch positions:', err);
@@ -389,7 +407,7 @@ const PipelineControl: React.FC = () => {
     console.log(`Loading position ${pipelineState.selectedSample}/${pipelineState.selectedPosition}...`);
 
     try {
-      const response = await fetch('${getApiBase()}/api/input/load_position', {
+      const response = await fetch(`${getApiBase()}/api/input/load_position`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -454,6 +472,16 @@ const PipelineControl: React.FC = () => {
     }
   };
 
+  // Auto-load effect — placed after handleLoadPosition to avoid hoisting error
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!pendingAutoLoad || autoLoadFiredRef.current) return;
+    autoLoadFiredRef.current = true;
+    setPendingAutoLoad(false);
+    handleLoadPosition();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingAutoLoad]);
+
   const handleRunAlignment = async () => {
     if (!pipelineState.loaded) {
       alert('Please load a position first');
@@ -465,7 +493,7 @@ const PipelineControl: React.FC = () => {
     console.log(`Running alignment on stage "${inputStage}" with reference: ${refChannel}...`);
 
     try {
-      const response = await fetch('${getApiBase()}/api/input/align', {
+      const response = await fetch(`${getApiBase()}/api/input/align`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -630,7 +658,7 @@ const PipelineControl: React.FC = () => {
       
       console.log(`[Frontend] Request body:`, JSON.stringify(requestBody, null, 2));
 
-      const response = await fetch('${getApiBase()}/api/input/preprocess', {
+      const response = await fetch(`${getApiBase()}/api/input/preprocess`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody),
@@ -942,6 +970,21 @@ const PipelineControl: React.FC = () => {
     console.log(`[Reset] ✓ Channel ${channelKey} reset to raw`);
   };
 
+  const handleSelectImageFile = async () => {
+    if (!window.electronAPI?.selectImageFile) {
+      alert('Image file picker is available in the Electron app only.');
+      return;
+    }
+    try {
+      const selectedPath = await window.electronAPI.selectImageFile();
+      if (!selectedPath) return;
+      alert(`Selected image file:\n${selectedPath}\n\nUse Sample/Position selection for loading into SEA.`);
+    } catch (err) {
+      console.error('Failed to open image file dialog:', err);
+      alert(`Failed to open file dialog: ${err}`);
+    }
+  };
+
   const handleRunAllSteps = async () => {
     if (!pipelineState.loaded) {
       alert('Please load a position first');
@@ -979,6 +1022,25 @@ const PipelineControl: React.FC = () => {
       alert('Run all steps failed: ' + err);
     }
   };
+
+  const selectedStagePreviewUrl =
+    pipelineState.stages[pipelineState.currentStage]?.[pipelineState.selectedChannel] || null;
+  const selectedStagePreviewSrc = useMemo(() => {
+    if (!selectedStagePreviewUrl) return null;
+    const absoluteUrl = selectedStagePreviewUrl.startsWith('http')
+      ? selectedStagePreviewUrl
+      : `${getApiBase()}${selectedStagePreviewUrl}`;
+    try {
+      const u = new URL(absoluteUrl);
+      // Keep existing cache-busting token if present; do not append duplicate `t`.
+      if (!u.searchParams.has('t')) {
+        u.searchParams.set('t', String(Date.now()));
+      }
+      return u.toString();
+    } catch {
+      return absoluteUrl;
+    }
+  }, [selectedStagePreviewUrl]);
 
   return (
     <div className="pipeline-control">
@@ -1035,7 +1097,7 @@ const PipelineControl: React.FC = () => {
                 {pipelineState.isLoadingPosition ? 'Loading...' : 'Load Position'}
               </button>
 
-              <button className="sidebar-btn btn-image" onClick={() => console.log('TODO: Load Image File')}>
+              <button className="sidebar-btn btn-image" onClick={handleSelectImageFile}>
                 Load Image File
               </button>
             </div>
@@ -1374,17 +1436,13 @@ const PipelineControl: React.FC = () => {
               </div>
             </div>
 
-            <div className="preview-box">
+            <div className="preview-box" onContextMenu={(e) => e.preventDefault()}>
               {pipelineState.loaded ? (
                 pipelineState.stages[pipelineState.currentStage]?.[pipelineState.selectedChannel] ? (
                   <img 
-                    src={(() => {
-                      const url = pipelineState.stages[pipelineState.currentStage]![pipelineState.selectedChannel];
-                      const absoluteUrl = url.startsWith('http') ? url : `${getApiBase()}${url}`;
-                      const separator = absoluteUrl.includes('?') ? '&' : '?';
-                      return `${absoluteUrl}${separator}t=${Date.now()}`;
-                    })()}
+                    src={selectedStagePreviewSrc || undefined}
                     alt={`${pipelineState.currentStage} - ${pipelineState.selectedChannel}`}
+                    onContextMenu={(e) => e.preventDefault()}
                     style={{ maxWidth: '100%', height: 'auto' }}
                   />
                 ) : (

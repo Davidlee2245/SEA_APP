@@ -4,6 +4,7 @@ interface ShiftVector {
   dx: number;
   dy: number;
   magnitude: number;
+  angle_deg?: number;
   type: 'reference' | 'aligned' | 'identity';
   residual_error?: number;
   num_matches?: number;
@@ -214,6 +215,22 @@ const AlignmentShiftPanel: React.FC<AlignmentShiftPanelProps> = ({
                           {shift.magnitude.toFixed(3)} px
                         </div>
                       </div>
+                      {shift.angle_deg !== undefined && (
+                        <>
+                          <div>
+                            <div style={{ fontSize: '10px', color: '#666', marginBottom: '2px' }}>Rotation</div>
+                            <div style={{ fontWeight: '600', color: '#333' }}>
+                              {shift.angle_deg >= 0 ? '+' : ''}{shift.angle_deg.toFixed(2)}°
+                            </div>
+                          </div>
+                          <div>
+                            <div style={{ fontSize: '10px', color: '#666', marginBottom: '2px' }}>|θ|</div>
+                            <div style={{ fontWeight: '600', color: '#333' }}>
+                              {Math.abs(shift.angle_deg).toFixed(2)}°
+                            </div>
+                          </div>
+                        </>
+                      )}
                       {shift.residual_error !== undefined && (
                         <div style={{ gridColumn: '1 / -1', fontSize: '10px', color: '#666', marginTop: '4px' }}>
                           <strong>Residual:</strong> {shift.residual_error.toFixed(2)} px

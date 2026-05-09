@@ -23,6 +23,16 @@ const { contextBridge, ipcRenderer } = require('electron');
 let _bufferedPort   = null;   // set as soon as the IPC message arrives
 let _portCallback   = null;   // set when React calls onBackendPort()
 
+// Prefer synchronous bootstrap from mainWindow.webPreferences.additionalArguments.
+// This prevents renderer startup races where components fetch before async IPC.
+const portArg = process.argv.find((arg) => arg.startsWith('--sea-backend-port='));
+if (portArg) {
+  const parsed = Number(portArg.split('=')[1]);
+  if (!Number.isNaN(parsed) && parsed > 0) {
+    _bufferedPort = parsed;
+  }
+}
+
 ipcRenderer.on('backend-port', (_event, port) => {
   _bufferedPort = port;
   if (_portCallback) {
@@ -44,14 +54,34 @@ contextBridge.exposeInMainWorld('electronAPI', {
   /** Open a native folder picker, return selected data root path (or null). */
   selectDataRoot: () => ipcRenderer.invoke('select-data-root'),
 
+  /** Open a native image file picker, return selected path (or null). */
+  selectImageFile: () => ipcRenderer.invoke('select-image-file'),
+
   /** Save config and launch the main app window. */
   launchAfterSettings: (config) => ipcRenderer.invoke('launch-after-settings', config),
+
+  /** Save config while app is already running (no relaunch). */
+  saveSettings: (config) => ipcRenderer.invoke('save-settings', config),
 
   /** Read current saved config. */
   getConfig: () => ipcRenderer.invoke('get-config'),
 
   /** Get the default data root path (shown as placeholder in settings). */
   getDefaultDataRoot: () => ipcRenderer.invoke('get-default-data-root'),
+
+  /** Run automatic conda + pip setup (first-launch). Returns result object. */
+  startAutoSetup: () => ipcRenderer.invoke('start-auto-setup'),
+
+  /** Subscribe to auto-setup status lines (main → settings). */
+  onAutoSetupProgress: (callback) => {
+    const handler = (_event, message) => {
+      if (typeof message === 'string') callback(message);
+    };
+    ipcRenderer.on('auto-setup-progress', handler);
+  },
+
+  /** Open a URL in the system browser (settings page). */
+  openExternal: (url) => ipcRenderer.invoke('open-external', url),
 
   // ── Runtime ──────────────────────────────────────────────────────────────
 
@@ -71,4 +101,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
       _portCallback = callback;
     }
   },
+
+  /** Get backend port synchronously if already known, otherwise null. */
+  getBackendPort: () => _bufferedPort,
+
+  // ── Persistent key/value storage (Electron userData) ─────────────────────
+  storeGet: (key) => ipcRenderer.invoke('store:get', key),
+  storeSet: (key, value) => ipcRenderer.invoke('store:set', key, value),
+  storeRemove: (key) => ipcRenderer.invoke('store:remove', key),
 });

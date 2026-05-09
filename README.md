@@ -294,6 +294,70 @@ See `QUICKSTART_VISUALIZATION.md` for detailed instructions.
 - `VISUALIZATION_README.md` - Features and architecture
 - `frontend/README.md` - Frontend development details
 
+## Alignment Features
+
+### TIFF Export on Save (Feature 1)
+
+After running alignment the **Save / Restore** panel gains an opt-in TIFF download:
+
+- **Checkbox** — "Download aligned TIFFs after save" (enabled only after alignment has been run; preference persists in localStorage with the alignment snapshot).
+- **Format radio** — *Individual channels* (ZIP of per-channel `{channel}_aligned.tif` files) or *Multi-channel composite* (single ImageJ-compatible multi-page TIFF, channels as pages).
+- Clicking **Save** writes the localStorage snapshot, then calls `POST /api/input/export_tiff` and triggers a browser download.
+- A status line below the buttons shows progress (`Saved · Downloading N TIFFs…`) and result (`Saved · N TIFFs downloaded ✓`), clearing after 3 seconds.
+
+**API endpoint:** `POST /api/input/export_tiff`
+
+| Field | Type | Description |
+|---|---|---|
+| `sample` | string | Sample name |
+| `position` | string | Position name |
+| `input_stage` | string | Preprocessing stage used for alignment |
+| `format` | `"zip"` \| `"composite"` | Output format |
+| `crop_rect` | `{x,y,w,h}` (optional) | Pixel crop in aligned-image space |
+
+Returns a streaming download (`application/zip` or `image/tiff`).
+
+**Filename conventions:**
+- Individual ZIP: `{sample}_{position}_aligned.zip` → contains `{channel}_aligned.tif`
+- Composite: `{sample}_{position}_aligned_composite.tif`
+
+---
+
+### Crop Tool (Feature 2)
+
+A non-destructive, post-alignment crop that affects export output only.
+
+**Location:** Collapsible **✂️ Crop** panel in the left sidebar, between Feature Detection and Save/Restore. Only shown after alignment has produced an aligned stage.
+
+**Workflow:**
+1. Expand the Crop panel (click the header).
+2. The Color Overlay canvas switches to **crop mode** — cursor becomes a crosshair and a "✂️ Crop mode" badge appears in the overlay header.
+3. Drag on the Color Overlay canvas to draw a rectangle. A white-dashed outline with semi-transparent dark outside region shows the selection.
+4. Release the mouse — the crop rectangle is committed. Corner handles appear.
+5. Refine with the numeric **X / Y / W / H** inputs in the Crop panel (image pixels).
+6. Click **Clear** to remove the crop.
+
+The crop is saved in the `AlignmentSnapshot` localStorage entry alongside shift vectors and is restored on **Load Saved**.
+
+**Integration with TIFF export:** when a crop is active and "Download aligned TIFFs after save" is checked, the export endpoint applies `arr[y:y+h, x:x+w]` to every channel before packaging.
+
+**`AlignmentSnapshot` schema (extended):**
+```typescript
+interface AlignmentSnapshot {
+  diagonalBoxes: Record<string, DiagonalBox | null>;
+  shiftVectors: Record<string, ShiftVector>;
+  refChannel: string;
+  selectedChannels: string[];
+  alignMethod: AlignMethod;
+  savedAt: string;
+  // New fields
+  cropRect: { x: number; y: number; w: number; h: number } | null;
+  tiffExportPreference: { autoDownload: boolean; format: 'zip' | 'composite' } | null;
+}
+```
+
+---
+
 ## Citation
 
 If you use SEA in your research, please cite:

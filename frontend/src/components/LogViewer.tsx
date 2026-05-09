@@ -4,6 +4,7 @@
 
 import React, { useEffect, useRef } from 'react';
 import '../styles/LogViewer.css';
+import { copyText } from '../lib/clipboard';
 
 interface LogViewerProps {
   logs: string[];
@@ -44,7 +45,12 @@ const LogViewer: React.FC<LogViewerProps> = ({ logs, maxLines = 500 }) => {
             />
             Auto-scroll
           </label>
-          <button onClick={() => navigator.clipboard.writeText(logs.join('\n'))}>
+          <button onClick={async () => {
+            const copied = await copyText(logs.join('\n'));
+            if (!copied) {
+              console.warn('Failed to copy logs to clipboard');
+            }
+          }}>
             📋 Copy All
           </button>
         </div>

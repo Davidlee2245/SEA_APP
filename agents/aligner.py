@@ -704,9 +704,26 @@ Respond in JSON:
                 
                 # Build transformation matrix based on transform_type
                 if transform_type.lower() in ['translation', 'euclidean']:
-                    # Translation-only or Euclidean (translation + rotation)
-                    # For now, implement translation-only (Euclidean with 0 rotation)
-                    # Translation matrix: [[1, 0, dx], [0, 1, dy], [0, 0, 1]]
+                    # NOTE (PCC limitation):
+                    # Phase Cross Correlation computes a sub-pixel SHIFT (dx, dy) from the
+                    # Fourier phase spectrum.  It does NOT estimate a rotation angle.
+                    # Therefore, even when transform_type='euclidean' is requested, only a
+                    # pure translation matrix is built here.  The rotation component of an
+                    # Euclidean transform is left as identity (0°).
+                    #
+                    # To add rotation support for PCC:
+                    #   1. Estimate rotation via log-polar / scale-invariant PCC first.
+                    #   2. Build M = T(cx,cy) · R(theta) · T(-cx,-cy) · T(dx,dy).
+                    #   3. Apply with warpAffine / Kornia instead of fourier_shift.
+                    #
+                    # Until that is implemented, 'euclidean' is silently treated as
+                    # 'translation' with this PCC method.
+                    if transform_type.lower() == 'euclidean':
+                        self.logger.warning(
+                            f"[PCC] transform_type='euclidean' requested for {channel_name} "
+                            "but PCC currently supports translation-only. "
+                            "Rotation will be 0°. Use manual_diagonal or feature-based methods for rotation."
+                        )
                     transform_matrix = np.array([
                         [1.0, 0.0, dx],
                         [0.0, 1.0, dy],

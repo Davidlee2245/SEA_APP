@@ -146,7 +146,7 @@ const ImageProcessing: React.FC = () => {
   // Fetch status function - defined first
   const fetchStatus = useCallback(async () => {
     try {
-      const response = await fetch('${getApiBase()}/api/pipeline/status');
+      const response = await fetch(`${getApiBase()}/api/pipeline/status`);
       const data = await response.json();
       if (data.success) {
         setStatus(data.data);
@@ -197,28 +197,34 @@ const ImageProcessing: React.FC = () => {
   // Apply to all channels or just selected channel
   const [applyToAllChannels, setApplyToAllChannels] = useState<boolean>(false);
 
-  // Fetch input samples on mount
+  // Fetch input samples on mount; auto-select default
   useEffect(() => {
     const fetchSamples = async () => {
       try {
-        const response = await fetch('${getApiBase()}/api/input/samples');
+        const response = await fetch(`${getApiBase()}/api/input/samples`);
         const data = await response.json();
         if (data.success) {
-          setProcessingState(prev => ({ ...prev, availableSamples: data.data }));
+          setProcessingState(prev => {
+            const next = { ...prev, availableSamples: data.data };
+            if (!prev.selectedSample && data.data.includes('A2780Cis10'))
+              next.selectedSample = 'A2780Cis10';
+            return next;
+          });
         }
       } catch (err) {
         console.error('Failed to fetch input samples:', err);
       }
     };
     fetchSamples();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Fetch positions when sample changes
+  // Fetch positions when sample changes; auto-select default
   useEffect(() => {
     if (!processingState.selectedSample) {
-      setProcessingState(prev => ({ 
-        ...prev, 
-        availablePositions: [], 
+      setProcessingState(prev => ({
+        ...prev,
+        availablePositions: [],
         selectedPosition: '',
         loaded: false,
         stages: {},
@@ -233,7 +239,15 @@ const ImageProcessing: React.FC = () => {
         );
         const data = await response.json();
         if (data.success) {
-          setProcessingState(prev => ({ ...prev, availablePositions: data.data }));
+          setProcessingState(prev => {
+            const next = { ...prev, availablePositions: data.data };
+            if (!prev.selectedPosition && data.data.includes('P1')) {
+              next.selectedPosition = 'P1';
+              if (prev.selectedSample === 'A2780Cis10' && !autoLoadFiredRef.current)
+                setPendingAutoLoad(true);
+            }
+            return next;
+          });
         }
       } catch (err) {
         console.error('Failed to fetch positions:', err);
@@ -244,6 +258,10 @@ const ImageProcessing: React.FC = () => {
 
   // Track when we've fetched processed final to prevent loops
   const fetchedProcessedRef = useRef<string>('');
+
+  // Default auto-load
+  const autoLoadFiredRef = useRef(false);
+  const [pendingAutoLoad, setPendingAutoLoad] = useState(false);
   
   // Auto-check and load preview when channel changes (always show processed/final)
   useEffect(() => {
@@ -641,7 +659,7 @@ const ImageProcessing: React.FC = () => {
     console.log(`Loading position ${processingState.selectedSample}/${processingState.selectedPosition}...`);
 
     try {
-      const response = await fetch('${getApiBase()}/api/input/load_position', {
+      const response = await fetch(`${getApiBase()}/api/input/load_position`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -710,6 +728,16 @@ const ImageProcessing: React.FC = () => {
       setProcessingState(prev => ({ ...prev, isLoadingPosition: false }));
     }
   };
+
+  // Auto-load effect — placed after handleLoadPosition to avoid hoisting error
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!pendingAutoLoad || autoLoadFiredRef.current) return;
+    autoLoadFiredRef.current = true;
+    setPendingAutoLoad(false);
+    handleLoadPosition();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingAutoLoad]);
 
   // Helper: Get channel-specific preprocessing params
   const getChannelParams = (channelKey: string, stepKey: string): any => {
@@ -807,7 +835,7 @@ const ImageProcessing: React.FC = () => {
         requestBody.params = params;
       }
       
-      const response = await fetch('${getApiBase()}/api/input/preprocess', {
+      const response = await fetch(`${getApiBase()}/api/input/preprocess`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody),
@@ -1067,6 +1095,22 @@ const ImageProcessing: React.FC = () => {
     // User can re-apply preprocessing if needed
   };
 
+  const handleSelectImageFile = async () => {
+    if (!window.electronAPI?.selectImageFile) {
+      alert('Image file picker is available in the Electron app only.');
+      return;
+    }
+
+    try {
+      const selectedPath = await window.electronAPI.selectImageFile();
+      if (!selectedPath) return;
+      alert(`Selected image file:\n${selectedPath}\n\nUse Sample/Position selection for loading into SEA.`);
+    } catch (err) {
+      console.error('Failed to open image file dialog:', err);
+      alert(`Failed to open file dialog: ${err}`);
+    }
+  };
+
   return (
     <div className="pipeline-control">
       {/* 3-COLUMN LAYOUT: Sidebar + Main + Channel Info */}
@@ -1122,7 +1166,7 @@ const ImageProcessing: React.FC = () => {
                 {processingState.isLoadingPosition ? 'Loading...' : 'Load Position'}
               </button>
 
-              <button className="sidebar-btn btn-image" onClick={() => console.log('TODO: Load Image File')}>
+              <button className="sidebar-btn btn-image" onClick={handleSelectImageFile}>
                 Load Image File
               </button>
             </div>
@@ -1404,6 +1448,7 @@ const ImageProcessing: React.FC = () => {
                         key={stableKey}
                         src={finalUrl}
                         alt={`Processed - ${processingState.selectedChannel}`}
+                        onContextMenu={(e) => e.preventDefault()}
                         style={{ maxWidth: '100%', height: 'auto' }}
                         onError={(e) => {
                           console.error(`[ImageProcessing] Failed to load preview image:`, e);

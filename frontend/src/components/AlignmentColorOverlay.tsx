@@ -34,6 +34,8 @@ interface ShiftVector {
   note?: string;
 }
 
+export interface CropRect { x: number; y: number; w: number; h: number }
+
 interface AlignmentColorOverlayProps {
   stages: {
     raw?: Record<string, string>;
@@ -46,16 +48,20 @@ interface AlignmentColorOverlayProps {
   };
   availableItems: ChannelItem[];
   isLoaded: boolean;
-  // NEW: Alignment metadata for shift vector visualization
+  // Alignment metadata for shift vector visualization
   sample?: string;
   position?: string;
   refChannel?: string;
   inputStage?: string;
-  shiftVectors?: Record<string, ShiftVector>; // Pass shift vectors directly as prop
-  // NEW: Callbacks for channel interaction
+  shiftVectors?: Record<string, ShiftVector>;
+  // Callbacks for channel interaction
   onChannelHover?: (channelKey: string | null) => void;
   onChannelClick?: (channelKey: string) => void;
   highlightedChannel?: string | null;
+  // Crop tool
+  cropRect?: CropRect | null;
+  onCropRectChange?: (rect: CropRect | null) => void;
+  cropInteractive?: boolean;
 }
 
 // Get color for a channel number (1-4)
@@ -81,9 +87,25 @@ const AlignmentColorOverlay: React.FC<AlignmentColorOverlayProps> = ({
   onChannelHover,
   onChannelClick,
   highlightedChannel,
+  cropRect,
+  onCropRectChange,
+  cropInteractive = false,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const beforeImagesRef = useRef<Record<string, HTMLImageElement>>({});
+  const cropOverlayRef = useRef<HTMLDivElement>(null);
+
+  // Crop drag state (display coords); converted to image space on commit
+  const cropDragRef = useRef<{
+    dragging: boolean;
+    startX: number;
+    startY: number;
+    currentX: number;
+    currentY: number;
+  } | null>(null);
+  const [cropDragDisplay, setCropDragDisplay] = useState<{
+    x: number; y: number; w: number; h: number;
+  } | null>(null);
   
   // Auto-select the first available stage (prefer raw, then others)
   const getDefaultStage = (): keyof typeof stages => {
@@ -168,9 +190,16 @@ const AlignmentColorOverlay: React.FC<AlignmentColorOverlayProps> = ({
       img.onerror = reject;
       // Ensure URL is absolute (add backend server if relative)
       const absoluteUrl = url.startsWith('http') ? url : `${getApiBase()}${url}`;
-      // Add cache-busting param (use & if URL already has query params, otherwise ?)
-      const separator = absoluteUrl.includes('?') ? '&' : '?';
-      img.src = `${absoluteUrl}${separator}t=${Date.now()}`;
+      try {
+        const u = new URL(absoluteUrl);
+        // Keep existing token if present; avoid duplicate t=...&t=...
+        if (!u.searchParams.has('t')) {
+          u.searchParams.set('t', String(Date.now()));
+        }
+        img.src = u.toString();
+      } catch {
+        img.src = absoluteUrl;
+      }
     });
   };
 
@@ -637,6 +666,82 @@ const AlignmentColorOverlay: React.FC<AlignmentColorOverlayProps> = ({
     ctx.restore();
   };
 
+  // ── Crop overlay interaction ─────────────────────────────────────────────────
+
+  const getDisplayScale = (): { scaleX: number; scaleY: number } => {
+    const canvas = canvasRef.current;
+    if (!canvas || !canvas.offsetWidth) return { scaleX: 1, scaleY: 1 };
+    return {
+      scaleX: canvas.width / canvas.offsetWidth,
+      scaleY: canvas.height / (canvas.offsetHeight || 1),
+    };
+  };
+
+  const handleCropMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!cropInteractive || stage !== 'aligned') return;
+    const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    cropDragRef.current = { dragging: true, startX: x, startY: y, currentX: x, currentY: y };
+    setCropDragDisplay({ x, y, w: 0, h: 0 });
+    e.preventDefault();
+  };
+
+  const handleCropMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!cropDragRef.current?.dragging) return;
+    const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect();
+    const curX = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+    const curY = Math.max(0, Math.min(e.clientY - rect.top, rect.height));
+    cropDragRef.current.currentX = curX;
+    cropDragRef.current.currentY = curY;
+    const { startX, startY } = cropDragRef.current;
+    setCropDragDisplay({
+      x: Math.min(startX, curX),
+      y: Math.min(startY, curY),
+      w: Math.abs(curX - startX),
+      h: Math.abs(curY - startY),
+    });
+  };
+
+  const handleCropMouseUp = () => {
+    if (!cropDragRef.current?.dragging) return;
+    const drag = cropDragRef.current;
+    drag.dragging = false;
+
+    const { scaleX, scaleY } = getDisplayScale();
+    const x = Math.min(drag.startX, drag.currentX);
+    const y = Math.min(drag.startY, drag.currentY);
+    const w = Math.abs(drag.currentX - drag.startX);
+    const h = Math.abs(drag.currentY - drag.startY);
+
+    if (w > 5 && h > 5 && onCropRectChange) {
+      onCropRectChange({
+        x: Math.round(x * scaleX),
+        y: Math.round(y * scaleY),
+        w: Math.round(w * scaleX),
+        h: Math.round(h * scaleY),
+      });
+    }
+    setCropDragDisplay(null);
+    cropDragRef.current = null;
+  };
+
+  // Compute the crop rect in display coords for SVG rendering.
+  // This runs during render; canvasSize state ensures re-render when canvas reloads.
+  const cropRectDisplay = (() => {
+    if (!cropRect || !canvasSize.width) return null;
+    const canvas = canvasRef.current;
+    if (!canvas || !canvas.offsetWidth) return null;
+    const scaleX = canvas.offsetWidth / canvas.width;
+    const scaleY = (canvas.offsetHeight || canvas.offsetWidth) / canvas.height;
+    return {
+      x: cropRect.x * scaleX,
+      y: cropRect.y * scaleY,
+      w: cropRect.w * scaleX,
+      h: cropRect.h * scaleY,
+    };
+  })();
+
   const toggleChannel = (ch: string) => {
     setChannels((prev) => ({
       ...prev,
@@ -690,7 +795,15 @@ const AlignmentColorOverlay: React.FC<AlignmentColorOverlayProps> = ({
   return (
     <div className="alignment-color-overlay">
       <div className="overlay-header">
-        <h3>🎨 Alignment QC: Color Overlay</h3>
+        <h3 style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          🎨 Alignment QC: Color Overlay
+          {cropInteractive && stage === 'aligned' && (
+            <span style={{ fontSize: '0.75rem', background: '#e3f2fd', color: '#1565c0',
+              padding: '2px 8px', borderRadius: 10, fontWeight: 'normal' }}>
+              ✂️ Crop mode — drag to define region
+            </span>
+          )}
+        </h3>
         <div className="overlay-info">
           <span>Multi-channel pseudo-color visualization for alignment verification</span>
         </div>
@@ -880,19 +993,113 @@ const AlignmentColorOverlay: React.FC<AlignmentColorOverlayProps> = ({
       </div>
 
       {/* Canvas Container */}
-      <div className="overlay-canvas-container" style={{ marginTop: '12px' }}>
+      <div className="overlay-canvas-container" style={{ marginTop: '12px' }} onContextMenu={(e) => e.preventDefault()}>
         {isRendering && (
           <div className="rendering-indicator">Rendering overlay...</div>
         )}
-        <canvas
-          ref={canvasRef}
-          className="overlay-canvas"
-          style={{
-            maxWidth: '100%',
-            height: 'auto',
-            border: '2px solid #ddd',
-          }}
-        />
+        {/* Canvas + crop overlay wrapper */}
+        <div style={{ position: 'relative', display: 'inline-block', maxWidth: '100%' }}>
+          <canvas
+            ref={canvasRef}
+            className="overlay-canvas"
+            onContextMenu={(e) => e.preventDefault()}
+            style={{
+              maxWidth: '100%',
+              height: 'auto',
+              border: '2px solid #ddd',
+              display: 'block',
+            }}
+          />
+
+          {/* Crop interaction layer — absolutely covers the canvas */}
+          <div
+            ref={cropOverlayRef}
+            style={{
+              position: 'absolute',
+              inset: 0,
+              cursor: cropInteractive && stage === 'aligned' ? 'crosshair' : 'default',
+              zIndex: 5,
+              pointerEvents: cropInteractive && stage === 'aligned' ? 'auto' : 'none',
+            }}
+            onMouseDown={handleCropMouseDown}
+            onMouseMove={handleCropMouseMove}
+            onMouseUp={handleCropMouseUp}
+            onMouseLeave={handleCropMouseUp}
+          >
+            <svg
+              width="100%"
+              height="100%"
+              style={{ position: 'absolute', inset: 0, overflow: 'visible' }}
+            >
+              {/* Active drag rectangle */}
+              {cropDragDisplay && cropDragDisplay.w > 2 && cropDragDisplay.h > 2 && (
+                <>
+                  <defs>
+                    <mask id="crop-drag-mask">
+                      <rect width="100%" height="100%" fill="white" />
+                      <rect
+                        x={cropDragDisplay.x} y={cropDragDisplay.y}
+                        width={cropDragDisplay.w} height={cropDragDisplay.h}
+                        fill="black"
+                      />
+                    </mask>
+                  </defs>
+                  <rect
+                    width="100%" height="100%"
+                    fill="rgba(0,0,0,0.45)"
+                    mask="url(#crop-drag-mask)"
+                  />
+                  <rect
+                    x={cropDragDisplay.x} y={cropDragDisplay.y}
+                    width={cropDragDisplay.w} height={cropDragDisplay.h}
+                    fill="none"
+                    stroke="white"
+                    strokeWidth={1.5}
+                    strokeDasharray="6 4"
+                  />
+                </>
+              )}
+
+              {/* Committed crop rect (from parent state) */}
+              {!cropDragDisplay && cropRectDisplay && cropRectDisplay.w > 0 && cropRectDisplay.h > 0 && (
+                <>
+                  <defs>
+                    <mask id="crop-committed-mask">
+                      <rect width="100%" height="100%" fill="white" />
+                      <rect
+                        x={cropRectDisplay.x} y={cropRectDisplay.y}
+                        width={cropRectDisplay.w} height={cropRectDisplay.h}
+                        fill="black"
+                      />
+                    </mask>
+                  </defs>
+                  <rect
+                    width="100%" height="100%"
+                    fill="rgba(0,0,0,0.35)"
+                    mask="url(#crop-committed-mask)"
+                  />
+                  <rect
+                    x={cropRectDisplay.x} y={cropRectDisplay.y}
+                    width={cropRectDisplay.w} height={cropRectDisplay.h}
+                    fill="none"
+                    stroke="white"
+                    strokeWidth={2}
+                    strokeDasharray="8 5"
+                  />
+                  {/* Corner handles */}
+                  {[
+                    [cropRectDisplay.x, cropRectDisplay.y],
+                    [cropRectDisplay.x + cropRectDisplay.w, cropRectDisplay.y],
+                    [cropRectDisplay.x, cropRectDisplay.y + cropRectDisplay.h],
+                    [cropRectDisplay.x + cropRectDisplay.w, cropRectDisplay.y + cropRectDisplay.h],
+                  ].map(([cx, cy], i) => (
+                    <circle key={i} cx={cx} cy={cy} r={5} fill="white" stroke="#333" strokeWidth={1} />
+                  ))}
+                </>
+              )}
+            </svg>
+          </div>
+        </div>
         <div className="canvas-dimensions">
           {canvasSize.width} × {canvasSize.height} px
         </div>

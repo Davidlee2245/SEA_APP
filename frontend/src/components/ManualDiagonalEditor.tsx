@@ -159,6 +159,33 @@ const ManualDiagonalEditor: React.FC<Props> = ({ imageUrl, box, onBoxChange, cha
 
     ctx.save();
 
+    // Extended guide lines — one per box edge, clipped to canvas
+    {
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, 0, dw, dh);
+      ctx.clip();
+      ctx.strokeStyle = 'rgba(255, 255, 0, 0.30)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([]);
+      const EXTEND = 10000;
+      const edgePairs: [number, number][] = [[0, 1], [1, 2], [2, 3], [3, 0]];
+      for (const [ai, bi] of edgePairs) {
+        const [ax, ay] = corners[ai];
+        const [bx, by] = corners[bi];
+        const dx = bx - ax, dy = by - ay;
+        const len = Math.sqrt(dx * dx + dy * dy);
+        if (len < 1) continue;
+        const ux = dx / len, uy = dy / len;
+        const mx = (ax + bx) / 2, my = (ay + by) / 2;
+        ctx.beginPath();
+        ctx.moveTo(mx - ux * EXTEND, my - uy * EXTEND);
+        ctx.lineTo(mx + ux * EXTEND, my + uy * EXTEND);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
     // Box outline — yellow
     ctx.strokeStyle = 'yellow'; ctx.lineWidth = 2; ctx.setLineDash([]);
     ctx.beginPath();
@@ -339,6 +366,7 @@ const ManualDiagonalEditor: React.FC<Props> = ({ imageUrl, box, onBoxChange, cha
     <div
       ref={containerRef}
       tabIndex={0}
+      onContextMenu={(e) => e.preventDefault()}
       onMouseDown={handleMouseDown}
       onMouseMove={handleMouseMove}
       onMouseUp={handleMouseUp}
@@ -351,11 +379,13 @@ const ManualDiagonalEditor: React.FC<Props> = ({ imageUrl, box, onBoxChange, cha
         src={imageUrl}
         alt={channelLabel || 'channel'}
         onLoad={measure}
+        onContextMenu={(e) => e.preventDefault()}
         draggable={false}
         style={{ display: 'block', maxWidth: '100%', height: 'auto', userSelect: 'none' }}
       />
       <canvas
         ref={canvasRef}
+        onContextMenu={(e) => e.preventDefault()}
         style={{ position: 'absolute', top: 0, left: 0, pointerEvents: 'none' }}
       />
       <div style={{

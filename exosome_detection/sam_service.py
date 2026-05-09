@@ -234,10 +234,22 @@ def compute_detection_features(masks: np.ndarray) -> List[Dict[str, Any]]:
             region.bbox[2],  # y2
         ]
         
+        # Compute perimeter and circularity from the region mask
+        region_mask = (region.image).astype(np.uint8) * 255
+        contours_sam, _ = cv2.findContours(region_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours_sam:
+            perimeter = float(cv2.arcLength(contours_sam[0], True))
+            circularity = round(min(1.0, (4.0 * np.pi * float(area)) / (perimeter ** 2)), 4) if perimeter > 0 else 0.0
+        else:
+            perimeter = 0.0
+            circularity = 0.0
+
         detections.append({
-            'area': float(area),
-            'centroid': [float(centroid[0]), float(centroid[1])],
-            'bbox': [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])],
+            'area':        float(area),
+            'centroid':    [float(centroid[0]), float(centroid[1])],
+            'bbox':        [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])],
+            'perimeter':   round(perimeter, 2),
+            'circularity': circularity,
         })
     
     return detections

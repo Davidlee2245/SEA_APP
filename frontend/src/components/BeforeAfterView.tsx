@@ -75,6 +75,7 @@ const BeforeAfterView: React.FC<BeforeAfterViewProps> = ({ frames }) => {
                 src={currentFrame.beforeImageUrl}
                 alt={`Before alignment - ${currentFrame.channelName}`}
                 onError={() => handleImageError('before')}
+                onContextMenu={(e) => e.preventDefault()}
               />
             )}
           </div>
@@ -104,6 +105,7 @@ const BeforeAfterView: React.FC<BeforeAfterViewProps> = ({ frames }) => {
                 src={currentFrame.afterImageUrl}
                 alt={`After alignment - ${currentFrame.channelName}`}
                 onError={() => handleImageError('after')}
+                onContextMenu={(e) => e.preventDefault()}
               />
             )}
           </div>

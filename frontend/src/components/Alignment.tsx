@@ -5,13 +5,14 @@
  *   Stage B — Alignment Execution
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import AlignmentColorOverlay from './AlignmentColorOverlay';
 import ChannelInfoPanel from './ChannelInfoPanel';
 import AlignmentShiftPanel from './AlignmentShiftPanel';
 import ManualDiagonalEditor, { DiagonalBox } from './ManualDiagonalEditor';
 import '../styles/PipelineControl.css';
 import { getApiBase } from '../lib/apiBase';
+import * as storage from '../lib/storage';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -35,6 +36,7 @@ type ShiftVector = {
   dx: number;
   dy: number;
   magnitude: number;
+  angle_deg?: number;
   type: 'affine' | 'tps' | 'identity' | 'reference';
   residual_error?: number;
   num_matches?: number;
@@ -80,6 +82,32 @@ interface FftParams {
   enable_rotation: boolean;
   grid_line_width: number;
 }
+
+// ─── Persistence ──────────────────────────────────────────────────────────────
+
+const DEFAULT_SAMPLE   = 'A2780Cis10';
+const DEFAULT_POSITION = 'P1';
+
+export interface CropRect { x: number; y: number; w: number; h: number }
+
+interface TiffExportPreference {
+  autoDownload: boolean;
+  format: 'zip' | 'composite';
+}
+
+interface AlignmentSnapshot {
+  diagonalBoxes:        Record<string, DiagonalBox | null>;
+  shiftVectors:         Record<string, ShiftVector>;
+  refChannel:           string;
+  selectedChannels:     string[];
+  alignMethod:          AlignMethod;
+  savedAt:              string;
+  cropRect:             CropRect | null;
+  tiffExportPreference: TiffExportPreference | null;
+}
+
+const snapshotKey = (sample: string, position: string) =>
+  `sea_alignment_${sample}_${position}`;
 
 // ─── Default parameters ────────────────────────────────────────────────────────
 
@@ -165,6 +193,7 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
   const [shiftVectors, setShiftVectors] = useState<Record<string, ShiftVector>>({});
   const [lastAlignmentRefChannel, setLastAlignmentRefChannel] = useState('');
   const [lastAlignmentInputStage, setLastAlignmentInputStage] = useState('');
+  const [alignmentRunId, setAlignmentRunId] = useState<number | null>(null);
 
   // ── Channel interaction (for shift panel / overlay) ──
   const [highlightedChannel, setHighlightedChannel] = useState<string | null>(null);
@@ -172,21 +201,65 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
 
   // ── Manual Diagonal method ──
   const [diagonalBoxes, setDiagonalBoxes] = useState<Record<string, DiagonalBox | null>>({});
+  const diagonalBoxesRef = useRef<Record<string, DiagonalBox | null>>({});
+
+  // ── Persistence ──
+  const [savedAt, setSavedAt] = useState<string | null>(null);
+  const [pendingAutoLoad, setPendingAutoLoad] = useState(false);
+  const autoLoadFiredRef = useRef(false);
+
+  // ── Crop tool ──
+  const [cropRect, setCropRect] = useState<CropRect | null>(null);
+  const [cropExpanded, setCropExpanded] = useState(false);
+  const [previewCropMode, setPreviewCropMode] = useState(false);
+  const previewImageRef = useRef<HTMLImageElement | null>(null);
+  const previewCropDragRef = useRef<{
+    dragging: boolean;
+    startX: number;
+    startY: number;
+    currentX: number;
+    currentY: number;
+  } | null>(null);
+  const [previewCropDragDisplay, setPreviewCropDragDisplay] = useState<{
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+  } | null>(null);
+  const [previewImageMeta, setPreviewImageMeta] = useState<{
+    naturalW: number;
+    naturalH: number;
+    displayW: number;
+    displayH: number;
+  }>({ naturalW: 0, naturalH: 0, displayW: 0, displayH: 0 });
+
+  // ── TIFF export ──
+  const [tiffExportPref, setTiffExportPref] = useState<TiffExportPreference>({
+    autoDownload: false,
+    format: 'zip',
+  });
+  const [exportStatus, setExportStatus] = useState<string>('');
 
   // ── Preview channel selection ──
   const [selectedPreviewChannel, setSelectedPreviewChannel] = useState('');
 
   // ─── Effects ────────────────────────────────────────────────────────────────
 
-  // Fetch samples on mount
+  // Fetch samples on mount; auto-select default
   useEffect(() => {
-    fetch('${getApiBase()}/api/input/samples')
+    fetch(`${getApiBase()}/api/input/samples`)
       .then(r => r.json())
-      .then(d => { if (d.success) setAvailableSamples(d.data); })
+      .then(d => {
+        if (!d.success) return;
+        setAvailableSamples(d.data);
+        if (!selectedSample && d.data.includes(DEFAULT_SAMPLE))
+          setSelectedSample(DEFAULT_SAMPLE);
+      })
       .catch(console.error);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Fetch positions when sample changes
+  // Fetch positions when sample changes; auto-select default
   useEffect(() => {
     if (!selectedSample) {
       setAvailablePositions([]);
@@ -197,8 +270,18 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
     }
     fetch(`${getApiBase()}/api/input/samples/${selectedSample}/positions`)
       .then(r => r.json())
-      .then(d => { if (d.success) setAvailablePositions(d.data); })
+      .then(d => {
+        if (!d.success) return;
+        setAvailablePositions(d.data);
+        if (!selectedPosition && d.data.includes(DEFAULT_POSITION)) {
+          setSelectedPosition(DEFAULT_POSITION);
+          // Signal that both defaults are ready — auto-load once
+          if (selectedSample === DEFAULT_SAMPLE && !autoLoadFiredRef.current)
+            setPendingAutoLoad(true);
+        }
+      })
       .catch(console.error);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedSample]);
 
   // Re-fetch processed previews + stats when the Alignment tab becomes active,
@@ -224,23 +307,141 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
       .catch(console.error);
   }, [isActive]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Reset Stage A when relevant inputs change
+  // Reset Stage A when relevant inputs change (keep diagonalBoxes — user controls via Reset button)
   useEffect(() => {
     setFeatureDetected(false);
     setPreviewLayers({});
     setFeatureSummary('');
     setFeatureDetectionError('');
-    setDiagonalBoxes({});
   }, [selectedInputStage, alignMethod, refChannel]);
 
+  // Keep a synchronous ref to avoid stale-state payloads when user clicks Align
+  // immediately after manipulating the box.
+  useEffect(() => {
+    diagonalBoxesRef.current = diagonalBoxes;
+  }, [diagonalBoxes]);
+
+  // Crop mode is only meaningful for aligned previews.
+  useEffect(() => {
+    if (currentStage !== 'aligned' && previewCropMode) setPreviewCropMode(false);
+  }, [currentStage, previewCropMode]);
+
+  useEffect(() => {
+    if (!previewCropMode) {
+      setPreviewCropDragDisplay(null);
+      previewCropDragRef.current = null;
+    }
+  }, [previewCropMode]);
+
   // ─── Handlers ────────────────────────────────────────────────────────────────
+
+  // ─── Persistence helpers ─────────────────────────────────────────────────────
+
+  const restoreAlignmentFromStorage = async (sample: string, position: string): Promise<boolean> => {
+    const raw = await storage.get(snapshotKey(sample, position));
+    if (!raw) return false;
+    try {
+      const snap: AlignmentSnapshot = JSON.parse(raw);
+      if (snap.diagonalBoxes)    setDiagonalBoxes(snap.diagonalBoxes);
+      if (snap.shiftVectors)     setShiftVectors(snap.shiftVectors);
+      if (snap.refChannel)       setRefChannel(snap.refChannel);
+      if (snap.selectedChannels) setSelectedChannels(new Set(snap.selectedChannels));
+      if (snap.alignMethod)      setAlignMethod(snap.alignMethod as AlignMethod);
+      setSavedAt(snap.savedAt || null);
+      setCropRect(snap.cropRect ?? null);
+      if (snap.tiffExportPreference) setTiffExportPref(snap.tiffExportPreference);
+      return true;
+    } catch { return false; }
+  };
+
+  const saveAlignment = async () => {
+    if (!selectedSample || !selectedPosition) return;
+    const ts = new Date().toISOString();
+    const snap: AlignmentSnapshot = {
+      diagonalBoxes,
+      shiftVectors,
+      refChannel,
+      selectedChannels: Array.from(selectedChannels),
+      alignMethod,
+      savedAt: ts,
+      cropRect,
+      tiffExportPreference: tiffExportPref,
+    };
+    await storage.set(snapshotKey(selectedSample, selectedPosition), JSON.stringify(snap));
+    setSavedAt(ts);
+
+    if (!tiffExportPref.autoDownload || alignmentRunId === null) return;
+
+    const channelCount = Object.keys(shiftVectors).length;
+    const label = tiffExportPref.format === 'composite'
+      ? '1 composite TIFF'
+      : `${channelCount} TIFF${channelCount !== 1 ? 's' : ''}`;
+    setExportStatus(`Saved · Downloading ${label}…`);
+    try {
+      const res = await fetch(`${getApiBase()}/api/input/export_tiff`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sample: selectedSample,
+          position: selectedPosition,
+          input_stage: lastAlignmentInputStage,
+          format: tiffExportPref.format,
+          ...(cropRect ? { crop_rect: cropRect } : {}),
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+        setExportStatus(`Export failed: ${err.error || 'Unknown error'}`);
+        setTimeout(() => setExportStatus(''), 5000);
+        return;
+      }
+      const blob = await res.blob();
+      const disposition = res.headers.get('Content-Disposition') || '';
+      const fnMatch = disposition.match(/filename="([^"]+)"/);
+      const filename = fnMatch
+        ? fnMatch[1]
+        : tiffExportPref.format === 'composite'
+          ? `${selectedSample}_${selectedPosition}_aligned_composite.tif`
+          : `${selectedSample}_${selectedPosition}_aligned.zip`;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      setExportStatus(`Saved · ${label} downloaded ✓`);
+      setTimeout(() => setExportStatus(''), 3000);
+    } catch (err) {
+      setExportStatus(`Export error: ${err}`);
+      setTimeout(() => setExportStatus(''), 5000);
+    }
+  };
+
+  const loadSavedAlignment = () => {
+    void restoreAlignmentFromStorage(selectedSample, selectedPosition);
+  };
+
+  const resetAlignment = () => {
+    if (!selectedSample || !selectedPosition) return;
+    void storage.remove(snapshotKey(selectedSample, selectedPosition));
+    const cleared: Record<string, DiagonalBox | null> = {};
+    availableItems.forEach(i => { cleared[i.key] = null; });
+    setDiagonalBoxes(cleared);
+    setShiftVectors({});
+    setAlignmentRunId(null);
+    setSavedAt(null);
+    setCropRect(null);
+    setExportStatus('');
+  };
 
   const handleLoadPosition = async () => {
     if (!selectedSample || !selectedPosition) return;
     setIsLoadingPosition(true);
 
     try {
-      const loadRes = await fetch('${getApiBase()}/api/input/load_position', {
+      const loadRes = await fetch(`${getApiBase()}/api/input/load_position`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sample: selectedSample, position: selectedPosition }),
@@ -309,13 +510,19 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
       setSelectedPreviewChannel(items[0]?.key || '');
       if (items.length > 0) setRefChannel(items[0].key);
 
-      // Reset stages A/B
+      // Reset Stage A/B state
       setFeatureDetected(false);
       setPreviewLayers({});
       setFeatureSummary('');
       setFeatureDetectionError('');
       setShiftVectors({});
+      setAlignmentRunId(null);
       setDiagonalBoxes({});
+      setCropRect(null);
+      setExportStatus('');
+
+      // Auto-restore saved alignment for this sample/position (overwrites the blanked state)
+      await restoreAlignmentFromStorage(selectedSample, selectedPosition);
     } catch (err) {
       alert('Failed to load position: ' + err);
     } finally {
@@ -329,6 +536,22 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
       next.has(key) ? next.delete(key) : next.add(key);
       return next;
     });
+  };
+
+  const handleSelectImageFile = async () => {
+    if (!window.electronAPI?.selectImageFile) {
+      alert('Image file picker is available in the Electron app only.');
+      return;
+    }
+
+    try {
+      const selectedPath = await window.electronAPI.selectImageFile();
+      if (!selectedPath) return;
+      alert(`Selected image file:\n${selectedPath}\n\nUse Sample/Position selection for alignment workflow.`);
+    } catch (err) {
+      console.error('Failed to open image file dialog:', err);
+      alert(`Failed to open file dialog: ${err}`);
+    }
   };
 
   // ── Stage A: Detect Features ────────────────────────────────────────────────
@@ -350,7 +573,7 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
           };
 
     try {
-      const res = await fetch('${getApiBase()}/api/input/detect_features', {
+      const res = await fetch(`${getApiBase()}/api/input/detect_features`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -386,34 +609,99 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
     if (!loaded || !selectedInputStage) return;
     if (selectedChannels.size < 2) { alert('Please select at least 2 channels'); return; }
     if (!selectedChannels.has(refChannel)) { alert('Reference channel must be selected'); return; }
+    const diagonalBoxesPayload = diagonalBoxesRef.current;
+    if (alignMethod === 'manual_diagonal') {
+      const refBox = diagonalBoxesPayload[refChannel];
+      if (!refBox) {
+        alert('Reference channel is missing a manual diagonal box.');
+        return;
+      }
+      const selected = Array.from(selectedChannels);
+      const allTargetsMatchRef = selected
+        .filter(ch => ch !== refChannel)
+        .every(ch => {
+          const b = diagonalBoxesPayload[ch];
+          if (!b) return false;
+          return (
+            Math.abs(b.angle - refBox.angle) < 1e-6 &&
+            Math.abs(b.cx - refBox.cx) < 1e-6 &&
+            Math.abs(b.cy - refBox.cy) < 1e-6 &&
+            Math.abs(b.width - refBox.width) < 1e-6 &&
+            Math.abs(b.height - refBox.height) < 1e-6
+          );
+        });
+      if (allTargetsMatchRef) {
+        console.warn(
+          '[Alignment] All target boxes match reference. Proceeding with identity transform.'
+        );
+      }
+      const selectedMovingChannel =
+        selectedPreviewChannel !== refChannel ? selectedPreviewChannel : selected.find(ch => ch !== refChannel) || selectedPreviewChannel;
+      const targetBox = diagonalBoxesPayload[selectedMovingChannel] || null;
+      console.log('[Alignment debug] manual box state before align', {
+        selectedMovingChannel,
+        referenceChannel: refChannel,
+        ref_box: refBox,
+        target_box: targetBox,
+        ref_box_angle: refBox?.angle ?? null,
+        target_box_angle: targetBox?.angle ?? null,
+        ref_center: refBox ? { cx: refBox.cx, cy: refBox.cy } : null,
+        target_center: targetBox ? { cx: targetBox.cx, cy: targetBox.cy } : null,
+      });
+    }
 
     setIsAligning(true);
     try {
-      const res = await fetch('${getApiBase()}/api/input/align', {
+      const requestPayload = {
+        sample: selectedSample,
+        position: selectedPosition,
+        input_stage: selectedInputStage,
+        ref_channel: refChannel,
+        method: alignMethod,
+        transform: transformType,
+        selected_channels: Array.from(selectedChannels),
+        ...(alignMethod === 'manual_diagonal' && { diagonal_boxes: diagonalBoxesPayload }),
+      };
+      console.log('[Alignment debug] /api/input/align request payload', requestPayload);
+      const res = await fetch(`${getApiBase()}/api/input/align`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sample: selectedSample,
-          position: selectedPosition,
-          input_stage: selectedInputStage,
-          ref_channel: refChannel,
-          method: alignMethod,
-          transform: transformType,
-          selected_channels: Array.from(selectedChannels),
-          ...(alignMethod === 'manual_diagonal' && { diagonal_boxes: diagonalBoxes }),
-        }),
+        body: JSON.stringify(requestPayload),
       });
       const data = await res.json();
       if (data.success) {
+        console.log('[Alignment debug] backend align response', data);
         const alignedPreviews = data.data.previews || {};
         const newVectors = data.data.shift_vectors || {};
         const newStats = data.data.stats || {};
+        const responseRunId = data.data.alignment_run_id ?? Date.now();
+        console.log('[Alignment debug] align response details', {
+          stagesAligned: alignedPreviews,
+          selectedPreviewStage: 'aligned',
+          selectedPreviewChannelBeforeUpdate: selectedPreviewChannel,
+          shiftVectorsFromBackend: newVectors,
+          alignmentRunId: responseRunId,
+        });
         setStages(prev => ({ ...prev, aligned: alignedPreviews }));
         setBackendStats(prev => ({ ...prev, ...newStats }));
         setCurrentStage('aligned');
         setLastAlignmentRefChannel(refChannel);
         setLastAlignmentInputStage(selectedInputStage);
         setShiftVectors(newVectors);
+        setAlignmentRunId(responseRunId);
+        // Auto-switch the preview to the first non-reference channel that has an
+        // aligned preview, so the user immediately sees the rotated result rather
+        // than the reference channel (which is always unrotated by definition).
+        const firstTargetWithPreview = Object.keys(alignedPreviews).find(
+          k => k !== refChannel && alignedPreviews[k]
+        );
+        if (firstTargetWithPreview) {
+          setSelectedPreviewChannel(firstTargetWithPreview);
+        } else if (!alignedPreviews[selectedPreviewChannel]) {
+          // Fallback: current channel has no preview — switch to whatever is available.
+          const anyWithPreview = Object.keys(alignedPreviews).find(k => alignedPreviews[k]);
+          if (anyWithPreview) setSelectedPreviewChannel(anyWithPreview);
+        }
       } else {
         alert(data.error || 'Alignment failed');
       }
@@ -423,6 +711,16 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
       setIsAligning(false);
     }
   };
+
+  // Auto-load default sample/position on first mount (placed after handler to avoid hoisting error)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!pendingAutoLoad || autoLoadFiredRef.current) return;
+    autoLoadFiredRef.current = true;
+    setPendingAutoLoad(false);
+    handleLoadPosition();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingAutoLoad]);
 
   // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -450,14 +748,19 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
     return '';
   };
 
-  // True when alignment is ready to run (replaces featureDetected for manual_diagonal)
+  // True when alignment can run.
+  // manual_diagonal: every selected channel must have a box drawn.
+  // All other methods: no mandatory prerequisite — feature detection is optional QC.
   const readyToAlign =
     alignMethod === 'manual_diagonal'
       ? selectedChannels.size >= 2 &&
         Array.from(selectedChannels).every(ch => diagonalBoxes[ch] != null)
-      : featureDetected;
+      : selectedChannels.size >= 2 && !!selectedInputStage;
 
-  // Image URL for the ManualDiagonalEditor (processed or raw stage, not features)
+  // Image URL for the ManualDiagonalEditor.
+  // Always uses processed (or raw) so the user can still see and edit boxes on the
+  // unwarped image.  After alignment runs, currentStage switches to 'aligned', and
+  // the ternary below will fall through to getPreviewSrc() instead of the editor.
   const diagImageSrc = (() => {
     if (alignMethod !== 'manual_diagonal') return null;
     const stageData = stages.processed ?? stages.raw;
@@ -466,6 +769,13 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
     if (!url) return null;
     return url.startsWith('http') ? url : `${getApiBase()}${url}`;
   })();
+
+  // True when the center preview should show the aligned result rather than the editor.
+  // Condition: alignment has run (stages.aligned exists) AND the stage selector is 'aligned'.
+  const showAlignedPreview =
+    alignMethod === 'manual_diagonal' &&
+    !!stages.aligned &&
+    currentStage === 'aligned';
 
   // Get the currently displayed image URL
   const getPreviewSrc = (): string | null => {
@@ -479,8 +789,171 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
     const url = stageData[selectedPreviewChannel];
     if (!url) return null;
     const abs = url.startsWith('http') ? url : `${getApiBase()}${url}`;
-    return `${abs}${abs.includes('?') ? '&' : '?'}t=${Date.now()}`;
+    const cacheBuster =
+      currentStage === 'aligned'
+        ? (alignmentRunId ?? Date.now())
+        : Date.now();
+    return `${abs}${abs.includes('?') ? '&' : '?'}t=${cacheBuster}`;
   };
+
+  const updatePreviewImageMeta = () => {
+    const img = previewImageRef.current;
+    if (!img) return;
+    setPreviewImageMeta({
+      naturalW: img.naturalWidth || 0,
+      naturalH: img.naturalHeight || 0,
+      displayW: img.clientWidth || 0,
+      displayH: img.clientHeight || 0,
+    });
+  };
+
+  const setCropRectFromDisplay = (x0: number, y0: number, x1: number, y1: number) => {
+    const { naturalW, naturalH, displayW, displayH } = previewImageMeta;
+    if (!naturalW || !naturalH || !displayW || !displayH) return;
+    const clamp = (v: number, max: number) => Math.max(0, Math.min(v, max));
+    const sx0 = clamp(x0, displayW);
+    const sy0 = clamp(y0, displayH);
+    const sx1 = clamp(x1, displayW);
+    const sy1 = clamp(y1, displayH);
+    const left = Math.min(sx0, sx1);
+    const top = Math.min(sy0, sy1);
+    const w = Math.abs(sx1 - sx0);
+    const h = Math.abs(sy1 - sy0);
+    if (w < 2 || h < 2) return;
+    setCropRect({
+      x: Math.round((left / displayW) * naturalW),
+      y: Math.round((top / displayH) * naturalH),
+      w: Math.round((w / displayW) * naturalW),
+      h: Math.round((h / displayH) * naturalH),
+    });
+  };
+
+  const handlePreviewCropMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!previewCropMode || currentStage !== 'aligned') return;
+    const box = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - box.left;
+    const y = e.clientY - box.top;
+    previewCropDragRef.current = { dragging: true, startX: x, startY: y, currentX: x, currentY: y };
+    setPreviewCropDragDisplay({ x, y, w: 0, h: 0 });
+    e.preventDefault();
+  };
+
+  const handlePreviewCropMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!previewCropDragRef.current?.dragging) return;
+    const box = e.currentTarget.getBoundingClientRect();
+    const curX = e.clientX - box.left;
+    const curY = e.clientY - box.top;
+    const drag = previewCropDragRef.current;
+    drag.currentX = curX;
+    drag.currentY = curY;
+    setPreviewCropDragDisplay({
+      x: Math.min(drag.startX, curX),
+      y: Math.min(drag.startY, curY),
+      w: Math.abs(curX - drag.startX),
+      h: Math.abs(curY - drag.startY),
+    });
+    setCropRectFromDisplay(drag.startX, drag.startY, curX, curY);
+  };
+
+  const handlePreviewCropMouseUp = () => {
+    const drag = previewCropDragRef.current;
+    if (!drag?.dragging) return;
+    drag.dragging = false;
+    setCropRectFromDisplay(drag.startX, drag.startY, drag.currentX, drag.currentY);
+    setPreviewCropDragDisplay(null);
+    previewCropDragRef.current = null;
+  };
+
+  const previewCropDisplayRect = (() => {
+    if (!cropRect) return null;
+    const { naturalW, naturalH, displayW, displayH } = previewImageMeta;
+    if (!naturalW || !naturalH || !displayW || !displayH) return null;
+    return {
+      x: (cropRect.x / naturalW) * displayW,
+      y: (cropRect.y / naturalH) * displayH,
+      w: (cropRect.w / naturalW) * displayW,
+      h: (cropRect.h / naturalH) * displayH,
+    };
+  })();
+
+  const renderPreviewImage = (src: string, alt: string) => (
+    <div
+      style={{ position: 'relative', display: 'inline-block', maxWidth: '100%' }}
+      onContextMenu={(e) => e.preventDefault()}
+    >
+      <img
+        ref={previewImageRef}
+        src={src}
+        alt={alt}
+        onLoad={updatePreviewImageMeta}
+        onContextMenu={(e) => e.preventDefault()}
+        style={{ maxWidth: '100%', height: 'auto', display: 'block' }}
+      />
+      <div
+        style={{
+          position: 'absolute',
+          inset: 0,
+          pointerEvents: previewCropMode && currentStage === 'aligned' ? 'auto' : 'none',
+          cursor: previewCropMode && currentStage === 'aligned' ? 'crosshair' : 'default',
+        }}
+        onMouseDown={handlePreviewCropMouseDown}
+        onMouseMove={handlePreviewCropMouseMove}
+        onMouseUp={handlePreviewCropMouseUp}
+        onMouseLeave={handlePreviewCropMouseUp}
+      >
+        <svg width="100%" height="100%" style={{ display: 'block' }}>
+          {(previewCropDragDisplay || previewCropDisplayRect) && (() => {
+            const r = previewCropDragDisplay || previewCropDisplayRect!;
+            const x0 = r.x;
+            const y0 = r.y;
+            const x1 = r.x + r.w;
+            const y1 = r.y + r.h;
+            const cornerLen = 14;
+            return (
+              <>
+                <defs>
+                  <mask id="preview-crop-mask">
+                    <rect width="100%" height="100%" fill="white" />
+                    <rect x={r.x} y={r.y} width={r.w} height={r.h} fill="black" />
+                  </mask>
+                </defs>
+                <rect width="100%" height="100%" fill="rgba(0,0,0,0.35)" mask="url(#preview-crop-mask)" />
+                <path d={`M ${x0 + cornerLen} ${y0} L ${x0} ${y0} L ${x0} ${y0 + cornerLen}`} stroke="#ffffff" strokeWidth={2.5} fill="none" />
+                <path d={`M ${x1 - cornerLen} ${y0} L ${x1} ${y0} L ${x1} ${y0 + cornerLen}`} stroke="#ffffff" strokeWidth={2.5} fill="none" />
+                <path d={`M ${x0 + cornerLen} ${y1} L ${x0} ${y1} L ${x0} ${y1 - cornerLen}`} stroke="#ffffff" strokeWidth={2.5} fill="none" />
+                <path d={`M ${x1 - cornerLen} ${y1} L ${x1} ${y1} L ${x1} ${y1 - cornerLen}`} stroke="#ffffff" strokeWidth={2.5} fill="none" />
+              </>
+            );
+          })()}
+        </svg>
+      </div>
+    </div>
+  );
+
+  useEffect(() => {
+    if (!loaded) return;
+    const stageData = stages[currentStage];
+    const stageUrl = stageData?.[selectedPreviewChannel] ?? null;
+    const previewSrc = getPreviewSrc();
+    const shiftForPreviewChannel = shiftVectors[selectedPreviewChannel] ?? null;
+    console.log('[Alignment debug] preview/state snapshot', {
+      selectedPreviewStage: currentStage,
+      selectedPreviewChannel,
+      stagesAlignedValue: stages.aligned ?? null,
+      stageUrlForSelectedChannel: stageUrl,
+      actualPreviewImageUrl: previewSrc,
+      transformMetadataForSelectedChannel: shiftForPreviewChannel,
+      shiftVectorsAll: shiftVectors,
+      alignmentRunId,
+    });
+  }, [
+    loaded,
+    currentStage,
+    selectedPreviewChannel,
+    stages,
+    shiftVectors,
+    alignmentRunId,
+  ]);
 
   const channelsConfig = (() => {
     const cfg: Record<string, { enabled: boolean; color: [number, number, number]; name: string }> = {};
@@ -528,6 +1001,9 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
               <button className="sidebar-btn" onClick={handleLoadPosition}
                 disabled={!selectedSample || !selectedPosition || isLoadingPosition}>
                 {isLoadingPosition ? 'Loading...' : 'Load Position'}
+              </button>
+              <button className="sidebar-btn btn-image" onClick={handleSelectImageFile}>
+                Load Image File
               </button>
             </div>
           </div>
@@ -944,30 +1420,219 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
             </div>
           )}
 
-          {/* 6. Stage B: Run Alignment */}
+          {/* 6. Run Alignment */}
           {loaded && (
             <div className="sidebar-section">
               <h3>🎯 Run Alignment</h3>
               <div className="sidebar-content">
-                {!readyToAlign && (
+                {alignMethod === 'manual_diagonal' && !readyToAlign && (
                   <div style={{ background: '#f3e5f5', color: '#6a1b9a', padding: 8, borderRadius: 4, fontSize: '0.82rem', marginBottom: 10 }}>
-                    {alignMethod === 'manual_diagonal'
-                      ? 'Draw a diagonal box on every selected channel, then run alignment.'
-                      : 'Complete Feature Detection (above) and review the overlay before running alignment.'}
+                    Draw a diagonal box on every selected channel, then run alignment.
+                  </div>
+                )}
+                {alignMethod !== 'manual_diagonal' && featureDetected && (
+                  <div style={{ background: '#e8f5e9', color: '#2e7d32', padding: 6, borderRadius: 4, fontSize: '0.8rem', marginBottom: 8 }}>
+                    ✅ Features detected — alignment will use detected grid structure.
+                  </div>
+                )}
+                {alignMethod !== 'manual_diagonal' && !featureDetected && (
+                  <div style={{ background: '#e3f2fd', color: '#1565c0', padding: 6, borderRadius: 4, fontSize: '0.8rem', marginBottom: 8 }}>
+                    💡 Tip: run Detect Features first to preview grid quality (optional).
                   </div>
                 )}
                 <button className="sidebar-btn" onClick={handleRunAlignment}
                   disabled={
                     isAligning || isDetecting ||
                     availableProcessedStages.length === 0 ||
-                    selectedChannels.size < 2 ||
                     !readyToAlign
                   }
                   style={{ width: '100%' }}>
                   {isAligning
-                    ? `Aligning ${selectedChannels.size} channels...`
+                    ? `Aligning ${selectedChannels.size} channels…`
                     : `Run Alignment (${selectedChannels.size} ch)`}
                 </button>
+                {availableProcessedStages.length === 0 && (
+                  <div style={{ color: '#c62828', fontSize: '0.78rem', marginTop: 6 }}>
+                    ⚠️ No processed stages — run Image Processing first.
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* 7. Crop Tool (post-alignment) */}
+          {loaded && !!stages.aligned && (
+            <div className="sidebar-section">
+              <h3
+                style={{ cursor: 'pointer', userSelect: 'none', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
+                onClick={() => setCropExpanded(p => !p)}
+              >
+                <span>✂️ Crop</span>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  {cropRect && (
+                    <span style={{ fontSize: '0.72rem', background: '#e3f2fd', color: '#1565c0',
+                      padding: '2px 6px', borderRadius: 10, fontWeight: 'normal' }}>
+                      active
+                    </span>
+                  )}
+                  <span style={{ fontSize: '0.8rem', color: '#888' }}>{cropExpanded ? '▲' : '▼'}</span>
+                </span>
+              </h3>
+              {cropExpanded && (
+                <div className="sidebar-content">
+                  <div style={{ fontSize: '0.82rem', color: '#555', marginBottom: 10, lineHeight: 1.5 }}>
+                    Toggle <strong>Crop</strong> in the Preview header, then drag on the
+                    preview image to define a crop region (post-alignment only).
+                    Non-destructive — affects export only.
+                  </div>
+
+                  {/* Numeric inputs */}
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 10 }}>
+                    {(['x', 'y', 'w', 'h'] as const).map(field => (
+                      <div key={field} className="input-group" style={{ marginBottom: 0 }}>
+                        <label style={{ fontSize: '0.78rem', marginBottom: 2 }}>
+                          {field === 'x' ? 'X' : field === 'y' ? 'Y' : field === 'w' ? 'W' : 'H'}
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          value={cropRect ? cropRect[field] : ''}
+                          placeholder={field === 'x' || field === 'y' ? '0' : '—'}
+                          style={{ width: '100%', padding: '4px 6px', fontSize: '0.82rem',
+                            border: '1px solid #ddd', borderRadius: 4 }}
+                          onChange={e => {
+                            const v = parseInt(e.target.value, 10);
+                            if (isNaN(v)) return;
+                            setCropRect(prev => prev
+                              ? { ...prev, [field]: v }
+                              : { x: 0, y: 0, w: 0, h: 0, [field]: v }
+                            );
+                          }}
+                        />
+                      </div>
+                    ))}
+                  </div>
+
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <button
+                      className="sidebar-btn"
+                      style={{ fontSize: '0.8rem', padding: '5px 10px',
+                        background: cropRect ? '#e8f5e9' : '#f5f5f5',
+                        color: cropRect ? '#2e7d32' : '#888',
+                        border: cropRect ? '1px solid #81c784' : '1px solid #ddd' }}
+                      disabled={!cropRect}
+                      title="Crop is applied at export time"
+                    >
+                      {cropRect ? '✅ Crop applied' : 'No crop set'}
+                    </button>
+                    <button
+                      className="sidebar-btn"
+                      style={{ fontSize: '0.8rem', padding: '5px 10px',
+                        background: '#fff3e0', color: '#b71c1c' }}
+                      onClick={() => setCropRect(null)}
+                      disabled={!cropRect}
+                      title="Remove crop rectangle">
+                      Clear
+                    </button>
+                  </div>
+
+                  {!stages.aligned && (
+                    <div style={{ background: '#fff8e1', color: '#7a5c00', padding: 6,
+                      borderRadius: 4, fontSize: '0.78rem', marginTop: 8, border: '1px solid #ffe082' }}>
+                      ⚠️ Run alignment first, then select the Aligned stage in the Color Overlay.
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* 8. Save / Restore Alignment */}
+          {loaded && (
+            <div className="sidebar-section">
+              <h3>💾 Save / Restore</h3>
+              <div className="sidebar-content">
+                {savedAt ? (
+                  <div style={{ background: '#e8f5e9', color: '#2e7d32', padding: '6px 10px',
+                    borderRadius: 4, fontSize: '0.78rem', marginBottom: 10, border: '1px solid #a5d6a7' }}>
+                    Saved: {new Date(savedAt).toLocaleString()}
+                  </div>
+                ) : (
+                  <div style={{ background: '#fff8e1', color: '#7a5c00', padding: '6px 10px',
+                    borderRadius: 4, fontSize: '0.78rem', marginBottom: 10, border: '1px solid #ffe082' }}>
+                    No saved alignment for this position
+                  </div>
+                )}
+
+                {/* TIFF export preference */}
+                <div style={{ background: '#f5f5f5', border: '1px solid #e0e0e0',
+                  borderRadius: 4, padding: '8px 10px', marginBottom: 10 }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 8,
+                    fontSize: '0.82rem', cursor: 'pointer', marginBottom: tiffExportPref.autoDownload ? 8 : 0 }}>
+                    <input
+                      type="checkbox"
+                      checked={tiffExportPref.autoDownload}
+                      disabled={alignmentRunId === null}
+                      onChange={e => setTiffExportPref(p => ({ ...p, autoDownload: e.target.checked }))}
+                    />
+                    Download aligned TIFFs after save
+                  </label>
+                  {alignmentRunId === null && (
+                    <div style={{ fontSize: '0.75rem', color: '#888', marginTop: 4, marginLeft: 22 }}>
+                      (run alignment first)
+                    </div>
+                  )}
+                  {tiffExportPref.autoDownload && (
+                    <div style={{ display: 'flex', gap: 16, marginLeft: 22 }}>
+                      {(['zip', 'composite'] as const).map(f => (
+                        <label key={f} style={{ display: 'flex', alignItems: 'center', gap: 4,
+                          fontSize: '0.8rem', cursor: 'pointer' }}>
+                          <input
+                            type="radio"
+                            name="tiffFormat"
+                            value={f}
+                            checked={tiffExportPref.format === f}
+                            onChange={() => setTiffExportPref(p => ({ ...p, format: f }))}
+                          />
+                          {f === 'zip' ? 'Individual channels' : 'Multi-channel composite'}
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                  <button className="sidebar-btn"
+                    style={{ fontSize: '0.8rem', padding: '5px 10px', background: '#1976d2', color: '#fff' }}
+                    onClick={saveAlignment}
+                    title="Save current ROI boxes and shift vectors to localStorage">
+                    Save
+                  </button>
+                  <button className="sidebar-btn"
+                    style={{ fontSize: '0.8rem', padding: '5px 10px' }}
+                    disabled={!localStorage.getItem(snapshotKey(selectedSample, selectedPosition))}
+                    onClick={loadSavedAlignment}
+                    title="Restore previously saved alignment state">
+                    Load Saved
+                  </button>
+                  <button className="sidebar-btn"
+                    style={{ fontSize: '0.8rem', padding: '5px 10px', background: '#fff3e0', color: '#b71c1c' }}
+                    onClick={resetAlignment}
+                    title="Clear saved alignment and reset ROI boxes">
+                    Reset
+                  </button>
+                </div>
+
+                {/* Export status line */}
+                {exportStatus && (
+                  <div style={{ marginTop: 8, fontSize: '0.8rem',
+                    color: exportStatus.includes('✓') ? '#2e7d32' : exportStatus.includes('failed') || exportStatus.includes('error') ? '#c62828' : '#1565c0',
+                    background: exportStatus.includes('✓') ? '#e8f5e9' : exportStatus.includes('failed') || exportStatus.includes('error') ? '#ffebee' : '#e3f2fd',
+                    padding: '4px 8px', borderRadius: 4, border: '1px solid',
+                    borderColor: exportStatus.includes('✓') ? '#a5d6a7' : exportStatus.includes('failed') || exportStatus.includes('error') ? '#ef9a9a' : '#90caf9' }}>
+                    {exportStatus}
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -979,7 +1644,24 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
         <div className="main-panel">
           <div className="preview-section">
             <div className="preview-header">
-              <h3>📸 Preview</h3>
+              <h3 style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                📸 Preview
+                <button
+                  className="sidebar-btn"
+                  style={{
+                    fontSize: '0.75rem',
+                    padding: '4px 8px',
+                    background: previewCropMode ? '#1565c0' : '#fff',
+                    color: previewCropMode ? '#fff' : '#1565c0',
+                    border: '1px solid #1565c0',
+                  }}
+                  disabled={!loaded || currentStage !== 'aligned'}
+                  onClick={() => setPreviewCropMode(p => !p)}
+                  title={currentStage !== 'aligned' ? 'Crop mode is available on Aligned stage only' : 'Toggle interactive crop mode'}
+                >
+                  {previewCropMode ? 'Crop: ON' : 'Crop'}
+                </button>
+              </h3>
               {loaded && (
                 <div className="preview-info">
                   <span><strong>Sample:</strong> {selectedSample}</span>
@@ -1001,7 +1683,11 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
               </div>
               <div className="control-group">
                 <label>Channel:</label>
-                <select value={selectedPreviewChannel} onChange={e => setSelectedPreviewChannel(e.target.value)} disabled={!loaded}>
+                <select
+                  value={selectedPreviewChannel}
+                  onChange={e => setSelectedPreviewChannel(e.target.value)}
+                  disabled={!loaded || (previewCropMode && currentStage === 'aligned')}
+                >
                   {availableItems.map(item => <option key={item.key} value={item.key}>{item.display_label}</option>)}
                 </select>
               </div>
@@ -1035,21 +1721,41 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
               )}
             </div>
 
-            <div className="preview-box">
+            <div className="preview-box" onContextMenu={(e) => e.preventDefault()}>
               {loaded ? (
-                alignMethod === 'manual_diagonal' && diagImageSrc ? (
+                // After alignment runs and stage='aligned', show the warped result as a plain
+                // image (so the change is visible).  For all other states keep the editor.
+                showAlignedPreview ? (() => {
+                  const src = getPreviewSrc();
+                  const dbgUrl = src ?? '(none)';
+                  console.log(
+                    `[Alignment preview] channel=${selectedPreviewChannel}` +
+                    ` stage=${currentStage}` +
+                    ` alignedExists=${!!stages.aligned}` +
+                    ` showAlignedPreview=true` +
+                    ` src=${dbgUrl}`
+                  );
+                  return src
+                    ? renderPreviewImage(src, `aligned - ${selectedPreviewChannel}`)
+                    : <p>No aligned preview for {selectedPreviewChannel}</p>;
+                })()
+                : alignMethod === 'manual_diagonal' && diagImageSrc ? (
                   <ManualDiagonalEditor
                     imageUrl={diagImageSrc}
                     box={diagonalBoxes[selectedPreviewChannel] ?? null}
-                    onBoxChange={newBox =>
-                      setDiagonalBoxes(prev => ({ ...prev, [selectedPreviewChannel]: newBox }))
-                    }
+                    onBoxChange={newBox => {
+                      diagonalBoxesRef.current = {
+                        ...diagonalBoxesRef.current,
+                        [selectedPreviewChannel]: newBox,
+                      };
+                      setDiagonalBoxes(prev => ({ ...prev, [selectedPreviewChannel]: newBox }));
+                    }}
                     channelLabel={availableItems.find(i => i.key === selectedPreviewChannel)?.display_label}
                   />
                 ) : (() => {
                   const src = getPreviewSrc();
                   return src
-                    ? <img src={src} alt={`${currentStage} - ${selectedPreviewChannel}`} style={{ maxWidth: '100%', height: 'auto' }} />
+                    ? renderPreviewImage(src, `${currentStage} - ${selectedPreviewChannel}`)
                     : <p>No preview available for {currentStage} / {selectedPreviewChannel}</p>;
                 })()
               ) : (
@@ -1071,6 +1777,9 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
             onChannelHover={setHighlightedChannel}
             onChannelClick={key => setChannelVisibility(prev => ({ ...prev, [key]: !prev[key] }))}
             highlightedChannel={highlightedChannel}
+            cropRect={cropRect}
+            onCropRectChange={setCropRect}
+            cropInteractive={false}
           />
         </div>
 

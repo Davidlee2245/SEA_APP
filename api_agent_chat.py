@@ -16,6 +16,7 @@ import numpy as np
 from datetime import datetime
 from pathlib import Path
 import hashlib
+import argparse
 
 # Try to import tifffile (optional, better for multi-page and 16-bit TIFF)
 try:
@@ -1553,5 +1554,8 @@ if __name__ == '__main__':
     print("  POST /api/preview - Convert TIFF to PNG for browser preview")
     print("=" * 60)
     
-    app.run(debug=True, port=5001)  # Different port from main API
+    parser = argparse.ArgumentParser(description='Agent Chat API server')
+    parser.add_argument('--port', type=int, default=5001, help='Port to bind the agent API')
+    args = parser.parse_args()
+    app.run(debug=True, port=args.port)  # Different port from main API by default
 

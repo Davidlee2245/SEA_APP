@@ -42,6 +42,7 @@
       { "from": "../checkpoints",            "to": "app/checkpoints"            },
       { "from": "../api_server_extended.py", "to": "app/api_server_extended.py" },
       { "from": "../api_agent_chat.py",      "to": "app/api_agent_chat.py"      },
+      { "from": "../requirements.txt",       "to": "app/requirements.txt"       },
       { "from": "../pipeline.py",            "to": "app/pipeline.py"            },
       { "from": "../frontend/dist",          "to": "app/frontend/dist"          }
     ],

@@ -22,6 +22,18 @@ let _httpBase  = '';                       // empty → relative URLs for browse
 let _wsBase    = 'ws://localhost:5000';    // default WS for browser dev
 let _agentBase = 'http://localhost:5001';  // agent server (separate process)
 
+// Bootstrap from Electron synchronously when available to avoid startup races.
+try {
+  const initialPort = window.electronAPI?.getBackendPort?.();
+  if (typeof initialPort === 'number' && Number.isFinite(initialPort) && initialPort > 0) {
+    _httpBase = `http://localhost:${initialPort}`;
+    _wsBase = `ws://localhost:${initialPort}`;
+    _agentBase = `http://localhost:${initialPort + 1}`;
+  }
+} catch {
+  // Non-Electron/browser contexts safely ignore bootstrap failures.
+}
+
 /** HTTP base for the main Flask API.  Empty string in browser dev mode. */
 export function getApiBase(): string   { return _httpBase;  }
 
@@ -50,10 +62,16 @@ declare global {
     electronAPI?: {
       selectPython:        () => Promise<string | null>;
       selectDataRoot:      () => Promise<string | null>;
+      selectImageFile:     () => Promise<string | null>;
       launchAfterSettings: (config: { pythonExe: string; dataRoot: string | null }) => Promise<void>;
+      saveSettings:        (config: { pythonExe: string; dataRoot: string | null; openaiKey?: string | null; anthropicKey?: string | null }) => Promise<boolean>;
       getConfig:           () => Promise<{ pythonExe?: string; dataRoot?: string }>;
       getDefaultDataRoot:  () => Promise<string>;
       onBackendPort:       (callback: (port: number) => void) => void;
+      getBackendPort:      () => number | null;
+      storeGet:            (key: string) => Promise<string | null>;
+      storeSet:            (key: string, value: string) => Promise<boolean>;
+      storeRemove:         (key: string) => Promise<boolean>;
     };
   }
 }
