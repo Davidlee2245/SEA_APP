@@ -6834,8 +6834,8 @@ if __name__ == '__main__':
     # CLI arguments — used by Electron to inject port and data root       #
     # ------------------------------------------------------------------ #
     parser = argparse.ArgumentParser(description='SEA API Server')
-    parser.add_argument('--port', type=int, default=5000,
-                        help='Port to listen on (default: 5000)')
+    parser.add_argument('--port', type=int, default=8765,
+                        help='Port to listen on (default: 8765)')
     parser.add_argument('--data-root', type=str, default=None,
                         help='Root directory for all data (input, output, previews, processing). '
                              'Defaults to the "data" folder next to this script.')

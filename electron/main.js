@@ -264,7 +264,7 @@ async function autoSetupConda(webContents) {
 // Port finder — tries `start`, increments if busy
 // ---------------------------------------------------------------------------
 
-function findFreePort(start = 5000) {
+function findFreePort(start = 8765) {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
     server.unref();
@@ -656,7 +656,7 @@ async function launchWithConfig(config) {
   createSplashWindow();
 
   try {
-    const port     = await findFreePort(5000);
+    const port     = await findFreePort(8765);
     const dataRoot = config.dataRoot || DEFAULT_DATA_ROOT;
 
     await startPythonBackend(config.pythonExe, dataRoot, port);
