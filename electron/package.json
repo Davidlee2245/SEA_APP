@@ -1,6 +1,6 @@
 {
   "name": "sea-exosome-analysis",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "SEA — Semiautomated Exosome Analysis Desktop App",
   "author": "SEA Lab",
   "repository": {
@@ -29,7 +29,9 @@
     "files": [
       "main.js",
       "preload.js",
-      "settings.html"
+      "settings.html",
+      "exosome.png",
+      "icons/**/*"
     ],
     "extraResources": [
       { "from": "../agents",                 "to": "app/agents"                 },
@@ -39,6 +41,7 @@
       { "from": "../config",                 "to": "app/config"                 },
       { "from": "../checkpoints",            "to": "app/checkpoints"            },
       { "from": "../api_server_extended.py", "to": "app/api_server_extended.py" },
+      { "from": "../api_agent_chat.py",      "to": "app/api_agent_chat.py"      },
       { "from": "../pipeline.py",            "to": "app/pipeline.py"            },
       { "from": "../frontend/dist",          "to": "app/frontend/dist"          }
     ],
@@ -53,7 +56,8 @@
     },
     "linux": {
       "target": "AppImage",
-      "category": "Science"
+      "category": "Science",
+      "icon": "icons"
     }
   }
 }
