@@ -28,6 +28,10 @@ ENV/
 node_modules/
 frontend/dist/
 electron/dist-electron/
+electron/out/
+electron/node_modules/
+electron/squashfs-root/
+*.AppImage
 
 # ── Large model weights (copy manually to checkpoints/pretrained/) ────────────
 checkpoints/pretrained/*.pth
@@ -72,6 +76,8 @@ Thumbs.db
 *.bak
 .ipynb_checkpoints/
 *.ipynb
+
+# Large artefacts (directories — never commit; history cleaned with git filter-repo)
 checkpoints/
 data/
 electron/dist-electron/
