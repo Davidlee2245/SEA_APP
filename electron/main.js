@@ -13,7 +13,7 @@
  */
 
 const { app, BrowserWindow, ipcMain, dialog, shell, Menu } = require('electron');
-const { spawn, spawnSync } = require('child_process');
+const { spawn, spawnSync, execSync } = require('child_process');
 const os           = require('os');
 const path       = require('path');
 const fs         = require('fs');
@@ -264,7 +264,129 @@ async function autoSetupConda(webContents) {
 // Port finder — tries `start`, increments if busy
 // ---------------------------------------------------------------------------
 
-function findFreePort(start = 8765) {
+/** Flask backend prefers this port; must match api_server_extended.py default. */
+const BACKEND_PREFERRED_PORT = 8765;
+
+/** True when `:` + port appears as its own numeric suffix (avoid :187659 false matches). */
+function lineLooksLikeTcpListenOnPort(line, port) {
+  const mark = ':' + port;
+  let i = 0;
+  while ((i = line.indexOf(mark, i)) !== -1) {
+    const prevOk = i === 0 || !/\d/.test(line[i - 1]);
+    const tail = line.slice(i + mark.length);
+    const nextOk = !tail || !/^\d/.test(tail);
+    if (prevOk && nextOk) return true;
+    i += 1;
+  }
+  return false;
+}
+
+/**
+ * Collect PIDs that have a TCP LISTEN socket on localhost for `port`.
+ * Windows: parse `netstat -ano`; macOS/Linux: `lsof`, then optional `ss` fallback.
+ */
+function getListeningPidsOnPort(port) {
+  const pids = [];
+  const seen = new Set();
+
+  function add(pid) {
+    const n = parseInt(pid, 10);
+    if (!Number.isFinite(n) || n <= 0 || n === process.pid) return;
+    if (!seen.has(n)) {
+      seen.add(n);
+      pids.push(n);
+    }
+  }
+
+  if (process.platform === 'win32') {
+    try {
+      const out = execSync('netstat -ano', { encoding: 'utf8', windowsHide: true, timeout: 15000 });
+      for (const line of out.split(/\r?\n/)) {
+        if (!/\bLISTENING\b/i.test(line)) continue;
+        if (!/^TCP/i.test(line.trim())) continue;
+        if (!lineLooksLikeTcpListenOnPort(line, port)) continue;
+        const m = line.match(/\s(\d+)\s*$/);
+        if (m) add(m[1]);
+      }
+    } catch (err) {
+      console.warn('[Backend Lifecycle] netstat -ano failed:', err.message);
+    }
+    return pids;
+  }
+
+  try {
+    const out = execSync(`lsof -nP -iTCP:${port} -sTCP:LISTEN -t`, {
+      encoding: 'utf8',
+      timeout: 15000,
+    });
+    for (const line of out.trim().split(/\s*\n+/).map((s) => s.trim()).filter(Boolean)) {
+      add(line);
+    }
+    if (pids.length > 0) return pids;
+  } catch (_) {
+    /* lsof missing or no listeners */
+  }
+
+  try {
+    const out = execSync(`sh -c 'ss -lptn 2>/dev/null || true'`, { encoding: 'utf8', timeout: 15000 });
+    for (const line of out.split(/\r?\n/)) {
+      if (!lineLooksLikeTcpListenOnPort(line, port)) continue;
+      const m = line.match(/pid=(\d+)/i);
+      if (m) add(m[1]);
+    }
+  } catch (_) {
+    /* ss optional */
+  }
+
+  return pids;
+}
+
+/** Force-terminate process tree / PID (used for orphans on our preferred port). */
+function terminatePidTree(pid, description) {
+  if (!pid) return;
+  const label = description || 'PID ' + pid;
+  try {
+    if (process.platform === 'win32') {
+      console.log('[Backend Lifecycle]', label + ': taskkill /F /T for PID', pid);
+      spawnSync('taskkill', ['/PID', String(pid), '/F', '/T'], {
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 20000,
+      });
+    } else {
+      console.log('[Backend Lifecycle]', label + ': SIGKILL for PID', pid);
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch (sigErr) {
+        console.warn('[Backend Lifecycle] process.kill SIGKILL:', sigErr.message, '— trying /bin/sh kill -9');
+        spawnSync('/bin/sh', ['-c', `kill -9 ${pid} 2>/dev/null || true`], { encoding: 'utf8', timeout: 10000 });
+      }
+    }
+  } catch (e) {
+    console.warn('[Backend Lifecycle] terminatePidTree PID', pid, ':', e.message);
+  }
+}
+
+/**
+ * Before starting Flask: release BACKEND_PREFERRED_PORT if something else holds it.
+ */
+async function ensurePreferredBackendPortFree() {
+  const port = BACKEND_PREFERRED_PORT;
+  const pids = getListeningPidsOnPort(port);
+  if (!pids.length) {
+    console.log(`[Backend Lifecycle] Preferred port ${port} is available (no listener PIDs detected).`);
+    return;
+  }
+  console.warn(
+    `[Backend Lifecycle] Preferred port ${port} is busy — terminating listener PID(s): ${pids.join(', ')}`
+  );
+  for (const pid of pids) {
+    terminatePidTree(pid, `Stale listener occupying port ${port}`);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 400));
+}
+
+function findFreePort(start = BACKEND_PREFERRED_PORT) {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
     server.unref();
@@ -656,7 +778,8 @@ async function launchWithConfig(config) {
   createSplashWindow();
 
   try {
-    const port     = await findFreePort(8765);
+    await ensurePreferredBackendPortFree();
+    const port     = await findFreePort(BACKEND_PREFERRED_PORT);
     const dataRoot = config.dataRoot || DEFAULT_DATA_ROOT;
 
     await startPythonBackend(config.pythonExe, dataRoot, port);
@@ -817,7 +940,11 @@ app.on('window-all-closed', () => {
   // Don't quit while we are in the middle of starting the backend —
   // the splash window may have just closed and the main window isn't open yet.
   if (isLaunching) return;
-  if (process.platform !== 'darwin') app.quit();
+  if (process.platform !== 'darwin') {
+    console.log('[Backend Lifecycle] window-all-closed (non-macOS): stopping Python backends before quit');
+    killPython();
+    app.quit();
+  }
 });
 
 app.on('activate', () => {
@@ -826,37 +953,36 @@ app.on('activate', () => {
 });
 
 function killPython() {
-  if (pythonProcess) {
-    console.log('[Main] Killing Python backend...');
+  if (pythonProcess && pythonProcess.pid) {
+    const pid = pythonProcess.pid;
+    console.log('[Backend Lifecycle] Terminating tracked Flask backend PID', pid);
+    terminatePidTree(pid, 'Flask backend (tracked)');
     try {
-      // On Windows, SIGTERM is not supported — taskkill is more reliable
-      if (process.platform === 'win32') {
-        require('child_process').spawnSync('taskkill', ['/PID', String(pythonProcess.pid), '/F', '/T']);
-      } else {
-        pythonProcess.kill('SIGTERM');
-      }
-    } catch (e) {
-      console.error('[Main] Failed to kill Python process:', e.message);
-    }
+      pythonProcess.removeAllListeners?.();
+    } catch (_) {}
     pythonProcess = null;
   }
-  if (agentProcess) {
-    console.log('[Main] Killing Agent backend...');
+  if (agentProcess && agentProcess.pid) {
+    const pid = agentProcess.pid;
+    console.log('[Backend Lifecycle] Terminating tracked Agent backend PID', pid);
+    terminatePidTree(pid, 'Agent backend (tracked)');
     try {
-      if (process.platform === 'win32') {
-        require('child_process').spawnSync('taskkill', ['/PID', String(agentProcess.pid), '/F', '/T']);
-      } else {
-        agentProcess.kill('SIGTERM');
-      }
-    } catch (e) {
-      console.error('[Main] Failed to kill Agent process:', e.message);
-    }
+      agentProcess.removeAllListeners?.();
+    } catch (_) {}
     agentProcess = null;
   }
 }
 
+app.on('before-quit', () => {
+  console.log('[Backend Lifecycle] before-quit: stopping Python backends');
+  killPython();
+});
+
 // Fires on clean quit (Cmd+Q, window close, app.quit())
-app.on('will-quit', killPython);
+app.on('will-quit', () => {
+  console.log('[Backend Lifecycle] will-quit: ensuring Python backends are stopped');
+  killPython();
+});
 
 // Belt-and-suspenders: also fires on process.exit() and uncaught crashes
 // so Python doesn't become an orphan if Electron hard-crashes.
