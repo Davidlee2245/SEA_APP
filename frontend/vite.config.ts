@@ -9,13 +9,13 @@ export default defineConfig({
     proxy: {
       // Long timeouts for endpoints that stream or run heavy work (e.g. Cygnus pipeline).
       '/api/cygnus/run': {
-        target: 'http://localhost:5000',
+        target: 'http://localhost:8765',
         changeOrigin: true,
         timeout: 60 * 60 * 1000, // 1 hour
         proxyTimeout: 60 * 60 * 1000,
       },
       '/api': {
-        target: 'http://localhost:5000',
+        target: 'http://localhost:8765',
         changeOrigin: true,
       },
     },

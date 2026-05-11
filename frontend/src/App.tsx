@@ -2,13 +2,13 @@
  * Main App Component
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { setBackendPort } from './lib/apiBase';
 import AlignmentViewer from './components/AlignmentViewer';
 import ImageProcessing from './components/ImageProcessing';
 import Alignment from './components/Alignment';
 import AgentChat from './components/AgentChat';
-import ExosomeDetection from './components/ExosomeDetection';
+import ExosomeDetection, { type ExosomeDetectionImperativeHandle } from './components/ExosomeDetection';
 import DataAnalysis from './components/DataAnalysis';
 import './styles/App.css';
 
@@ -26,6 +26,16 @@ const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<
     'agent' | 'processing' | 'alignment' | 'exosome' | 'dataAnalysis' | 'viewer'
   >('agent');
+
+  const exosomeDetectionRef = useRef<ExosomeDetectionImperativeHandle>(null);
+
+  useEffect(() => {
+    if (activeTab !== 'exosome') return;
+    requestAnimationFrame(() => {
+      console.log('[FIT TRIGGER]', { source: 'App.tsx:activeTab-exosome-rAF' });
+      exosomeDetectionRef.current?.fitToViewport();
+    });
+  }, [activeTab]);
 
   return (
     <div className="app">
@@ -71,33 +81,57 @@ const App: React.FC = () => {
 
       {/* All tabs are always mounted (hidden via CSS) to preserve state across tab switches */}
 
-      <div className="tab-content" style={{ display: activeTab === 'agent' ? 'block' : 'none' }}>
+      <div
+        className="tab-content"
+        data-tab="agent"
+        data-active={activeTab === 'agent' ? 'true' : 'false'}
+      >
         <AgentChat />
       </div>
 
-      <div className="tab-content" style={{ display: activeTab === 'processing' ? 'block' : 'none' }}>
+      <div
+        className="tab-content"
+        data-tab="processing"
+        data-active={activeTab === 'processing' ? 'true' : 'false'}
+      >
         <React.Suspense fallback={<div>Loading Image Processing...</div>}>
           <ImageProcessing isActive={activeTab === 'processing'} />
         </React.Suspense>
       </div>
 
-      <div className="tab-content" style={{ display: activeTab === 'alignment' ? 'block' : 'none' }}>
+      <div
+        className="tab-content"
+        data-tab="alignment"
+        data-active={activeTab === 'alignment' ? 'true' : 'false'}
+      >
         <React.Suspense fallback={<div>Loading Alignment...</div>}>
           <Alignment isActive={activeTab === 'alignment'} />
         </React.Suspense>
       </div>
 
-      <div className="tab-content" style={{ display: activeTab === 'exosome' ? 'block' : 'none' }}>
+      <div
+        className="tab-content"
+        data-tab="exosome"
+        data-active={activeTab === 'exosome' ? 'true' : 'false'}
+      >
         <React.Suspense fallback={<div>Loading Exosome Detection...</div>}>
-          <ExosomeDetection isActive={activeTab === 'exosome'} />
+          <ExosomeDetection ref={exosomeDetectionRef} isActive={activeTab === 'exosome'} />
         </React.Suspense>
       </div>
 
-      <div className="tab-content" style={{ display: activeTab === 'viewer' ? 'block' : 'none' }}>
+      <div
+        className="tab-content"
+        data-tab="viewer"
+        data-active={activeTab === 'viewer' ? 'true' : 'false'}
+      >
         <AlignmentViewer />
       </div>
 
-      <div className="tab-content" style={{ display: activeTab === 'dataAnalysis' ? 'block' : 'none' }}>
+      <div
+        className="tab-content"
+        data-tab="dataAnalysis"
+        data-active={activeTab === 'dataAnalysis' ? 'true' : 'false'}
+      >
         <DataAnalysis />
       </div>
     </div>

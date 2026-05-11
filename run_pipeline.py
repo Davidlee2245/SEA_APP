@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import matplotlib
+
+matplotlib.use("Agg")
+
 from pathlib import Path
 
 from stage1_loader import RELEVANT_MARKERS, load_cygnus_object

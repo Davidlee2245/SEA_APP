@@ -88,7 +88,7 @@ The development server proxies API requests to the Flask backend. Configure in `
 server: {
   proxy: {
     '/api': {
-      target: 'http://localhost:5000',  // Flask backend URL
+      target: 'http://localhost:8765',  // Flask backend URL (api_server_extended.py default)
       changeOrigin: true,
     },
   },

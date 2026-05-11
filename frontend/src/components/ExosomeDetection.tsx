@@ -3,7 +3,15 @@
  * Uses SAM (Segment Anything Model) for exosome segmentation
  */
 
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, {
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+  useMemo,
+  forwardRef,
+  useImperativeHandle,
+} from 'react';
 import '../styles/ExosomeDetection.css';
 import { getApiBase } from '../lib/apiBase';
 import { copyText } from '../lib/clipboard';
@@ -768,7 +776,46 @@ async function fetchChannelDisplay(
 
 // ---------------------------------------------------------------------------
 
-const ExosomeDetection: React.FC<{ isActive?: boolean }> = ({ isActive = true }) => {
+/**
+ * Part of the viewport element that actually intersects the browser window.
+ * The canvas container can be laid out taller than the visible window (flex + large
+ * canvas intrinsic size); centering must use this visible band in element-local coords.
+ */
+function getVisibleViewportInset(vp: HTMLElement): {
+  visibleW: number;
+  visibleH: number;
+  originX: number;
+  originY: number;
+} | null {
+  const rect = vp.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+  if (typeof window === 'undefined') {
+    return { visibleW: rect.width, visibleH: rect.height, originX: 0, originY: 0 };
+  }
+  const winH = window.innerHeight;
+  const winW = window.innerWidth;
+  const intersectTop = Math.max(rect.top, 0);
+  const intersectBottom = Math.min(rect.bottom, winH);
+  const intersectLeft = Math.max(rect.left, 0);
+  const intersectRight = Math.min(rect.right, winW);
+  const visibleW = intersectRight - intersectLeft;
+  const visibleH = intersectBottom - intersectTop;
+  if (visibleW <= 0 || visibleH <= 0) return null;
+  return {
+    visibleW,
+    visibleH,
+    originX: intersectLeft - rect.left,
+    originY: intersectTop - rect.top,
+  };
+}
+
+/** Imperative API for parent (e.g. App) when the tab was hidden during image load. */
+export type ExosomeDetectionImperativeHandle = {
+  fitToViewport: () => void;
+};
+
+const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive?: boolean }>(
+  function ExosomeDetection({ isActive = true }, ref) {
   const [state, setState] = useState<ExosomeDetectionState>({
     selectedSample: '',
     selectedPosition: '',
@@ -884,6 +931,8 @@ const ExosomeDetection: React.FC<{ isActive?: boolean }> = ({ isActive = true })
     offsetX: 0,
     offsetY: 0,
   });
+  const zoomStateRef = useRef(zoomState);
+  zoomStateRef.current = zoomState;
   const [filterArea, setFilterArea] = useState<{ min: string; max: string }>({ min: '', max: '' });
   const [filterCirc, setFilterCirc] = useState<{ min: string; max: string }>({ min: '', max: '' });
   const [showFilteredOnly, setShowFilteredOnly] = useState(false);
@@ -897,6 +946,8 @@ const ExosomeDetection: React.FC<{ isActive?: boolean }> = ({ isActive = true })
   const [saveFilterMessage, setSaveFilterMessage] = useState<string>('');
   const isPanningRef = useRef<boolean>(false);
   const panStartRef = useRef<{ x: number; y: number } | null>(null);
+  /** True while pointer is inside the RF canvas viewport (for cursor: none + brush preview). */
+  const [rfPointerOverViewport, setRfPointerOverViewport] = useState(false);
 
   const exosomeDiskTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const exosomeDiskPendingRef = useRef<Record<string, string>>({});
@@ -1241,21 +1292,68 @@ const ExosomeDetection: React.FC<{ isActive?: boolean }> = ({ isActive = true })
 
   /** Fit the loaded image in the viewport with a small margin (0.95). */
   const fitToViewport = useCallback(() => {
+    console.log('[FIT CALLED]');
     const vp = viewportRef.current;
     const img = imageRef.current;
     if (!vp || !img) return;
     const iw = img.naturalWidth || img.width;
     const ih = img.naturalHeight || img.height;
     if (iw <= 0 || ih <= 0) return;
-    const rect = vp.getBoundingClientRect();
-    const viewportWidth = rect.width;
-    const viewportHeight = rect.height;
-    if (viewportWidth <= 0 || viewportHeight <= 0) return;
-    const scale = Math.min(viewportWidth / iw, viewportHeight / ih) * 0.95;
-    const offsetX = (viewportWidth - iw * scale) / 2;
-    const offsetY = (viewportHeight - ih * scale) / 2;
+    const vis = getVisibleViewportInset(vp);
+    if (!vis) {
+      console.log('[fitToViewport] getVisibleViewportInset returned null');
+      return;
+    }
+    const { visibleW, visibleH, originX, originY } = vis;
+    const scale = Math.min(visibleW / iw, visibleH / ih) * 0.95;
+    const offsetX = originX + (visibleW - iw * scale) / 2;
+    const offsetY = originY + (visibleH - ih * scale) / 2;
+    const vpRect = vp.getBoundingClientRect();
+    // TEMP debug — remove after diagnosing centering / scroll issues
+    console.log('[fitToViewport] getVisibleViewportInset (full)', {
+      originX: vis.originX,
+      originY: vis.originY,
+      visibleW: vis.visibleW,
+      visibleH: vis.visibleH,
+    });
+    console.log('[fitToViewport] computed offsets', { offsetX, offsetY });
+    console.log('[fitToViewport]', {
+      visibleW,
+      visibleH,
+      iw,
+      ih,
+      scale,
+      offsetX,
+      offsetY,
+      originX,
+      originY,
+      windowInnerWidth: typeof window !== 'undefined' ? window.innerWidth : null,
+      windowInnerHeight: typeof window !== 'undefined' ? window.innerHeight : null,
+      viewportRect: {
+        top: vpRect.top,
+        left: vpRect.left,
+        right: vpRect.right,
+        bottom: vpRect.bottom,
+        width: vpRect.width,
+        height: vpRect.height,
+      },
+    });
     setZoomState({ scale, offsetX, offsetY });
   }, []);
+
+  useImperativeHandle(ref, () => ({
+    fitToViewport: () => {
+      console.log('[FIT TRIGGER]', { source: 'imperative-handle:entry' });
+      requestAnimationFrame(() => {
+        if (!imageRef.current || !viewportRef.current) return;
+        const z = zoomStateRef.current;
+        if (z.scale !== 1 || z.offsetX !== 0 || z.offsetY !== 0) return;
+        if (!getVisibleViewportInset(viewportRef.current)) return;
+        console.log('[FIT TRIGGER]', { source: 'imperative-handle:before-internal-fit' });
+        fitToViewport();
+      });
+    },
+  }), [fitToViewport]);
 
   // Load position and get channel info
   const handleLoadPosition = async () => {
@@ -1358,6 +1456,7 @@ const ExosomeDetection: React.FC<{ isActive?: boolean }> = ({ isActive = true })
             imageRef.current = img;
             drawCanvas();
             requestAnimationFrame(() => {
+              console.log('[FIT TRIGGER]', { source: 'handleLoadPosition:img-onload-rAF' });
               fitToViewport();
             });
           };
@@ -1484,6 +1583,7 @@ const ExosomeDetection: React.FC<{ isActive?: boolean }> = ({ isActive = true })
         // Avoid resetting zoom on channel / display / LUT changes; only fit when no image was shown yet.
         if (firstImageInSession) {
           requestAnimationFrame(() => {
+            console.log('[FIT TRIGGER]', { source: 'channel-display-LUT-effect:img-onload-rAF' });
             fitToViewport();
           });
         }
@@ -1577,15 +1677,14 @@ const ExosomeDetection: React.FC<{ isActive?: boolean }> = ({ isActive = true })
         }
       }
       
-      // Draw brush preview (semi-transparent circle following cursor; eraser = red outline only)
+      // Draw brush preview (semi-transparent circle following cursor)
       if (state.brushPreview.x !== null && state.brushPreview.y !== null) {
         ctx.save();
         ctx.beginPath();
         ctx.arc(state.brushPreview.x, state.brushPreview.y, state.brushSize, 0, Math.PI * 2);
         if (state.annotationMode === 'eraser') {
-          ctx.strokeStyle = 'rgba(255, 0, 0, 0.95)';
-          ctx.lineWidth = 2;
-          ctx.stroke();
+          ctx.fillStyle = 'rgba(255, 165, 0, 0.4)';
+          ctx.fill();
         } else {
           const previewColor = state.annotationMode === 'exosome'
             ? 'rgba(0, 255, 0, 0.4)'
@@ -1949,6 +2048,12 @@ const ExosomeDetection: React.FC<{ isActive?: boolean }> = ({ isActive = true })
   useEffect(() => {
     drawCanvas();
   }, [drawCanvas]);
+
+  useEffect(() => {
+    if (state.detectionMethod !== 'random_forest') {
+      setRfPointerOverViewport(false);
+    }
+  }, [state.detectionMethod]);
 
   // Debug logging for coordinate mapping (legacy - now handled in getCanvasCoords)
   const logClickDebug = useCallback((e: React.MouseEvent<HTMLCanvasElement> | React.MouseEvent<HTMLDivElement>, computedCoords: { x: number; y: number }) => {
@@ -2327,6 +2432,7 @@ const ExosomeDetection: React.FC<{ isActive?: boolean }> = ({ isActive = true })
   
   // Double-click: fit image to viewport
   const handleDoubleClick = () => {
+    console.log('[FIT TRIGGER]', { source: 'handleDoubleClick' });
     fitToViewport();
   };
 
@@ -2533,7 +2639,8 @@ const ExosomeDetection: React.FC<{ isActive?: boolean }> = ({ isActive = true })
   // Handle canvas click for pixel inspector
   const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!canvasRef.current || !imageRef.current) return;
-    
+    if (state.annotationMode === 'eraser') return;
+
     const { x, y } = getCanvasCoords(e);
     
     // Get pixel intensity from image
@@ -3813,6 +3920,9 @@ const ExosomeDetection: React.FC<{ isActive?: boolean }> = ({ isActive = true })
           <div
             ref={viewportRef}
             className="canvas-container"
+            onPointerEnter={() => {
+              setRfPointerOverViewport(true);
+            }}
             onPointerDown={(e) => {
               // Ignore middle-click entirely to avoid browser auto-scroll conflicts.
               if (e.button === 1) return;
@@ -3839,6 +3949,7 @@ const ExosomeDetection: React.FC<{ isActive?: boolean }> = ({ isActive = true })
               handleCanvasMouseUp();
             }}
             onPointerLeave={(e) => {
+              setRfPointerOverViewport(false);
               handlePanEnd();
               handleCanvasMouseLeave();
             }}
@@ -3856,9 +3967,19 @@ const ExosomeDetection: React.FC<{ isActive?: boolean }> = ({ isActive = true })
               overflow: 'hidden',
               width: '100%',
               height: '100%',
-              cursor: isPanningRef.current
-                ? 'grabbing'
-                : (zoomState.scale > 1.0 && !isAnnotatingRef.current && !isDrawingRef.current ? 'grab' : 'default'),
+              cursor: (() => {
+                if (isPanningRef.current) return 'grabbing';
+                if (
+                  state.detectionMethod === 'random_forest' &&
+                  (rfPointerOverViewport || isAnnotatingRef.current)
+                ) {
+                  return 'none';
+                }
+                if (zoomState.scale > 1.0 && !isAnnotatingRef.current && !isDrawingRef.current) {
+                  return 'grab';
+                }
+                return 'default';
+              })(),
             }}
           >
             {state.currentImageUrl ? (
@@ -4241,7 +4362,7 @@ const ExosomeDetection: React.FC<{ isActive?: boolean }> = ({ isActive = true })
       </div>
     </div>
   );
-};
+});
 
 export default ExosomeDetection;
 

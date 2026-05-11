@@ -273,7 +273,7 @@ bash setup_visualization.sh
 ```bash
 conda activate SEA
 python api_server_extended.py
-# Runs on http://localhost:5000
+# Runs on http://localhost:8765 (default; matches Vite proxy in frontend/vite.config.ts)
 ```
 
 > **Important:** Use `api_server_extended.py`, not `api_server.py`. The extended server provides all backend endpoints required by the GUI, including image preprocessing, alignment, and exosome detection. The basic `api_server.py` only serves raw file previews and will cause 404 errors for most GUI features.

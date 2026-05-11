@@ -2,9 +2,9 @@
  * Runtime API base URL resolution.
  *
  * Browser dev workflow (window.electronAPI is absent):
- *   getApiBase()   → ''                        (relative → Vite proxy → localhost:5000)
- *   getWsBase()    → 'ws://localhost:5000'      (direct WS to backend, same as before)
- *   getAgentBase() → 'http://localhost:5001'    (direct to agent server)
+ *   getApiBase()   → ''                        (relative → Vite proxy → localhost:8765)
+ *   getWsBase()    → 'ws://localhost:8765'      (direct WS to backend; must match api_server_extended --port)
+ *   getAgentBase() → 'http://localhost:8766'    (agent chat; main backend port + 1, same as Electron)
  *
  * Electron production (window.electronAPI present):
  *   App.tsx calls setBackendPort(port) once when it receives the IPC message.
@@ -19,8 +19,8 @@
  */
 
 let _httpBase  = '';                       // empty → relative URLs for browser dev
-let _wsBase    = 'ws://localhost:5000';    // default WS for browser dev
-let _agentBase = 'http://localhost:5001';  // agent server (separate process)
+let _wsBase    = 'ws://localhost:8765';    // default WS for browser dev (matches api_server_extended.py default)
+let _agentBase = 'http://localhost:8766';  // agent server: next port after main API (see electron/main.js)
 
 // Bootstrap from Electron synchronously when available to avoid startup races.
 try {
@@ -40,7 +40,7 @@ export function getApiBase(): string   { return _httpBase;  }
 /** WebSocket base for the pipeline stream. */
 export function getWsBase(): string    { return _wsBase;    }
 
-/** HTTP base for the agent chat server (port 5001 by convention). */
+/** HTTP base for the agent chat server (main API port + 1 in dev / Electron). */
 export function getAgentBase(): string { return _agentBase; }
 
 /**

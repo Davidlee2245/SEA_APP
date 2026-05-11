@@ -312,7 +312,7 @@ const AgentChat: React.FC = () => {
     } catch (err) {
       const errorMessage: Message = {
         role: 'assistant',
-        content: `❌ Failed to reach agent API: ${err}. Make sure the agent server is running on port 5001.`,
+        content: `❌ Failed to reach agent API: ${err}. Make sure the agent server is reachable at ${getAgentBase()}.`,
         timestamp: new Date()
       };
       setMessages(prev => [...prev, errorMessage]);
@@ -414,7 +414,7 @@ const AgentChat: React.FC = () => {
       console.error('Quick recommend failed:', err);
       const errorMessage: Message = {
         role: 'assistant',
-        content: `❌ Failed to reach agent API: ${err}. Make sure the agent server is running on port 5001.`,
+        content: `❌ Failed to reach agent API: ${err}. Make sure the agent server is reachable at ${getAgentBase()}.`,
         timestamp: new Date()
       };
       setMessages(prev => [...prev, errorMessage]);
