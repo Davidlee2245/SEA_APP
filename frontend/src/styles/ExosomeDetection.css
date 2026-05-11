@@ -3,6 +3,7 @@
 .exosome-detection {
   width: 100%;
   height: 100%;
+  max-height: 100%;
   min-height: 0;
   flex: 1 1 0;
   padding: 0;
@@ -10,21 +11,33 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  align-self: stretch;
 }
 
+/* Flex row (not CSS grid): grid 1fr rows with an indefinite grid block-size often compute to 0 height,
+   which collapses .exosome-viewer and .canvas-container. Flex + align-items stretch fixes the chain. */
 .exosome-layout {
-  display: grid;
-  grid-template-columns: 280px 1fr 280px;
-  grid-template-rows: minmax(0, 1fr);
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
   gap: 1rem;
   flex: 1 1 0;
   min-height: 0;
-  height: 100%;
+  min-width: 0;
+  width: 100%;
   overflow: hidden;
+  align-self: stretch;
+}
+
+.exosome-layout > * {
+  min-height: 0;
 }
 
 /* LEFT: Controls Panel */
 .exosome-controls {
+  flex: 0 0 280px;
+  width: 280px;
+  max-width: 280px;
   background: white;
   border-radius: 8px;
   padding: 1rem;
@@ -153,17 +166,31 @@
   background: #229954;
 }
 
-/* CENTER: Image Viewer */
-.exosome-viewer {
+/* CENTER: scrollport — viewer fills one “screen” of this column; results flow below in document order */
+.exosome-center-column {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  max-height: 100%;
+  box-sizing: border-box;
+  display: block;
+  overflow-x: hidden;
+  overflow-y: auto;
   background: white;
   border-radius: 8px;
   padding: 1rem;
-  overflow: hidden; /* clip transformed canvas; avoid nested scroll pushing page */
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+/* At least full column height so canvas+toolbar fill the visible area; results scroll in parent */
+.exosome-viewer {
+  min-height: 100%;
+  min-width: 0;
+  overflow: hidden; /* clip transformed canvas */
   display: flex;
   flex-direction: column;
-  min-height: 0;
-  min-width: 0;
+  box-sizing: border-box;
 }
 
 .viewer-controls {
@@ -185,6 +212,7 @@
   flex: 1;
 }
 
+/* Takes all remaining space in .exosome-viewer after .viewer-controls + footnote */
 .canvas-container {
   flex: 1 1 0;
   min-height: 0;
@@ -219,6 +247,9 @@
 
 /* RIGHT: Results Panel */
 .exosome-results {
+  flex: 0 0 280px;
+  width: 280px;
+  max-width: 280px;
   background: white;
   border-radius: 8px;
   padding: 1rem;
@@ -257,6 +288,7 @@
 
 .results-table-container {
   margin-bottom: 1rem;
+  overflow: visible;
 }
 
 .results-table-container h3 {
@@ -330,11 +362,19 @@
   margin: 0.25rem 0;
 }
 
-/* Results section below image in center panel */
+/* Below exosome-viewer; scroll happens on .exosome-center-column only */
 .viewer-results {
+  overflow: visible;
   margin-top: 1rem;
   padding-top: 1rem;
   border-top: 1px solid #e0e0e0;
+}
+
+.viewer-results .histogram-container,
+.viewer-results .results-table-container,
+.viewer-results .summary-row {
+  overflow: visible;
+  max-height: none;
 }
 
 .summary-row {

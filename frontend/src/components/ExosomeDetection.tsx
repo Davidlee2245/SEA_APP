@@ -6,6 +6,7 @@
 import React, {
   useState,
   useEffect,
+  useLayoutEffect,
   useRef,
   useCallback,
   useMemo,
@@ -168,7 +169,9 @@ interface ExosomeDetectionState {
   annotations: Array<{ 
     id: string; // Unique ID for removal
     points: Array<[number, number]>, 
-    label: number 
+    label: number;
+    /** One entry per addBrushPoint call; used for overlay so size matches brush preview. */
+    brushDabs?: Array<{ x: number; y: number; radius: number }>;
   }>; // label: 1=exosome, 0=background
   brushSize: number;
   annotationMode: 'exosome' | 'background' | 'eraser'; // Current annotation mode (E toggles eraser)
@@ -694,37 +697,36 @@ const DetectionTable: React.FC<DetectionTableProps> = React.memo(({
         )}
       </div>
 
-      <div style={{ maxHeight: '300px', overflowY: 'auto' }}>
-        <table className="detections-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
-          <thead>
-            <tr>
-              <th style={thStyle} onClick={() => handleHeaderClick('id')}>ID{sortArrow('id')}</th>
-              <th style={thStyle} onClick={() => handleHeaderClick('area')}>Area (px²){sortArrow('area')}</th>
-              <th style={{ ...thStyle, cursor: 'default' }}>Centroid (x, y)</th>
-              <th style={thStyle} onClick={() => handleHeaderClick('perimeter')}>Perimeter{sortArrow('perimeter')}</th>
-              <th style={thStyle} onClick={() => handleHeaderClick('circularity')}>Circularity{sortArrow('circularity')}</th>
-              <th style={{ ...thStyle, cursor: 'default' }}>Score</th>
+      {/* Table scrolls with .viewer-results only — no inner overflow (avoids nested scrollbars) */}
+      <table className="detections-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
+        <thead>
+          <tr>
+            <th style={thStyle} onClick={() => handleHeaderClick('id')}>ID{sortArrow('id')}</th>
+            <th style={thStyle} onClick={() => handleHeaderClick('area')}>Area (px²){sortArrow('area')}</th>
+            <th style={{ ...thStyle, cursor: 'default' }}>Centroid (x, y)</th>
+            <th style={thStyle} onClick={() => handleHeaderClick('perimeter')}>Perimeter{sortArrow('perimeter')}</th>
+            <th style={thStyle} onClick={() => handleHeaderClick('circularity')}>Circularity{sortArrow('circularity')}</th>
+            <th style={{ ...thStyle, cursor: 'default' }}>Score</th>
+          </tr>
+        </thead>
+        <tbody>
+          {filtered.map(({ d, origIdx }) => (
+            <tr
+              key={d.id}
+              onClick={() => onRowClick(origIdx)}
+              className={selectedIdx === origIdx ? 'selected' : ''}
+              style={{ cursor: 'pointer' }}
+            >
+              <td style={{ padding: '4px 8px', textAlign: 'center' }}>{d.id}</td>
+              <td style={{ padding: '4px 8px', textAlign: 'right' }}>{d.area.toFixed(1)}</td>
+              <td style={{ padding: '4px 8px', textAlign: 'center' }}>({d.centroid[0].toFixed(1)}, {d.centroid[1].toFixed(1)})</td>
+              <td style={{ padding: '4px 8px', textAlign: 'right' }}>{d.perimeter != null ? d.perimeter.toFixed(1) : '—'}</td>
+              <td style={{ padding: '4px 8px', textAlign: 'right' }}>{d.circularity != null ? d.circularity.toFixed(3) : '—'}</td>
+              <td style={{ padding: '4px 8px', textAlign: 'right' }}>{d.score !== undefined ? d.score.toFixed(3) : 'N/A'}</td>
             </tr>
-          </thead>
-          <tbody>
-            {filtered.map(({ d, origIdx }) => (
-              <tr
-                key={d.id}
-                onClick={() => onRowClick(origIdx)}
-                className={selectedIdx === origIdx ? 'selected' : ''}
-                style={{ cursor: 'pointer' }}
-              >
-                <td style={{ padding: '4px 8px', textAlign: 'center' }}>{d.id}</td>
-                <td style={{ padding: '4px 8px', textAlign: 'right' }}>{d.area.toFixed(1)}</td>
-                <td style={{ padding: '4px 8px', textAlign: 'center' }}>({d.centroid[0].toFixed(1)}, {d.centroid[1].toFixed(1)})</td>
-                <td style={{ padding: '4px 8px', textAlign: 'right' }}>{d.perimeter != null ? d.perimeter.toFixed(1) : '—'}</td>
-                <td style={{ padding: '4px 8px', textAlign: 'right' }}>{d.circularity != null ? d.circularity.toFixed(3) : '—'}</td>
-                <td style={{ padding: '4px 8px', textAlign: 'right' }}>{d.score !== undefined ? d.score.toFixed(3) : 'N/A'}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 });
@@ -1296,6 +1298,12 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
     const vp = viewportRef.current;
     const img = imageRef.current;
     if (!vp || !img) return;
+    const vpBounds = vp.getBoundingClientRect();
+    const vpH = vpBounds.height;
+    if (vpH <= 0 || vpH < 50) {
+      console.log(`[FIT SKIPPED] viewport height too small: ${vpH}`);
+      return;
+    }
     const iw = img.naturalWidth || img.width;
     const ih = img.naturalHeight || img.height;
     if (iw <= 0 || ih <= 0) return;
@@ -1308,7 +1316,6 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
     const scale = Math.min(visibleW / iw, visibleH / ih) * 0.95;
     const offsetX = originX + (visibleW - iw * scale) / 2;
     const offsetY = originY + (visibleH - ih * scale) / 2;
-    const vpRect = vp.getBoundingClientRect();
     // TEMP debug — remove after diagnosing centering / scroll issues
     console.log('[fitToViewport] getVisibleViewportInset (full)', {
       originX: vis.originX,
@@ -1330,14 +1337,15 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
       windowInnerWidth: typeof window !== 'undefined' ? window.innerWidth : null,
       windowInnerHeight: typeof window !== 'undefined' ? window.innerHeight : null,
       viewportRect: {
-        top: vpRect.top,
-        left: vpRect.left,
-        right: vpRect.right,
-        bottom: vpRect.bottom,
-        width: vpRect.width,
-        height: vpRect.height,
+        top: vpBounds.top,
+        left: vpBounds.left,
+        right: vpBounds.right,
+        bottom: vpBounds.bottom,
+        width: vpBounds.width,
+        height: vpBounds.height,
       },
     });
+    console.log('[FIT APPLIED]', { scale, offsetX, offsetY });
     setZoomState({ scale, offsetX, offsetY });
   }, []);
 
@@ -1597,6 +1605,7 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
 
   // Draw canvas with image, prompts, and masks
   const drawCanvas = useCallback(() => {
+    console.log('[ZOOM STATE]', zoomState);
     const canvas = canvasRef.current;
     if (!canvas || !imageRef.current) return;
 
@@ -1611,7 +1620,17 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     // Draw image
+    console.log('[BEFORE DRAW]', 'about to draw image');
     ctx.drawImage(img, 0, 0);
+    console.log('[AFTER DRAW]', 'image drawn');
+    console.log('[DRAW IMAGE]', {
+      imgComplete: img.complete,
+      imgWidth: img.width,
+      imgHeight: img.height,
+      canvasWidth: canvas.width,
+      canvasHeight: canvas.height,
+      ctxExists: !!ctx,
+    });
 
     // Guide from reference (C0) overlay for non-reference channels.
     if (showGuideFromRef && state.selectedChannel !== 'C0' && guideRefPoints.length > 0) {
@@ -1663,11 +1682,16 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
               : 'rgb(255, 0, 0)';
 
             offCtx.fillStyle = fillColor;
+            // Overlay always follows discrete ann.points so eraser holes match state. brushDabs is
+            // kept for bookkeeping / persistence but does not define the raster preview.
+            // One beginPath + fill per group: boolean union so overlaps do not darken via AA fringe.
+            offCtx.beginPath();
             ann.points.forEach(([x, y]) => {
-              offCtx.beginPath();
-              offCtx.arc(x, y, 2, 0, Math.PI * 2);
-              offCtx.fill();
+              const pr = 2;
+              offCtx.moveTo(x + pr, y);
+              offCtx.arc(x, y, pr, 0, Math.PI * 2);
             });
+            offCtx.fill();
           });
 
           ctx.save();
@@ -1676,7 +1700,7 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
           ctx.restore();
         }
       }
-      
+
       // Draw brush preview (semi-transparent circle following cursor)
       if (state.brushPreview.x !== null && state.brushPreview.y !== null) {
         ctx.save();
@@ -1730,7 +1754,6 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
     }
 
     // Draw detections: use masks if available, otherwise use bboxes
-    console.log('[FILTER DEBUG] showFilteredOnly=', showFilteredOnly, 'applyNonce=', filterApplyNonce, 'appliedFilterIds.size=', filteredDetectionIndexSet.size, 'totalDetections=', state.detections.length);
     // Render one group of detections (by original index) in a single color.
     // Handles both mask path and bbox fallback; works regardless of showMaskOutlines.
     const drawDetectionGroup = (indices: number[], color: string) => {
@@ -2019,7 +2042,8 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
         }
       }
     }
-  }, [state.boxPrompt, state.pointPrompts, state.masks, state.maskOpacity, state.showMaskOutlines, state.detections, state.annotations, state.probabilityMap, state.showConfidenceMap, state.detectionMethod, state.calibrationMode, state.debugLogs, state.brushPreview, state.brushSize, state.annotationMode, state.showGroundTruth, state.groundTruthPoints, state.groundTruthPixelSizeUm, state.gtImageWidth, state.gtImageHeight, state.rawGtSampleUm, state.gtDebugMode, state.gtSwapXY, state.gtYFlip, state.gtOffsetX, state.gtOffsetY, zoomState, showFilteredOnly, filteredDetectionIndices, filteredOutIndices, filterApplyNonce, showGuideFromRef, guideRefPoints, state.selectedChannel]);
+    console.log('[DRAW COMPLETE]');
+  }, [state.boxPrompt, state.pointPrompts, state.masks, state.maskOpacity, state.showMaskOutlines, state.detections, state.annotations, state.clickHistory, state.probabilityMap, state.showConfidenceMap, state.detectionMethod, state.calibrationMode, state.debugLogs, state.brushPreview, state.brushSize, state.annotationMode, state.showGroundTruth, state.groundTruthPoints, state.groundTruthPixelSizeUm, state.gtImageWidth, state.gtImageHeight, state.rawGtSampleUm, state.gtDebugMode, state.gtSwapXY, state.gtYFlip, state.gtOffsetX, state.gtOffsetY, zoomState, showFilteredOnly, filteredDetectionIndices, filteredOutIndices, filterApplyNonce, detectionBatchId, showGuideFromRef, guideRefPoints, state.selectedChannel]);
 
   // Helper: HSL to RGB
   const hslToRgb = (h: number, s: number, l: number): [number, number, number] => {
@@ -2044,8 +2068,8 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
     return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
   };
 
-  // Redraw canvas when state changes
-  useEffect(() => {
+  // Redraw canvas when drawCanvas updates (layout effect: run before paint so image/masks are visible immediately).
+  useLayoutEffect(() => {
     drawCanvas();
   }, [drawCanvas]);
 
@@ -2439,6 +2463,7 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
   // Add brush point with radius (Random Forest)
   const addBrushPoint = useCallback((x: number, y: number, label: number, annotationId?: string) => {
     const radius = state.brushSize;
+    const dab = { x, y, radius };
     const points: Array<[number, number]> = [];
     
     // Generate points in a circle
@@ -2459,9 +2484,11 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
         const existingIndex = prev.annotations.findIndex(ann => ann.id === annotationId);
         if (existingIndex >= 0) {
           const updated = [...prev.annotations];
+          const prevDabs = updated[existingIndex].brushDabs ?? [];
           updated[existingIndex] = {
             ...updated[existingIndex],
             points: [...updated[existingIndex].points, ...points],
+            brushDabs: [...prevDabs, dab],
           };
           return { ...prev, annotations: updated };
         }
@@ -2471,7 +2498,7 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
       const newId = annotationId || `ann_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
       return {
         ...prev,
-        annotations: [...prev.annotations, { id: newId, points, label }],
+        annotations: [...prev.annotations, { id: newId, points, label, brushDabs: [dab] }],
       };
     });
     
@@ -2492,8 +2519,33 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
             return dx * dx + dy * dy > r2;
           }),
         }))
+        .map((ann) => {
+          const dabs = ann.brushDabs;
+          if (!dabs || dabs.length === 0) return ann;
+          const nextDabs = dabs.filter((dab) => {
+            const dr2 = dab.radius * dab.radius;
+            return ann.points.some(([px, py]) => {
+              const dx = px - dab.x;
+              const dy = py - dab.y;
+              return dx * dx + dy * dy <= dr2;
+            });
+          });
+          return { ...ann, brushDabs: nextDabs.length > 0 ? nextDabs : undefined };
+        })
         .filter(ann => ann.points.length > 0);
-      return { ...prev, annotations: nextAnnotations };
+
+      // No annotations left → wipe all click history (including entries without annotationId).
+      const nextClickHistory =
+        nextAnnotations.length === 0
+          ? []
+          : (() => {
+              const ids = new Set(nextAnnotations.map((a) => a.id));
+              return prev.clickHistory.filter(
+                (c) => !c.annotationId || ids.has(c.annotationId),
+              );
+            })();
+
+      return { ...prev, annotations: nextAnnotations, clickHistory: nextClickHistory };
     });
     drawCanvas();
   }, [state.brushSize, drawCanvas]);
@@ -2912,7 +2964,6 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
         rfModelStatus: `Loaded model from ${state.selectedRfModelSourcePosition} and segmented ${state.selectedPosition}`,
         rfModelWarning: data.model_warning || data.data._model_warning || null,
       }));
-      drawCanvas();
     } catch (err: any) {
       setState(prev => ({
         ...prev,
@@ -3066,8 +3117,7 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
         isDetecting: false,
       }));
 
-      console.log('[ExosomeDetection] State updated, drawing canvas...');
-      drawCanvas();
+      console.log('[ExosomeDetection] State updated (canvas redraw via useEffect when drawCanvas deps change)');
     } catch (err: any) {
       console.error('Segmentation failed:', err);
       alert('Segmentation failed: ' + err.message);
@@ -3441,7 +3491,7 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
                 Shortcuts: <b>[</b> / <b>]</b> brush size, <b>E</b> eraser toggle, or Shift + Mouse Wheel
               </small>
             </div>
-            <button onClick={() => setState(prev => ({ ...prev, annotations: [] }))}>
+            <button onClick={() => setState(prev => ({ ...prev, annotations: [], clickHistory: [] }))}>
               Clear Annotations
             </button>
             <small style={{color: '#666', display: 'block', marginTop: '0.5rem'}}>
@@ -3700,8 +3750,9 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
           </div>
         </div>
 
-        {/* CENTER: Image Viewer */}
-        <div className="exosome-viewer">
+        {/* CENTER: column = viewer+canvas (grows) + optional results (capped scroll); not inside .exosome-viewer flex stack */}
+        <div className="exosome-center-column">
+          <div className="exosome-viewer">
           <div className="viewer-controls">
             {/* ── Exosome-Detection Display Mode (does NOT affect detection) ── */}
             <div style={{
@@ -4029,8 +4080,9 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
               <div className="placeholder">Load an image to start detection</div>
             )}
           </div>
+        </div>
 
-          {/* Results Section: Summary + Histogram + Table (below image) */}
+          {/* Results Section: Summary + Histogram + Table (below image, outside .exosome-viewer flex stack) */}
           {state.detections.length > 0 && summaryStats && (
             <div className="viewer-results">
               {/* Summary Cards Row */}

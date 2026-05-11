@@ -12,6 +12,17 @@ import ExosomeDetection, { type ExosomeDetectionImperativeHandle } from './compo
 import DataAnalysis from './components/DataAnalysis';
 import './styles/App.css';
 
+type TabId = 'agent' | 'processing' | 'alignment' | 'exosome' | 'dataAnalysis' | 'viewer';
+
+/** Stable DOM hooks: ids + data-tab / data-active for CSS [data-tab='…'] and DevTools queries. */
+function tabPanelProps(tab: TabId, activeTab: TabId) {
+  return {
+    id: `tab-panel-${tab}`,
+    'data-tab': tab,
+    'data-active': activeTab === tab ? 'true' : 'false',
+  } as const;
+}
+
 const App: React.FC = () => {
   // In Electron, receive the backend port from the main process and update
   // the shared API base so all components use the correct absolute URL.
@@ -23,9 +34,7 @@ const App: React.FC = () => {
     });
   }, []);
 
-  const [activeTab, setActiveTab] = useState<
-    'agent' | 'processing' | 'alignment' | 'exosome' | 'dataAnalysis' | 'viewer'
-  >('agent');
+  const [activeTab, setActiveTab] = useState<TabId>('agent');
 
   const exosomeDetectionRef = useRef<ExosomeDetectionImperativeHandle>(null);
 
@@ -81,57 +90,33 @@ const App: React.FC = () => {
 
       {/* All tabs are always mounted (hidden via CSS) to preserve state across tab switches */}
 
-      <div
-        className="tab-content"
-        data-tab="agent"
-        data-active={activeTab === 'agent' ? 'true' : 'false'}
-      >
+      <div className="tab-content" {...tabPanelProps('agent', activeTab)}>
         <AgentChat />
       </div>
 
-      <div
-        className="tab-content"
-        data-tab="processing"
-        data-active={activeTab === 'processing' ? 'true' : 'false'}
-      >
+      <div className="tab-content" {...tabPanelProps('processing', activeTab)}>
         <React.Suspense fallback={<div>Loading Image Processing...</div>}>
           <ImageProcessing isActive={activeTab === 'processing'} />
         </React.Suspense>
       </div>
 
-      <div
-        className="tab-content"
-        data-tab="alignment"
-        data-active={activeTab === 'alignment' ? 'true' : 'false'}
-      >
+      <div className="tab-content" {...tabPanelProps('alignment', activeTab)}>
         <React.Suspense fallback={<div>Loading Alignment...</div>}>
           <Alignment isActive={activeTab === 'alignment'} />
         </React.Suspense>
       </div>
 
-      <div
-        className="tab-content"
-        data-tab="exosome"
-        data-active={activeTab === 'exosome' ? 'true' : 'false'}
-      >
+      <div className="tab-content" {...tabPanelProps('exosome', activeTab)}>
         <React.Suspense fallback={<div>Loading Exosome Detection...</div>}>
           <ExosomeDetection ref={exosomeDetectionRef} isActive={activeTab === 'exosome'} />
         </React.Suspense>
       </div>
 
-      <div
-        className="tab-content"
-        data-tab="viewer"
-        data-active={activeTab === 'viewer' ? 'true' : 'false'}
-      >
+      <div className="tab-content" {...tabPanelProps('viewer', activeTab)}>
         <AlignmentViewer />
       </div>
 
-      <div
-        className="tab-content"
-        data-tab="dataAnalysis"
-        data-active={activeTab === 'dataAnalysis' ? 'true' : 'false'}
-      >
+      <div className="tab-content" {...tabPanelProps('dataAnalysis', activeTab)}>
         <DataAnalysis />
       </div>
     </div>
