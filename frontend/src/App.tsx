@@ -77,7 +77,7 @@ const App: React.FC = () => {
 
       <div className="tab-content" style={{ display: activeTab === 'processing' ? 'block' : 'none' }}>
         <React.Suspense fallback={<div>Loading Image Processing...</div>}>
-          <ImageProcessing />
+          <ImageProcessing isActive={activeTab === 'processing'} />
         </React.Suspense>
       </div>
 
@@ -89,7 +89,7 @@ const App: React.FC = () => {
 
       <div className="tab-content" style={{ display: activeTab === 'exosome' ? 'block' : 'none' }}>
         <React.Suspense fallback={<div>Loading Exosome Detection...</div>}>
-          <ExosomeDetection />
+          <ExosomeDetection isActive={activeTab === 'exosome'} />
         </React.Suspense>
       </div>
 

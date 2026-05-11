@@ -163,7 +163,7 @@ interface ExosomeDetectionState {
     label: number 
   }>; // label: 1=exosome, 0=background
   brushSize: number;
-  annotationMode: 'exosome' | 'background'; // Current annotation mode
+  annotationMode: 'exosome' | 'background' | 'eraser'; // Current annotation mode (E toggles eraser)
   
   // Pixel Inspector
   pixelInspector: {
@@ -768,7 +768,7 @@ async function fetchChannelDisplay(
 
 // ---------------------------------------------------------------------------
 
-const ExosomeDetection: React.FC = () => {
+const ExosomeDetection: React.FC<{ isActive?: boolean }> = ({ isActive = true }) => {
   const [state, setState] = useState<ExosomeDetectionState>({
     selectedSample: '',
     selectedPosition: '',
@@ -897,6 +897,39 @@ const ExosomeDetection: React.FC = () => {
   const [saveFilterMessage, setSaveFilterMessage] = useState<string>('');
   const isPanningRef = useRef<boolean>(false);
   const panStartRef = useRef<{ x: number; y: number } | null>(null);
+
+  const exosomeDiskTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const exosomeDiskPendingRef = useRef<Record<string, string>>({});
+  const selectedSampleRef = useRef(state.selectedSample);
+  selectedSampleRef.current = state.selectedSample;
+
+  const scheduleExosomeKeysToDisk = (kv: Record<string, string>) => {
+    Object.assign(exosomeDiskPendingRef.current, kv);
+    if (exosomeDiskTimerRef.current) window.clearTimeout(exosomeDiskTimerRef.current);
+    exosomeDiskTimerRef.current = window.setTimeout(() => {
+      exosomeDiskTimerRef.current = null;
+      const sample = selectedSampleRef.current;
+      const merged = { ...exosomeDiskPendingRef.current };
+      exosomeDiskPendingRef.current = {};
+      if (sample && Object.keys(merged).length) {
+        void storage.mergeExosomeStorageKeysOnDisk(sample, merged);
+      }
+    }, 500);
+  };
+
+  useEffect(() => () => {
+    if (exosomeDiskTimerRef.current) window.clearTimeout(exosomeDiskTimerRef.current);
+  }, []);
+
+  useEffect(() => {
+    if (!state.selectedSample || !state.selectedPosition) return;
+    void storage.saveUiTabSlice(state.selectedSample, 'exosome', {
+      position: state.selectedPosition,
+      channel: state.selectedChannel || undefined,
+      lastActiveTab: isActive ? 'exosome' : undefined,
+    });
+  }, [isActive, state.selectedSample, state.selectedPosition, state.selectedChannel]);
+
   const filteredDetectionIndexSet = useMemo(() => new Set(filteredDetectionIndices), [filteredDetectionIndices]);
   const annotationLabelById = useMemo(() => {
     const map = new Map<string, number>();
@@ -941,15 +974,14 @@ const ExosomeDetection: React.FC = () => {
         .map((i) => state.detections[i]?.id)
         .filter((id): id is number => typeof id === 'number' && Number.isFinite(id));
 
-      await storage.set(
-        storageKey,
-        JSON.stringify({
-          enabled: true,
-          objectIds,
-          totalDetections: state.detections.length,
-          savedAt: Date.now(),
-        }),
-      );
+      const filterPayload = JSON.stringify({
+        enabled: true,
+        objectIds,
+        totalDetections: state.detections.length,
+        savedAt: Date.now(),
+      });
+      await storage.set(storageKey, filterPayload);
+      void storage.mergeExosomeStorageKeysOnDisk(sample, { [storageKey]: filterPayload });
 
       // Investigation logs (remove after debugging)
       try {
@@ -1130,7 +1162,29 @@ const ExosomeDetection: React.FC = () => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Fetch positions when sample changes; auto-select default
+  // Restore sea-storage keys from sample-local exosome_state.json when sample changes
+  useEffect(() => {
+    if (!state.selectedSample) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const disk = await storage.loadStateFromDisk(state.selectedSample, true);
+        if (cancelled) return;
+        const ex = disk.exosome as { storage?: Record<string, string> } | undefined;
+        if (!ex?.storage) return;
+        for (const [k, v] of Object.entries(ex.storage)) {
+          if (typeof v !== 'string' || !v.length) continue;
+          if (!k.startsWith(`sea_`)) continue;
+          await storage.set(k, v);
+        }
+      } catch {
+        /* ignore */
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [state.selectedSample]);
+
+  // Fetch positions when sample changes; auto-select default (prefer .sea_state/ui)
   useEffect(() => {
     if (!state.selectedSample) {
       setState(prev => ({
@@ -1144,29 +1198,64 @@ const ExosomeDetection: React.FC = () => {
       return;
     }
 
+    let cancelled = false;
     const fetchPositions = async () => {
       try {
         const response = await fetch(
           `${getApiBase()}/api/input/samples/${state.selectedSample}/positions`
         );
         const data = await response.json();
-        if (data.success) {
-          setState(prev => {
-            const next = { ...prev, availablePositions: data.data };
-            if (!prev.selectedPosition && data.data.includes('P1')) {
-              next.selectedPosition = 'P1';
-              if (prev.selectedSample === 'A2780Cis10' && !autoLoadFiredRef.current)
-                setPendingAutoLoad(true);
-            }
-            return next;
-          });
-        }
+        if (!data.success || cancelled) return;
+        const positions: string[] = data.data;
+        const disk = await storage.loadStateFromDisk(state.selectedSample);
+        if (cancelled) return;
+        const ui = disk.ui as { exosome?: { position?: string; channel?: string } } | undefined;
+        const wantPos = ui?.exosome?.position;
+        setState(prev => {
+          const next = { ...prev, availablePositions: positions };
+          let sp = prev.selectedPosition;
+          if (!sp || !positions.includes(sp)) {
+            if (wantPos && positions.includes(wantPos)) sp = wantPos;
+            else if (positions.includes('P1')) sp = 'P1';
+            else sp = positions[0] || '';
+          }
+          next.selectedPosition = sp;
+          if (
+            !prev.selectedPosition &&
+            positions.includes('P1') &&
+            sp === 'P1' &&
+            prev.selectedSample === 'A2780Cis10' &&
+            !autoLoadFiredRef.current
+          ) {
+            setPendingAutoLoad(true);
+          }
+          return next;
+        });
       } catch (err) {
         console.error('Failed to fetch positions:', err);
       }
     };
-    fetchPositions();
+    void fetchPositions();
+    return () => { cancelled = true; };
   }, [state.selectedSample]);
+
+  /** Fit the loaded image in the viewport with a small margin (0.95). */
+  const fitToViewport = useCallback(() => {
+    const vp = viewportRef.current;
+    const img = imageRef.current;
+    if (!vp || !img) return;
+    const iw = img.naturalWidth || img.width;
+    const ih = img.naturalHeight || img.height;
+    if (iw <= 0 || ih <= 0) return;
+    const rect = vp.getBoundingClientRect();
+    const viewportWidth = rect.width;
+    const viewportHeight = rect.height;
+    if (viewportWidth <= 0 || viewportHeight <= 0) return;
+    const scale = Math.min(viewportWidth / iw, viewportHeight / ih) * 0.95;
+    const offsetX = (viewportWidth - iw * scale) / 2;
+    const offsetY = (viewportHeight - ih * scale) / 2;
+    setZoomState({ scale, offsetX, offsetY });
+  }, []);
 
   // Load position and get channel info
   const handleLoadPosition = async () => {
@@ -1194,12 +1283,19 @@ const ExosomeDetection: React.FC = () => {
       const items: ChannelItem[] = data.data.items || [];
       const firstItem = items[0];
       const d = data.data;
+
+      let initialChannel = firstItem?.key || '';
+      try {
+        const diskUi = await storage.loadStateFromDisk(state.selectedSample, true);
+        const wantCh = (diskUi.ui as { exosome?: { channel?: string } } | undefined)?.exosome?.channel;
+        if (wantCh && items.some(i => i.key === wantCh)) initialChannel = wantCh;
+      } catch { /* keep default */ }
       
       setDetectionBatchId(b => b + 1);
       setState(prev => ({
         ...prev,
         availableItems: items,
-        selectedChannel: firstItem?.key || '',
+        selectedChannel: initialChannel,
         loaded: items.length > 0,
         currentImageUrl: firstItem?.preview_url || null,
         boxPrompt: null,
@@ -1244,7 +1340,7 @@ const ExosomeDetection: React.FC = () => {
           getApiBase(),
           state.selectedSample,
           state.selectedPosition,
-          firstItem.key,
+          initialChannel || firstItem.key,
           state.displayMode,
           state.displayLut,
           items,
@@ -1261,6 +1357,9 @@ const ExosomeDetection: React.FC = () => {
             }));
             imageRef.current = img;
             drawCanvas();
+            requestAnimationFrame(() => {
+              fitToViewport();
+            });
           };
           const url = result.url.startsWith('http') ? result.url : `${getApiBase()}${result.url}`;
           img.src = url;
@@ -1291,7 +1390,10 @@ const ExosomeDetection: React.FC = () => {
     const { selectedSample, selectedPosition, selectedChannel, detectionMethod, clickHistory, annotations } = state;
     if (!selectedSample || !selectedPosition || !selectedChannel) return;
     const payload = { clickHistory, annotations, savedAt: new Date().toISOString() };
-    void storage.set(clickStorageKey(selectedSample, selectedPosition, selectedChannel, detectionMethod), JSON.stringify(payload));
+    const key = clickStorageKey(selectedSample, selectedPosition, selectedChannel, detectionMethod);
+    const json = JSON.stringify(payload);
+    void storage.set(key, json);
+    scheduleExosomeKeysToDisk({ [key]: json });
   };
 
   const loadClickHistory = () => {
@@ -1317,7 +1419,10 @@ const ExosomeDetection: React.FC = () => {
     const { selectedSample, selectedPosition, selectedChannel, detectionMethod, clickHistory } = state;
     if (!selectedSample || !selectedPosition || !selectedChannel || clickHistory.length === 0) return;
     const payload = { clickHistory, annotations: state.annotations, savedAt: new Date().toISOString() };
-    void storage.set(clickStorageKey(selectedSample, selectedPosition, selectedChannel, detectionMethod), JSON.stringify(payload));
+    const key = clickStorageKey(selectedSample, selectedPosition, selectedChannel, detectionMethod);
+    const json = JSON.stringify(payload);
+    void storage.set(key, json);
+    scheduleExosomeKeysToDisk({ [key]: json });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.clickHistory]);
 
@@ -1366,6 +1471,7 @@ const ExosomeDetection: React.FC = () => {
       img.crossOrigin = 'anonymous';
       img.onload = () => {
         if (cancelled) return;
+        const firstImageInSession = imageRef.current === null;
         setState(prev => ({
           ...prev,
           currentImageUrl: result.url,
@@ -1375,6 +1481,12 @@ const ExosomeDetection: React.FC = () => {
         }));
         imageRef.current = img;
         drawCanvas();
+        // Avoid resetting zoom on channel / display / LUT changes; only fit when no image was shown yet.
+        if (firstImageInSession) {
+          requestAnimationFrame(() => {
+            fitToViewport();
+          });
+        }
       };
       const url = result.url.startsWith('http') ? result.url : `${getApiBase()}${result.url}`;
       img.src = url;
@@ -1464,43 +1576,23 @@ const ExosomeDetection: React.FC = () => {
           ctx.restore();
         }
       }
-
-      // Draw click-history markers with explicit class colors.
-      if (state.clickHistory.length > 0) {
-        const labelById = new Map<string, number>();
-        state.annotations.forEach((ann) => labelById.set(ann.id, ann.label));
-        state.clickHistory.forEach((click) => {
-          let clickType: 'exosome' | 'background' = 'exosome';
-          if (click.clickType) {
-            clickType = click.clickType;
-          } else if (click.annotationId) {
-            const label = labelById.get(click.annotationId);
-            if (label === 0) clickType = 'background';
-            if (label === 1) clickType = 'exosome';
-          } else if ((click.predictedClass || '').toLowerCase() === 'background') {
-            clickType = 'background';
-          }
-
-          ctx.save();
-          ctx.strokeStyle = clickType === 'background' ? '#ff2d2d' : '#00d95f';
-          ctx.lineWidth = 2;
-          ctx.beginPath();
-          ctx.arc(click.imageX, click.imageY, 5, 0, Math.PI * 2);
-          ctx.stroke();
-          ctx.restore();
-        });
-      }
       
-      // Draw brush preview (semi-transparent circle following cursor)
+      // Draw brush preview (semi-transparent circle following cursor; eraser = red outline only)
       if (state.brushPreview.x !== null && state.brushPreview.y !== null) {
-        const previewColor = state.annotationMode === 'exosome' 
-          ? 'rgba(0, 255, 0, 0.4)' 
-          : 'rgba(255, 0, 0, 0.4)';
         ctx.save();
-        ctx.fillStyle = previewColor;
         ctx.beginPath();
         ctx.arc(state.brushPreview.x, state.brushPreview.y, state.brushSize, 0, Math.PI * 2);
-        ctx.fill();
+        if (state.annotationMode === 'eraser') {
+          ctx.strokeStyle = 'rgba(255, 0, 0, 0.95)';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        } else {
+          const previewColor = state.annotationMode === 'exosome'
+            ? 'rgba(0, 255, 0, 0.4)'
+            : 'rgba(255, 0, 0, 0.4)';
+          ctx.fillStyle = previewColor;
+          ctx.fill();
+        }
         ctx.restore();
       }
       
@@ -2060,7 +2152,7 @@ const ExosomeDetection: React.FC = () => {
     
     // Calculate zoom factor (1.1 per step, or 0.9 for zoom out)
     const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
-    const newScale = Math.max(0.5, Math.min(8.0, zoomState.scale * zoomFactor));
+    const newScale = Math.max(0.05, Math.min(8.0, zoomState.scale * zoomFactor));
     
     // Calculate new offset to keep zoom centered on mouse cursor
     // Formula: newOffset = mousePos - (mousePos - oldOffset) * (newScale / oldScale)
@@ -2106,6 +2198,12 @@ const ExosomeDetection: React.FC = () => {
         setState(prev => ({
           ...prev,
           brushSize: Math.min(50, prev.brushSize + 1),
+        }));
+      } else if (e.key === 'e' || e.key === 'E') {
+        e.preventDefault();
+        setState(prev => ({
+          ...prev,
+          annotationMode: prev.annotationMode === 'eraser' ? 'exosome' : 'eraser',
         }));
       }
     };
@@ -2227,13 +2325,9 @@ const ExosomeDetection: React.FC = () => {
     }
   };
   
-  // Reset zoom on double click
+  // Double-click: fit image to viewport
   const handleDoubleClick = () => {
-    setZoomState({
-      scale: 1.0,
-      offsetX: 0,
-      offsetY: 0,
-    });
+    fitToViewport();
   };
 
   // Add brush point with radius (Random Forest)
@@ -2277,6 +2371,26 @@ const ExosomeDetection: React.FC = () => {
     
     drawCanvas();
   }, [state.brushSize, drawCanvas]);
+
+  /** Remove annotation points within brush radius of (cx, cy) from all groups (Random Forest eraser). */
+  const eraseBrushAt = useCallback((cx: number, cy: number) => {
+    const r = state.brushSize;
+    const r2 = r * r;
+    setState(prev => {
+      const nextAnnotations = prev.annotations
+        .map(ann => ({
+          ...ann,
+          points: ann.points.filter(([px, py]) => {
+            const dx = px - cx;
+            const dy = py - cy;
+            return dx * dx + dy * dy > r2;
+          }),
+        }))
+        .filter(ann => ann.points.length > 0);
+      return { ...prev, annotations: nextAnnotations };
+    });
+    drawCanvas();
+  }, [state.brushSize, drawCanvas]);
   
   // Canvas mouse handlers for box/point prompts (SAM only) and brush annotation (Random Forest)
   const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -2287,6 +2401,14 @@ const ExosomeDetection: React.FC = () => {
     const { x, y } = getCanvasCoords(e);
 
     if (state.detectionMethod === 'random_forest') {
+      if (state.annotationMode === 'eraser') {
+        isAnnotatingRef.current = true;
+        currentAnnotationPointsRef.current = [];
+        currentAnnotationIdRef.current = null;
+        eraseBrushAt(x, y);
+        return;
+      }
+
       // Brush annotation mode
       isAnnotatingRef.current = true;
       currentAnnotationPointsRef.current = [];
@@ -2366,11 +2488,17 @@ const ExosomeDetection: React.FC = () => {
     }
     
     if (state.detectionMethod === 'random_forest' && isAnnotatingRef.current) {
-      // Continue brush stroke with the same annotation ID
-      const label = (e.buttons & 1)  // bitwise: left button held (handles left+middle = 5 too)
-        ? (state.annotationMode === 'exosome' ? 1 : 0)
-        : (state.annotationMode === 'exosome' ? 0 : 1);
-      addBrushPoint(x, y, label, currentAnnotationIdRef.current || undefined);
+      if (state.annotationMode === 'eraser') {
+        if (e.buttons & 1 || e.buttons & 2) {
+          eraseBrushAt(x, y);
+        }
+      } else {
+        // Continue brush stroke with the same annotation ID
+        const label = (e.buttons & 1)  // bitwise: left button held (handles left+middle = 5 too)
+          ? (state.annotationMode === 'exosome' ? 1 : 0)
+          : (state.annotationMode === 'exosome' ? 0 : 1);
+        addBrushPoint(x, y, label, currentAnnotationIdRef.current || undefined);
+      }
     } else if (state.detectionMethod === 'sam' && isDrawingRef.current && startPosRef.current) {
       if (state.detectionMode === 'box') {
         setState(prev => ({
@@ -3175,7 +3303,7 @@ const ExosomeDetection: React.FC = () => {
                     type="radio"
                     value="exosome"
                     checked={state.annotationMode === 'exosome'}
-                    onChange={(e) => setState(prev => ({ ...prev, annotationMode: e.target.value as 'exosome' | 'background' }))}
+                    onChange={(e) => setState(prev => ({ ...prev, annotationMode: e.target.value as 'exosome' | 'background' | 'eraser' }))}
                   />
                   Exosome (Left Click)
                 </label>
@@ -3184,7 +3312,7 @@ const ExosomeDetection: React.FC = () => {
                     type="radio"
                     value="background"
                     checked={state.annotationMode === 'background'}
-                    onChange={(e) => setState(prev => ({ ...prev, annotationMode: e.target.value as 'exosome' | 'background' }))}
+                    onChange={(e) => setState(prev => ({ ...prev, annotationMode: e.target.value as 'exosome' | 'background' | 'eraser' }))}
                   />
                   Background (Right Click)
                 </label>
@@ -3203,7 +3331,7 @@ const ExosomeDetection: React.FC = () => {
                 onChange={(value) => setState(prev => ({ ...prev, brushSize: Math.round(value) }))}
               />
               <small style={{color: '#666', display: 'block', marginTop: '0.25rem'}}>
-                Shortcuts: <b>[</b> / <b>]</b> keys or Shift + Mouse Wheel
+                Shortcuts: <b>[</b> / <b>]</b> brush size, <b>E</b> eraser toggle, or Shift + Mouse Wheel
               </small>
             </div>
             <button onClick={() => setState(prev => ({ ...prev, annotations: [] }))}>

@@ -259,7 +259,7 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Fetch positions when sample changes; auto-select default
+  // Fetch positions when sample changes; auto-select default (prefer .sea_state/ui)
   useEffect(() => {
     if (!selectedSample) {
       setAvailablePositions([]);
@@ -268,19 +268,35 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
       setStages({});
       return;
     }
+    let cancelled = false;
     fetch(`${getApiBase()}/api/input/samples/${selectedSample}/positions`)
       .then(r => r.json())
-      .then(d => {
-        if (!d.success) return;
-        setAvailablePositions(d.data);
-        if (!selectedPosition && d.data.includes(DEFAULT_POSITION)) {
-          setSelectedPosition(DEFAULT_POSITION);
-          // Signal that both defaults are ready — auto-load once
-          if (selectedSample === DEFAULT_SAMPLE && !autoLoadFiredRef.current)
+      .then(async d => {
+        if (cancelled || !d.success) return;
+        const positions: string[] = d.data;
+        setAvailablePositions(positions);
+        const disk = await storage.loadStateFromDisk(selectedSample);
+        if (cancelled) return;
+        const ui = disk.ui as { alignment?: { position?: string; channel?: string } } | undefined;
+        const wantPos = ui?.alignment?.position;
+        setSelectedPosition(prev => {
+          let next: string;
+          if (prev && positions.includes(prev)) next = prev;
+          else if (wantPos && positions.includes(wantPos)) next = wantPos;
+          else if (positions.includes(DEFAULT_POSITION)) next = DEFAULT_POSITION;
+          else next = positions[0] || '';
+          if (
+            next === DEFAULT_POSITION &&
+            selectedSample === DEFAULT_SAMPLE &&
+            !autoLoadFiredRef.current
+          ) {
             setPendingAutoLoad(true);
-        }
+          }
+          return next;
+        });
       })
       .catch(console.error);
+    return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedSample]);
 
@@ -306,6 +322,16 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
       })
       .catch(console.error);
   }, [isActive]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Persist last alignment selection + tab to sample-local ui_state.json
+  useEffect(() => {
+    if (!selectedSample || !selectedPosition) return;
+    void storage.saveUiTabSlice(selectedSample, 'alignment', {
+      position: selectedPosition,
+      channel: selectedPreviewChannel || undefined,
+      lastActiveTab: isActive ? 'alignment' : undefined,
+    });
+  }, [isActive, selectedSample, selectedPosition, selectedPreviewChannel]);
 
   // Reset Stage A when relevant inputs change (keep diagonalBoxes — user controls via Reset button)
   useEffect(() => {
@@ -338,6 +364,25 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
   // ─── Persistence helpers ─────────────────────────────────────────────────────
 
   const restoreAlignmentFromStorage = async (sample: string, position: string): Promise<boolean> => {
+    try {
+      const disk = await storage.loadStateFromDisk(sample, true);
+      const al = disk.alignment as { byPosition?: Record<string, AlignmentSnapshot> } | undefined;
+      const fromDisk = al?.byPosition?.[position];
+      if (fromDisk && typeof fromDisk === 'object') {
+        const snap = fromDisk;
+        if (snap.diagonalBoxes) setDiagonalBoxes(snap.diagonalBoxes);
+        if (snap.shiftVectors) setShiftVectors(snap.shiftVectors);
+        if (snap.refChannel) setRefChannel(snap.refChannel);
+        if (snap.selectedChannels) setSelectedChannels(new Set(snap.selectedChannels));
+        if (snap.alignMethod) setAlignMethod(snap.alignMethod as AlignMethod);
+        setSavedAt(snap.savedAt || null);
+        setCropRect(snap.cropRect ?? null);
+        if (snap.tiffExportPreference) setTiffExportPref(snap.tiffExportPreference);
+        return true;
+      }
+    } catch {
+      /* fall through to legacy store */
+    }
     const raw = await storage.get(snapshotKey(sample, position));
     if (!raw) return false;
     try {
@@ -369,6 +414,15 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
     };
     await storage.set(snapshotKey(selectedSample, selectedPosition), JSON.stringify(snap));
     setSavedAt(ts);
+
+    try {
+      const disk = await storage.loadStateFromDisk(selectedSample, true);
+      const prevAlign = (disk.alignment || {}) as { byPosition?: Record<string, AlignmentSnapshot> };
+      const byPosition = { ...(prevAlign.byPosition || {}), [selectedPosition]: snap };
+      void storage.saveStateToDisk(selectedSample, 'alignment', { byPosition });
+    } catch {
+      void storage.saveStateToDisk(selectedSample, 'alignment', { byPosition: { [selectedPosition]: snap } });
+    }
 
     if (!tiffExportPref.autoDownload || alignmentRunId === null) return;
 
@@ -426,6 +480,15 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
   const resetAlignment = () => {
     if (!selectedSample || !selectedPosition) return;
     void storage.remove(snapshotKey(selectedSample, selectedPosition));
+    void (async () => {
+      try {
+        const disk = await storage.loadStateFromDisk(selectedSample, true);
+        const prevAlign = (disk.alignment || {}) as { byPosition?: Record<string, AlignmentSnapshot> };
+        const byPosition = { ...(prevAlign.byPosition || {}) };
+        delete byPosition[selectedPosition];
+        void storage.saveStateToDisk(selectedSample, 'alignment', { byPosition });
+      } catch { /* ignore */ }
+    })();
     const cleared: Record<string, DiagonalBox | null> = {};
     availableItems.forEach(i => { cleared[i.key] = null; });
     setDiagonalBoxes(cleared);
@@ -507,8 +570,14 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
       setAvailableProcessedStages(availableStages);
       setSelectedInputStage(defaultInputStage);
       setLoaded(items.length > 0);
-      setSelectedPreviewChannel(items[0]?.key || '');
-      if (items.length > 0) setRefChannel(items[0].key);
+      let previewCh = items[0]?.key || '';
+      try {
+        const diskUi = await storage.loadStateFromDisk(selectedSample, true);
+        const want = (diskUi.ui as { alignment?: { channel?: string } } | undefined)?.alignment?.channel;
+        if (want && items.some(i => i.key === want)) previewCh = want;
+      } catch { /* keep default */ }
+      setSelectedPreviewChannel(previewCh);
+      if (items.length > 0) setRefChannel(previewCh || items[0].key);
 
       // Reset Stage A/B state
       setFeatureDetected(false);

@@ -44,6 +44,13 @@
       { "from": "../api_agent_chat.py",      "to": "app/api_agent_chat.py"      },
       { "from": "../requirements.txt",       "to": "app/requirements.txt"       },
       { "from": "../pipeline.py",            "to": "app/pipeline.py"            },
+      { "from": "../run_pipeline.py",        "to": "app/run_pipeline.py"        },
+      { "from": "../stage1_loader.py",       "to": "app/stage1_loader.py"       },
+      { "from": "../stage2_visualization.py","to": "app/stage2_visualization.py"},
+      { "from": "../stage3_preprocessing.py","to": "app/stage3_preprocessing.py"},
+      { "from": "../stage4_colocalization.py","to": "app/stage4_colocalization.py"},
+      { "from": "../stage5_dimred_clustering.py","to": "app/stage5_dimred_clustering.py"},
+      { "from": "../stage6_report.py",       "to": "app/stage6_report.py"       },
       { "from": "../frontend/dist",          "to": "app/frontend/dist"          }
     ],
     "win": {

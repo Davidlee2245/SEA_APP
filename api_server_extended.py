@@ -198,6 +198,208 @@ def restore_preprocessing_cache_from_disk(sample_name: str, position_name: str) 
         traceback.print_exc()
         return False
 
+
+# ---------------------------------------------------------------------------
+# Sample-local state: <dataRoot>/input/<sample>/.sea_state/*.json
+# ---------------------------------------------------------------------------
+
+_SEA_STATE_FILES = {
+    'preprocess': 'preprocess_state.json',
+    'alignment': 'alignment_state.json',
+    'exosome': 'exosome_state.json',
+    'ui': 'ui_state.json',
+}
+
+
+def _sanitize_sample_dir_name(sample: str) -> Optional[str]:
+    if not sample or not isinstance(sample, str):
+        return None
+    s = sample.strip()
+    if not s or '..' in s or '/' in s or '\\' in s:
+        return None
+    return s
+
+
+def get_sea_state_path(sample: str, filename: str) -> Path:
+    """
+    Return INPUT_ROOT / <sample> / .sea_state / <filename>, creating .sea_state if needed.
+    """
+    sn = _sanitize_sample_dir_name(sample)
+    if not sn:
+        raise ValueError('Invalid sample name')
+    fn = (filename or '').strip()
+    if not fn or '..' in fn or '/' in fn or '\\' in fn:
+        raise ValueError('Invalid state filename')
+    d = INPUT_ROOT / sn / '.sea_state'
+    d.mkdir(parents=True, exist_ok=True)
+    return d / fn
+
+
+def _sea_state_preprocess_blob_for_position(sample_name: str, position_name: str) -> Optional[dict]:
+    """Read preprocess_state.json; return the subsection for this position (or legacy flat dict)."""
+    sn = _sanitize_sample_dir_name(sample_name)
+    if not sn:
+        return None
+    path = INPUT_ROOT / sn / '.sea_state' / _SEA_STATE_FILES['preprocess']
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding='utf8'))
+    except Exception as e:
+        print(f"[.sea_state] Failed to parse preprocess_state.json: {e}")
+        return None
+    if not isinstance(data, dict):
+        return None
+    positions = data.get('positions')
+    if isinstance(positions, dict) and position_name in positions:
+        sub = positions.get(position_name)
+        return sub if isinstance(sub, dict) else None
+    # Legacy / flat: whole file applies to the active position when no "positions" map
+    if 'positions' not in data:
+        return data
+    return None
+
+
+def _allowed_preprocess_output_path(p: Path, sample_name: str) -> bool:
+    """Only accept paths under this sample's input tree or processing tree."""
+    try:
+        resolved = p.resolve()
+        input_sample = (INPUT_ROOT / sample_name).resolve()
+        processing_sample = (INPUT_ROOT.parent / 'processing' / sample_name).resolve()
+        s_res = str(resolved)
+        return s_res.startswith(str(input_sample)) or s_res.startswith(str(processing_sample))
+    except Exception:
+        return False
+
+
+def merge_sample_local_preprocess_state_into_cache(
+    sample_name: str,
+    position_name: str,
+    position_key: str,
+) -> None:
+    """
+    Merge .sea_state/preprocess_state.json into preprocessing_cache[position_key].
+    Sample-local entries override existing cache (including restore from preprocess_sessions).
+    """
+    blob = _sea_state_preprocess_blob_for_position(sample_name, position_name)
+    if not blob or position_key not in preprocessing_cache:
+        return
+
+    print(f"[.sea_state] Merging preprocess_state for {position_key} (sample-local overrides)")
+
+    # channel_states: { channel: { step: { ... output_path ... } } }
+    cs = blob.get('channel_states')
+    if isinstance(cs, dict):
+        if 'channel_states' not in preprocessing_cache[position_key]:
+            preprocessing_cache[position_key]['channel_states'] = {}
+        for ch_name, steps in cs.items():
+            if not isinstance(steps, dict):
+                continue
+            if ch_name not in preprocessing_cache[position_key]['channel_states']:
+                preprocessing_cache[position_key]['channel_states'][ch_name] = {}
+            for step_name, state in steps.items():
+                if step_name == 'raw':
+                    continue
+                if isinstance(state, dict):
+                    op = state.get('output_path') or state.get('path')
+                    if op:
+                        outp = Path(str(op))
+                        if outp.exists() and _allowed_preprocess_output_path(outp, sample_name):
+                            state = {**state, 'output_path': str(outp)}
+                    preprocessing_cache[position_key]['channel_states'][ch_name][step_name] = state
+                else:
+                    preprocessing_cache[position_key]['channel_states'][ch_name][step_name] = state
+
+    # stage_files: { step_name: { channel_name: path_str } }
+    sf = blob.get('stage_files')
+    if isinstance(sf, dict):
+        for step_name, ch_map in sf.items():
+            if step_name in ('raw', 'channel_states'):
+                continue
+            if not isinstance(ch_map, dict):
+                continue
+            if step_name not in preprocessing_cache[position_key]:
+                preprocessing_cache[position_key][step_name] = {}
+            out_map = preprocessing_cache[position_key][step_name]
+            if not isinstance(out_map, dict):
+                out_map = {}
+                preprocessing_cache[position_key][step_name] = out_map
+            for ch_name, path_str in ch_map.items():
+                if not isinstance(path_str, str):
+                    continue
+                outp = Path(path_str)
+                if outp.exists() and _allowed_preprocess_output_path(outp, sample_name):
+                    out_map[ch_name] = outp
+
+
+def _merge_ui_state_dict(existing: Any, patch: Any) -> dict:
+    """Shallow-merge top-level keys; dict values merge one level deep."""
+    base: dict = {}
+    if isinstance(existing, dict):
+        base = dict(existing)
+    if not isinstance(patch, dict):
+        return base
+    for k, v in patch.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            base[k] = {**base[k], **v}
+        else:
+            base[k] = v
+    return base
+
+
+@app.route('/api/state/<sample>/load', methods=['GET'])
+def load_sample_sea_state(sample):
+    sn = _sanitize_sample_dir_name(sample)
+    if not sn:
+        return jsonify({'success': False, 'error': 'Invalid sample name'}), 400
+    sea_dir = INPUT_ROOT / sn / '.sea_state'
+    out: Dict[str, Any] = {}
+    if not sea_dir.is_dir():
+        return jsonify({'success': True, 'data': out})
+    for key, fname in _SEA_STATE_FILES.items():
+        fp = sea_dir / fname
+        if fp.exists():
+            try:
+                out[key] = json.loads(fp.read_text(encoding='utf8'))
+            except Exception as e:
+                print(f"[.sea_state] Failed to read {fname}: {e}")
+    return jsonify({'success': True, 'data': out})
+
+
+@app.route('/api/state/<sample>/save', methods=['POST'])
+def save_sample_sea_state(sample):
+    sn = _sanitize_sample_dir_name(sample)
+    if not sn:
+        return jsonify({'success': False, 'error': 'Invalid sample name'}), 400
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({'success': False, 'error': 'JSON object body required'}), 400
+
+    try:
+        for key, fname in _SEA_STATE_FILES.items():
+            if key not in body or body[key] is None:
+                continue
+            path = get_sea_state_path(sn, fname)
+            if key == 'ui':
+                existing: Any = {}
+                if path.exists():
+                    try:
+                        existing = json.loads(path.read_text(encoding='utf8'))
+                    except Exception:
+                        existing = {}
+                merged = _merge_ui_state_dict(existing, body[key])
+                path.write_text(json.dumps(merged, indent=2), encoding='utf8')
+                print(f"[.sea_state] Wrote {fname} (ui merge) for sample {sn}")
+            else:
+                path.write_text(json.dumps(body[key], indent=2), encoding='utf8')
+                print(f"[.sea_state] Wrote {fname} for sample {sn}")
+    except ValueError as ve:
+        return jsonify({'success': False, 'error': str(ve)}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+    return jsonify({'success': True})
+
 # Marker mapping cache: {cycle_upper: {channel_upper: marker}}
 # Example: {"C1": {"CH1": "p62", "CH2": "CD63"}, ...}
 marker_map: Dict[str, Dict[str, str]] = {}
@@ -2852,6 +3054,8 @@ def load_position():
 
             preprocessing_cache[position_key] = {'raw': channel_files_dict}
 
+            merge_sample_local_preprocess_state_into_cache(sample_name, position_name, position_key)
+
             return jsonify({
                 'success': True,
                 'data': {
@@ -2969,6 +3173,8 @@ def load_position():
         # Try to restore processed stages from disk
         print(f"[Load Position] Attempting to restore processed stages from disk...")
         restore_preprocessing_cache_from_disk(sample_name, position_name)
+
+        merge_sample_local_preprocess_state_into_cache(sample_name, position_name, position_key)
         
         if position_key in preprocessing_cache:
             cached_stages = [k for k in preprocessing_cache[position_key].keys() if k != 'raw' and k != 'channel_states']

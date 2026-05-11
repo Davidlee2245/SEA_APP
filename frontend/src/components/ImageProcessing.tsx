@@ -9,6 +9,7 @@ import ProgressBar from './ProgressBar';
 import ChannelInfoPanel from './ChannelInfoPanel';
 import '../styles/PipelineControl.css';
 import { getApiBase, getWsBase } from '../lib/apiBase';
+import * as storage from '../lib/storage';
 
 interface PipelineStatus {
   status: 'idle' | 'running' | 'completed' | 'failed' | 'cancelled';
@@ -108,7 +109,7 @@ interface ImageProcessingState {
   isProcessing: boolean;
 }
 
-const ImageProcessing: React.FC = () => {
+const ImageProcessing: React.FC<{ isActive?: boolean }> = ({ isActive = true }) => {
   const [status, setStatus] = useState<PipelineStatus | null>(null);
   
   // Ref to track if we're currently auto-triggering preprocessing (to prevent loops)
@@ -219,7 +220,7 @@ const ImageProcessing: React.FC = () => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Fetch positions when sample changes; auto-select default
+  // Fetch positions when sample changes; auto-select default (prefer .sea_state/ui)
   useEffect(() => {
     if (!processingState.selectedSample) {
       setProcessingState(prev => ({
@@ -232,29 +233,60 @@ const ImageProcessing: React.FC = () => {
       return;
     }
 
+    let cancelled = false;
     const fetchPositions = async () => {
       try {
         const response = await fetch(
           `${getApiBase()}/api/input/samples/${processingState.selectedSample}/positions`
         );
         const data = await response.json();
-        if (data.success) {
-          setProcessingState(prev => {
-            const next = { ...prev, availablePositions: data.data };
-            if (!prev.selectedPosition && data.data.includes('P1')) {
-              next.selectedPosition = 'P1';
-              if (prev.selectedSample === 'A2780Cis10' && !autoLoadFiredRef.current)
-                setPendingAutoLoad(true);
-            }
-            return next;
-          });
-        }
+        if (!data.success || cancelled) return;
+        const positions: string[] = data.data;
+        const disk = await storage.loadStateFromDisk(processingState.selectedSample);
+        if (cancelled) return;
+        const ui = disk.ui as { imageProcessing?: { position?: string; channel?: string } } | undefined;
+        const wantPos = ui?.imageProcessing?.position;
+        setProcessingState(prev => {
+          const next = { ...prev, availablePositions: positions };
+          let sp = prev.selectedPosition;
+          if (!sp || !positions.includes(sp)) {
+            if (wantPos && positions.includes(wantPos)) sp = wantPos;
+            else if (positions.includes('P1')) sp = 'P1';
+            else sp = positions[0] || '';
+          }
+          next.selectedPosition = sp;
+          if (
+            !prev.selectedPosition &&
+            positions.includes('P1') &&
+            sp === 'P1' &&
+            prev.selectedSample === 'A2780Cis10' &&
+            !autoLoadFiredRef.current
+          ) {
+            setPendingAutoLoad(true);
+          }
+          return next;
+        });
       } catch (err) {
         console.error('Failed to fetch positions:', err);
       }
     };
-    fetchPositions();
+    void fetchPositions();
+    return () => { cancelled = true; };
   }, [processingState.selectedSample]);
+
+  useEffect(() => {
+    if (!processingState.selectedSample || !processingState.selectedPosition) return;
+    void storage.saveUiTabSlice(processingState.selectedSample, 'imageProcessing', {
+      position: processingState.selectedPosition,
+      channel: processingState.selectedChannel || undefined,
+      lastActiveTab: isActive ? 'processing' : undefined,
+    });
+  }, [
+    isActive,
+    processingState.selectedSample,
+    processingState.selectedPosition,
+    processingState.selectedChannel,
+  ]);
 
   // Track when we've fetched processed final to prevent loops
   const fetchedProcessedRef = useRef<string>('');
@@ -671,6 +703,13 @@ const ImageProcessing: React.FC = () => {
       const data = await response.json();
       if (data.success) {
         const items: ChannelItem[] = data.data.items || [];
+
+        let initialChannel = items[0]?.key || '';
+        try {
+          const diskUi = await storage.loadStateFromDisk(processingState.selectedSample, true);
+          const wantCh = (diskUi.ui as { imageProcessing?: { channel?: string } } | undefined)?.imageProcessing?.channel;
+          if (wantCh && items.some(i => i.key === wantCh)) initialChannel = wantCh;
+        } catch { /* keep default */ }
         
         const previews: PreviewStage = {};
         items.forEach(item => {
@@ -694,7 +733,7 @@ const ImageProcessing: React.FC = () => {
         setProcessingState(prev => ({
           ...prev,
           availableItems: items,
-          selectedChannel: items[0]?.key || '',
+          selectedChannel: initialChannel,
           loaded: items.length > 0,
           stages: { raw: previews },
           currentStage: 'processed',  // Default to processed (will show raw if no processing done)
