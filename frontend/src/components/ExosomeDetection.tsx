@@ -976,9 +976,7 @@ async function fetchPreprocessFinalMeta(
 }
 
 /**
- * Fetch the display-mode-correct preview URL for a channel.
- * - enhanced + gray + no processed TIFF source  → reuse pre-cached preview_url from items (no extra round-trip)
- * - all other combinations  → call /api/exosome/channel_display
+ * Fetch the display-mode-correct preview URL for a channel via /api/exosome/channel_display.
  */
 async function fetchChannelDisplay(
   apiBase: string,
@@ -987,7 +985,6 @@ async function fetchChannelDisplay(
   channel: string,
   displayMode: 'raw_16bit' | 'enhanced' | 'minmax' | 'processed_result',
   lut: string,
-  availableItems: ChannelItem[],
   preprocessFinalStage: string | null,
 ): Promise<{ url: string; normStats: NormStats | null } | null> {
   if (!sample || !position || !channel) return null;
@@ -1000,13 +997,6 @@ async function fetchChannelDisplay(
   /** Processed-stack preview always uses percentile stretch on that TIFF (matches prior "enhanced" behaviour). */
   const modeForApi: 'raw_16bit' | 'enhanced' | 'minmax' =
     displayMode === 'processed_result' ? 'enhanced' : displayMode;
-
-  if (!useProcessedStack && modeForApi === 'enhanced' && lut === 'gray') {
-    const item = availableItems.find((i) => i.key === channel);
-    if (item?.preview_url) {
-      return { url: item.preview_url, normStats: item.norm_stats || null };
-    }
-  }
 
   try {
     const body: Record<string, unknown> = {
@@ -1719,7 +1709,6 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, ExosomeDet
           initialChannel || firstItem.key,
           effectiveDisplayMode,
           state.displayLut,
-          items,
           ipMeta.finalStage,
         );
         if (result) {
@@ -1930,7 +1919,6 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, ExosomeDet
       state.selectedChannel,
       state.displayMode,
       state.displayLut,
-      state.availableItems,
       state.preprocessFinalStage,
     ).then(result => {
       if (cancelled || !result) return;
