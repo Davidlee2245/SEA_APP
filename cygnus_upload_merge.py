@@ -219,7 +219,9 @@ def read_uploaded_table(file_storage: Any, openpyxl_available: bool) -> Tuple[pd
 def merge_cygnus_upload_files(file_storages: List[Any], openpyxl_available: bool) -> pd.DataFrame:
     """
     Load each upload, validate fixed + marker columns, ensure marker signatures match,
-    then concatenate rows with ignore_index=True.
+    then concatenate rows. Row index is reset to a unique 0..N-1 range. If ``object_id``
+    values are duplicated across files (common when merging two exports), they are
+    replaced with a new unique 1..N sequence so downstream ``.reindex`` / joins work.
     """
     if not file_storages:
         raise ValueError("No files provided")
@@ -252,4 +254,7 @@ def merge_cygnus_upload_files(file_storages: List[Any], openpyxl_available: bool
 
     col_order = list(ref_df.columns)
     frames_ordered = [df.loc[:, col_order] for _, df, _, _, _ in parsed]
-    return pd.concat(frames_ordered, ignore_index=True)
+    merged = pd.concat(frames_ordered, ignore_index=True).reset_index(drop=True)
+    if ID_COL in merged.columns and merged[ID_COL].duplicated().any():
+        merged[ID_COL] = list(range(1, len(merged) + 1))
+    return merged

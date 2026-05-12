@@ -7754,15 +7754,22 @@ def _save_rf_model_to_per_position_and_copy_flat(
 
 def _resolve_explicit_rf_model_path(model_path_str: str) -> Tuple[Path, Path]:
     """Validate an absolute model path from the client; return (pkl, metadata) paths."""
-    raw = Path(model_path_str)
+    raw = Path(str(model_path_str).strip()).expanduser()
     if '..' in raw.parts:
         raise ValueError('model_path must not contain ".."')
-    data_root = Path(os.getenv('SEA_DATA_ROOT', 'data/input')).resolve()
-    resolved = raw.resolve()
+    # Use module DATA_ROOT (honours ``--data-root`` / Electron settings), not a fresh read of
+    # SEA_DATA_ROOT alone — otherwise cwd-relative defaults disagree with the running server.
+    data_root = DATA_ROOT.expanduser().resolve()
+    try:
+        resolved = raw.resolve(strict=False)
+    except TypeError:
+        resolved = raw.resolve()
     try:
         resolved.relative_to(data_root)
     except ValueError as exc:
-        raise ValueError('model_path must be under SEA_DATA_ROOT') from exc
+        raise ValueError(
+            'model_path must be under the application input data root (same as DATA_ROOT / SEA_DATA_ROOT)'
+        ) from exc
     parts = resolved.parts
     if 'rf_models' not in parts:
         raise ValueError('model_path must be under an rf_models directory')
@@ -9123,6 +9130,8 @@ if __name__ == '__main__':
     INPUT_ROOT = _data_root / 'input'
     OUTPUT_ROOT = _data_root / 'output'
     DATA_ROOT   = _data_root / 'input'
+    # Keep env aligned with CLI data root so any code reading SEA_DATA_ROOT matches DATA_ROOT.
+    os.environ['SEA_DATA_ROOT'] = str(DATA_ROOT.resolve())
     PREVIEW_CACHE      = _data_root / 'previews'
     PROCESSING_OUTPUT  = _data_root / 'processing'
     LABEL_DIR          = _data_root / 'label'
