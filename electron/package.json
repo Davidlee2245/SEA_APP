@@ -40,6 +40,7 @@
       { "from": "../exosome_detection",      "to": "app/exosome_detection"      },
       { "from": "../config",                 "to": "app/config"                 },
       { "from": "../checkpoints",            "to": "app/checkpoints"            },
+      { "from": "../cygnus_upload_merge.py", "to": "app/cygnus_upload_merge.py" },
       { "from": "../api_server_extended.py", "to": "app/api_server_extended.py" },
       { "from": "../api_agent_chat.py",      "to": "app/api_agent_chat.py"      },
       { "from": "../requirements.txt",       "to": "app/requirements.txt"       },

@@ -191,6 +191,25 @@ function pickDefaultRfModelPath(models: RfModelListEntry[], currentPosition: str
   return pool[0]?.path ?? null;
 }
 
+/** Effective .pkl path for RF inference: explicit selection, else picker default, else flat status path. */
+function resolveRfModelPathForSegmentation(
+  st: RfPersistedStatusPayload | null | undefined,
+  selectedPosition: string,
+  selectedPath: string,
+): string {
+  const trimmed = (selectedPath || '').trim();
+  if (trimmed) return trimmed;
+  if (!st) return '';
+  const models = st.available_models;
+  if (models?.length) {
+    return pickDefaultRfModelPath(models, selectedPosition) || (st.path || '').trim() || '';
+  }
+  if (st.exists && st.path) {
+    return String(st.path).trim();
+  }
+  return '';
+}
+
 /** True when the picker's selected file is listed and trained on a different FOV than the current position. */
 function isSelectedRfModelTrainedOnDifferentPosition(
   models: RfModelListEntry[] | undefined,
@@ -3297,21 +3316,35 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, ExosomeDet
     }
   }, [state.selectedSample, state.selectedChannel]);
 
+  /** Bumps when RF disk status meaningfully changes (not only available_models — flat-only layout has path + empty list). */
   const rfInventoryKey = useMemo(() => {
-    const m = state.rfPersistedStatus?.available_models;
-    if (!m?.length) return '';
-    return m.map((x) => `${x.path}@${x.saved_at || ''}`).join('||');
-  }, [state.rfPersistedStatus?.available_models]);
+    const st = state.rfPersistedStatus;
+    if (!st) return '';
+    const m = st.available_models;
+    const listKey = m?.length ? m.map((x) => `${x.path}@${x.saved_at || ''}`).join('||') : '';
+    const flat = (st.path || '').trim();
+    return `${st.exists ? '1' : '0'}|${flat}|${listKey}`;
+  }, [state.rfPersistedStatus]);
 
   useEffect(() => {
     if (state.detectionMethod !== 'random_forest') return;
-    const models = state.rfPersistedStatus?.available_models;
-    if (!models?.length) {
+    const st = state.rfPersistedStatus;
+    const flatPath = (st?.path || '').trim();
+    const models = st?.available_models;
+
+    if (!st) {
       setState((p) => (p.selectedRfModelPath !== '' ? { ...p, selectedRfModelPath: '' } : p));
       return;
     }
-    const next = pickDefaultRfModelPath(models, state.selectedPosition) || '';
-    setState((p) => ({ ...p, selectedRfModelPath: next }));
+
+    let next = '';
+    if (models?.length) {
+      next = pickDefaultRfModelPath(models, state.selectedPosition) || flatPath || '';
+    } else if (st.exists && flatPath) {
+      next = flatPath;
+    }
+
+    setState((p) => (p.selectedRfModelPath === next ? p : { ...p, selectedRfModelPath: next }));
   }, [state.detectionMethod, state.selectedPosition, rfInventoryKey]);
 
   const handleSaveRfModel = async () => {
@@ -3398,7 +3431,11 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, ExosomeDet
 
     try {
       const sr2 = stateRef.current;
-      const modelPathTrim = (sr2.selectedRfModelPath || '').trim();
+      const modelPathTrim = resolveRfModelPathForSegmentation(
+        sr2.rfPersistedStatus,
+        sr2.selectedPosition,
+        sr2.selectedRfModelPath,
+      );
       const pickerModelOtherPosition = isSelectedRfModelTrainedOnDifferentPosition(
         sr2.rfPersistedStatus?.available_models,
         modelPathTrim,
@@ -3466,6 +3503,9 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, ExosomeDet
           requestBody.apply_morphology = sr2.fillHoles;
           requestBody.n_estimators = 100;
           requestBody.force_retrain = forceRetrain;
+          if (modelPathTrim) {
+            requestBody.model_path = modelPathTrim;
+          }
         }
 
         console.log('[ExosomeDetection] Sending request:', { method: sr2.detectionMethod, ...requestBody });
