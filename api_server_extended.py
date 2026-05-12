@@ -8860,11 +8860,13 @@ def exosome_channel_display():
     align_disp = align_root / f"{channel}_aligned_display.tif"
     align_raw = align_root / f"{channel}_aligned.tif"
     using_ip_result = bool(source_stage and source_stage != 'raw')
+    # Crop workflow stores per-channel slice TIFFs in raw_cache; align mirror may be full-field.
+    skip_align_preference = 'crop' in position.lower()
 
     tiff_path: Optional[Path] = None
-    if using_ip_result and align_disp.is_file():
+    if not skip_align_preference and using_ip_result and align_disp.is_file():
         tiff_path = align_disp
-    elif align_raw.is_file():
+    elif not skip_align_preference and align_raw.is_file():
         tiff_path = align_raw
     else:
         if using_ip_result:

@@ -91,6 +91,8 @@ const ManualDiagonalEditor: React.FC<Props> = ({ imageUrl, box, onBoxChange, cha
   const dragRef = useRef<Drag>({ k: 'none' });
   const boxRef  = useRef(box);
   boxRef.current = box;
+  /** Committed box at the start of a two-click draw; restored on Esc during draw. */
+  const previousBoxRef = useRef<DiagonalBox | null>(null);
 
   // Uniform scale factor: natural → display
   const scale = useCallback(
@@ -290,6 +292,7 @@ const ManualDiagonalEditor: React.FC<Props> = ({ imageUrl, box, onBoxChange, cha
     if (!box) {
       // Draw mode
       if (!drawP1) {
+        previousBoxRef.current = box;
         setDrawP1([ix, iy]);
       } else {
         const p1 = drawP1;
@@ -324,6 +327,7 @@ const ManualDiagonalEditor: React.FC<Props> = ({ imageUrl, box, onBoxChange, cha
 
     } else {
       // Click outside box → reset and start new draw
+      previousBoxRef.current = box;
       onBoxChange(null);
       setDrawP1([ix, iy]);
     }
@@ -362,6 +366,13 @@ const ManualDiagonalEditor: React.FC<Props> = ({ imageUrl, box, onBoxChange, cha
   // ── Keyboard shortcuts ────────────────────────────────────────────────────
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Escape' && drawP1 != null) {
+      e.preventDefault();
+      setDrawP1(null);
+      setHoverPos(null);
+      onBoxChange(previousBoxRef.current);
+      return;
+    }
     if (!box) return;
     const step = e.shiftKey ? 10 : 1;
     if      (e.key === 'ArrowLeft')  { e.preventDefault(); onBoxChange({ ...box, cx: box.cx - step }); }
