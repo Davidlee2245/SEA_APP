@@ -161,12 +161,25 @@ def run_reference_colocalization(
     distance_threshold: float,
     marker_names: Optional[Dict[str, str]] = None,
     label_masks_by_channel: Optional[Dict[str, np.ndarray]] = None,
+    background_intensities: Optional[Dict[str, float]] = None,
+    marker_mean_intensity_by_id: Optional[Dict[str, Dict[int, float]]] = None,
 ) -> Dict[str, Any]:
     """
     Perform reference-centered colocalization analysis.
+
+    ``{ch}_positive`` and ``{ch}_positive_geom`` both reflect geometry only (matched
+    marker count > 0 for overlap / nearest-centroid rules). Background-subtracted
+    intensity is stored in ``{ch}_intensity_bg_subtracted`` for display only and
+    does not change positivity.
+
+    ``{ch}_mean_intensity`` is the mean of matched marker ``mean_intensity`` values
+    from the marker CSV (no background subtraction), or ``None`` when there are no
+    matches or no intensity data.
     """
     marker_names = marker_names or {}
     label_masks_by_channel = label_masks_by_channel or {}
+    background_intensities = background_intensities or {}
+    intensity_map = marker_mean_intensity_by_id or {}
 
     ref_objects = detections_by_channel.get(reference_channel, [])
     if not ref_objects:
@@ -181,10 +194,12 @@ def run_reference_colocalization(
                 "analysis_mode": analysis_mode,
                 "distance_threshold": distance_threshold,
                 "reference_channel": reference_channel,
+                "marker_channels": marker_channels,
             },
             "channel_summary": [],
             "combination_summary": [],
             "overlay": {"positive_reference_ids": []},
+            "background_intensities": {ch: background_intensities.get(ch) for ch in marker_channels},
         }
 
     per_channel_match: Dict[str, Dict[int, Dict[str, Any]]] = {}
@@ -227,16 +242,38 @@ def run_reference_colocalization(
             count = int(m["count"])
             matched_ids = [int(x) for x in m["matched_ids"]]
             nearest_d = m["nearest_distance"]
-            positive = count > 0
+            positive_geom = count > 0
 
-            row[f"{ch}_positive"] = positive
+            ch_bg = background_intensities.get(ch)
+            mean_intensity: Optional[float] = None
+            if matched_ids:
+                id_vals = intensity_map.get(ch) or {}
+                vals = []
+                for mid in matched_ids:
+                    v = id_vals.get(int(mid))
+                    if v is not None and np.isfinite(v):
+                        vals.append(float(v))
+                if vals:
+                    mean_intensity = float(np.mean(vals))
+
+            row[f"{ch}_mean_intensity"] = (
+                round(float(mean_intensity), 6) if mean_intensity is not None else None
+            )
+
+            row[f"{ch}_positive_geom"] = bool(positive_geom)
+            intensity_bg_sub: Optional[float] = None
+            if ch_bg is not None and mean_intensity is not None:
+                intensity_bg_sub = max(0.0, float(mean_intensity) - float(ch_bg))
+                row[f"{ch}_intensity_bg_subtracted"] = round(intensity_bg_sub, 6)
+
+            row[f"{ch}_positive"] = bool(positive_geom)
             row[f"{ch}_count"] = count
             row[f"{ch}_nearest_distance"] = round(float(nearest_d), 3) if nearest_d is not None else None
             row[f"{ch}_matched_ids"] = matched_ids
 
-            if positive:
+            if positive_geom:
                 positive_channels.append(ch)
-            marker_counts_sum += count
+            marker_counts_sum += int(count) if positive_geom else 0
 
         combo = _channel_combo_label(positive_channels)
         row["biomarker_combination_label"] = combo
@@ -304,6 +341,11 @@ def run_reference_colocalization(
         "marker_channels": marker_channels,
     }
 
+    bg_payload: Dict[str, Any] = {}
+    for ch in marker_channels:
+        v = background_intensities.get(ch)
+        bg_payload[ch] = None if v is None else float(v)
+
     return {
         "reference_table": reference_table,
         "summary": summary,
@@ -313,4 +355,5 @@ def run_reference_colocalization(
             "positive_reference_ids": positive_reference_ids,
             "reference_channel": reference_channel,
         },
+        "background_intensities": bg_payload,
     }

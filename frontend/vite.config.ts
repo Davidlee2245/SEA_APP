@@ -7,7 +7,7 @@ export default defineConfig({
   server: {
     port: 3000,
     proxy: {
-      // Long timeouts for endpoints that stream or run heavy work (e.g. Cygnus pipeline).
+      // Long timeouts for endpoints that stream or run heavy work (e.g. data analysis pipeline).
       '/api/cygnus/run': {
         target: 'http://localhost:8765',
         changeOrigin: true,

@@ -1,5 +1,5 @@
 /**
- * Data Analysis — Cygnus pipeline: upload CSV, run via API, view report inline (no iframe).
+ * Data Analysis: upload CSV / Excel, run via API, view report inline (no iframe).
  */
 
 import React, { useRef, useState, useCallback, useEffect } from 'react';
@@ -54,17 +54,15 @@ const DataAnalysis: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const reportMountRef = useRef<HTMLDivElement>(null);
   const [phase, setPhase] = useState<Phase>('idle');
-  const [selectedName, setSelectedName] = useState<string>('');
-  const [file, setFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
   const [reportHtml, setReportHtml] = useState<string>('');
   const [errorMessage, setErrorMessage] = useState<string>('');
   const [validationHint, setValidationHint] = useState<string>('');
 
   const handleFileChange = useCallback(() => {
     const input = fileInputRef.current;
-    const next = input?.files?.[0] ?? null;
-    setFile(next);
-    setSelectedName(next ? next.name : '');
+    const list = input?.files ? Array.from(input.files) : [];
+    setFiles(list);
     setValidationHint('');
     setErrorMessage('');
     if (phase === 'done' || phase === 'error') {
@@ -74,8 +72,10 @@ const DataAnalysis: React.FC = () => {
   }, [phase]);
 
   const runPipeline = useCallback(async () => {
-    if (!file) {
-      setValidationHint('Please select a CSV file first.');
+    const input = fileInputRef.current;
+    const toSend = input?.files?.length ? Array.from(input.files) : files;
+    if (toSend.length === 0) {
+      setValidationHint('Please select at least one CSV or Excel file.');
       return;
     }
     setValidationHint('');
@@ -84,7 +84,9 @@ const DataAnalysis: React.FC = () => {
     setPhase('running');
 
     const formData = new FormData();
-    formData.append('file', file);
+    for (const f of toSend) {
+      formData.append('files', f);
+    }
 
     try {
       const response = await fetch(`${getApiBase()}/api/cygnus/run`, {
@@ -124,7 +126,7 @@ const DataAnalysis: React.FC = () => {
       setErrorMessage(`Network or client error: ${msg}`);
       setPhase('error');
     }
-  }, [file]);
+  }, [files]);
 
   useEffect(() => {
     const root = reportMountRef.current;
@@ -155,29 +157,49 @@ const DataAnalysis: React.FC = () => {
   return (
     <div className="alignment-viewer data-analysis-tab">
       <header className="viewer-header">
-        <h1>Data Analysis — Cygnus Report</h1>
+        <h1>Data Analysis</h1>
         <div className="metadata" style={{ flexWrap: 'wrap', gap: '0.75rem' }}>
-          <div className="input-group">
-            <label htmlFor="cygnus-csv-input">CSV table:</label>
+          <div className="input-group" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: '0.35rem' }}>
+            <label htmlFor="data-analysis-file-input">Tables (CSV / Excel, multiple allowed):</label>
+            <span style={{ color: '#7f8c8d', fontSize: '0.85rem', maxWidth: '42rem' }}>
+              Upload the Results Viewer Excel (Full / three-sheet) or CSV with *_positive and *_score columns. Select
+              multiple files in one go: use <strong>Ctrl</strong> (Windows/Linux) or <strong>Cmd</strong> (macOS) while
+              clicking in the file dialog, or Shift-click for a range. All selected files are merged on the server when
+              you run the pipeline.
+            </span>
             <input
-              id="cygnus-csv-input"
+              id="data-analysis-file-input"
               ref={fileInputRef}
+              name="files"
               type="file"
-              accept=".csv,text/csv"
+              accept=".csv,.xlsx,.xls,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+              multiple={true}
               onChange={handleFileChange}
               disabled={phase === 'running'}
             />
-            {selectedName ? (
-              <span style={{ marginLeft: '0.5rem', color: '#2c3e50', fontWeight: 500 }}>
-                {selectedName}
-              </span>
-            ) : null}
+            {files.length > 0 ? (
+              <ul
+                style={{
+                  margin: '0.25rem 0 0',
+                  paddingLeft: '1.25rem',
+                  color: '#2c3e50',
+                  fontSize: '0.9rem',
+                  maxWidth: '42rem',
+                }}
+              >
+                {files.map((f) => (
+                  <li key={`${f.name}-${f.size}-${f.lastModified}`}>{f.name}</li>
+                ))}
+              </ul>
+            ) : (
+              <span style={{ color: '#7f8c8d', fontSize: '0.9rem' }}>No files selected.</span>
+            )}
           </div>
           <button
             type="button"
             className="step-button active"
             onClick={runPipeline}
-            disabled={phase === 'running'}
+            disabled={phase === 'running' || files.length === 0}
           >
             Run pipeline
           </button>
@@ -191,7 +213,15 @@ const DataAnalysis: React.FC = () => {
       {phase === 'running' ? (
         <div className="alignment-viewer loading" style={{ minHeight: 120 }}>
           <div className="spinner" />
-          <p>Running Cygnus pipeline… This may take several minutes. Do not close this tab.</p>
+          <p>
+            Running analysis pipeline
+            {(() => {
+              const n = fileInputRef.current?.files?.length ?? files.length;
+              return n > 1 ? ` (merging ${n} files)` : '';
+            })()}
+            … This may take several minutes. Do not close
+            this tab.
+          </p>
         </div>
       ) : null}
 

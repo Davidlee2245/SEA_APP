@@ -29,6 +29,7 @@ interface NormStats {
   normalization: string;
   cache_hit?: boolean;
   preview_path?: string;
+  source_stage?: string;
 }
 
 interface ChannelItem {
@@ -55,16 +56,177 @@ interface DetectionResult {
   circularity?: number;
 }
 
-interface SavedRfModelItem {
-  position: string;
-  saved_at?: string | null;
-  trained_on?: {
-    sample?: string;
-    position?: string;
-    channel?: string;
+/** Persist filtered detection object IDs (localStorage + merged sample exosome_state on disk). */
+export async function persistFilterToDisk(
+  sample: string,
+  position: string,
+  channel: string,
+  objectIds: number[],
+  totalDetections: number,
+): Promise<void> {
+  if (!sample || !position || !channel) {
+    throw new Error('sample, position, and channel are required');
+  }
+  const storageKey = `sea_filtered_detections_${sample}_${position}_${channel}`;
+  const filterPayload = JSON.stringify({
+    enabled: true,
+    objectIds,
+    totalDetections,
+    savedAt: Date.now(),
+  });
+  await storage.set(storageKey, filterPayload);
+  void storage.mergeExosomeStorageKeysOnDisk(sample, { [storageKey]: filterPayload });
+}
+
+type ParsedSegmentationPayload = {
+  masks: boolean[][][] | null;
+  scores: number[] | null;
+  detections: DetectionResult[];
+  probabilityMap: number[][] | null;
+  masksOmitted: boolean;
+  warning?: string;
+  confidenceThreshold?: number;
+};
+
+/** Normalize /api/exosome/segment (or latest_segment_result) ``data`` for React state. */
+function parseSegmentationDataPayload(
+  data: any,
+  opts: { includeProbabilityMap: boolean },
+): ParsedSegmentationPayload {
+  const masksOmitted = !!data?._masks_omitted;
+  const warning = typeof data?._warning === 'string' ? data._warning : undefined;
+  const masksRaw = data?.masks || [];
+  const masks: boolean[][][] = masksRaw.map((mask: any) => {
+    if (Array.isArray(mask) && Array.isArray(mask[0])) {
+      return mask as boolean[][];
+    }
+    return mask as boolean[][];
+  });
+  const scoresRaw = data?.scores || [];
+  const scoresList: number[] = scoresRaw.map((s: any) => {
+    if (typeof s === 'number' && Number.isFinite(s)) return s;
+    const v = parseFloat(String(s));
+    return Number.isFinite(v) ? v : 0;
+  });
+
+  const detections: DetectionResult[] = (data?.detections || []).map((d: any, idx: number) => ({
+    id: idx + 1,
+    area: d.area || 0,
+    centroid: d.centroid || [0, 0],
+    bbox: d.bbox || [0, 0, 0, 0],
+    score: idx < scoresList.length ? scoresList[idx] : undefined,
+    perimeter: d.perimeter != null ? d.perimeter : undefined,
+    circularity: d.circularity != null ? d.circularity : undefined,
+  }));
+
+  let probabilityMap: number[][] | null = null;
+  if (opts.includeProbabilityMap && data?.probability_map) {
+    probabilityMap = data.probability_map as number[][];
+  }
+
+  let confidenceThreshold: number | undefined;
+  const rawCt = data?.confidence_threshold;
+  if (typeof rawCt === 'number' && Number.isFinite(rawCt)) {
+    confidenceThreshold = rawCt;
+  } else if (typeof rawCt === 'string' && rawCt.trim() !== '') {
+    const x = parseFloat(rawCt);
+    if (Number.isFinite(x)) confidenceThreshold = x;
+  }
+
+  return {
+    masks: masks.length > 0 ? masks : null,
+    scores: scoresList.length > 0 ? scoresList : null,
+    detections,
+    probabilityMap,
+    masksOmitted,
+    warning,
+    confidenceThreshold,
   };
-  sklearn_version?: string | null;
+}
+
+/** One saved RF model entry (flat, per-position, or legacy). */
+export interface RfModelListEntry {
+  layout: string;
+  position: string;
+  position_slug?: string;
+  channel_stem?: string | null;
+  saved_at?: string;
+  trained_on?: Record<string, unknown>;
+  sklearn_version?: string;
   path: string;
+}
+
+/** Response shape from GET /api/exosome/rf_model/status */
+interface RfPersistedStatusPayload {
+  exists: boolean;
+  channel_stem: string;
+  channel?: string;
+  path?: string;
+  saved_at?: string;
+  trained_on?: Record<string, unknown>;
+  sklearn_version?: string;
+  /** All on-disk models for this sample/channel (for picker). */
+  available_models?: RfModelListEntry[];
+}
+
+function trainedPositionForRfModelEntry(m: RfModelListEntry): string {
+  const t = m.trained_on;
+  if (t && typeof t === 'object' && 'position' in t && typeof (t as { position?: unknown }).position === 'string') {
+    return String((t as { position: string }).position).trim();
+  }
+  return (m.position || '').trim();
+}
+
+function pickDefaultRfModelPath(models: RfModelListEntry[], currentPosition: string): string | null {
+  if (!models.length) return null;
+  const ts = (s?: string) => {
+    if (!s) return 0;
+    const t = Date.parse(s);
+    return Number.isFinite(t) ? t : 0;
+  };
+  const pos = (currentPosition || '').trim();
+  const forPos = models.filter((m) => trainedPositionForRfModelEntry(m) === pos);
+  const pool = forPos.length ? forPos : [...models];
+  pool.sort((a, b) => ts(b.saved_at) - ts(a.saved_at));
+  return pool[0]?.path ?? null;
+}
+
+/** True when the picker's selected file is listed and trained on a different FOV than the current position. */
+function isSelectedRfModelTrainedOnDifferentPosition(
+  models: RfModelListEntry[] | undefined,
+  modelPath: string,
+  currentPosition: string,
+): boolean {
+  const p = (modelPath || '').trim();
+  if (!p || !models?.length) return false;
+  const entry = models.find((m) => m.path === p);
+  if (!entry) return false;
+  const trainedPos = trainedPositionForRfModelEntry(entry);
+  const cur = (currentPosition || '').trim();
+  return trainedPos !== '' && cur !== '' && trainedPos !== cur;
+}
+
+function formatRfModelOptionLabel(m: RfModelListEntry): string {
+  const pos =
+    (m.trained_on &&
+      typeof m.trained_on.position === 'string' &&
+      m.trained_on.position.trim()) ||
+    m.position ||
+    (m.layout === 'flat' ? 'default (flat)' : '—');
+  const raw = m.saved_at;
+  let time = '—';
+  if (raw) {
+    const d = new Date(raw);
+    if (Number.isFinite(d.getTime())) {
+      const y = d.getFullYear();
+      const mo = String(d.getMonth() + 1).padStart(2, '0');
+      const da = String(d.getDate()).padStart(2, '0');
+      const hh = String(d.getHours()).padStart(2, '0');
+      const mm = String(d.getMinutes()).padStart(2, '0');
+      time = `${y}-${mo}-${da} ${hh}:${mm}`;
+    }
+  }
+  return `${pos} (saved ${time})`;
 }
 
 interface GuidePoint {
@@ -123,6 +285,8 @@ interface ExosomeDetectionState {
   availableSamples: string[];
   availablePositions: string[];
   availableItems: ChannelItem[];
+  /** Channel keys with DATA_ROOT align mirror (<sample>/align/<position>/<key>_aligned.tif). */
+  alignArtifactChannels: string[];
   loaded: boolean;
   currentImageUrl: string | null;
   imageWidth: number;
@@ -206,7 +370,9 @@ interface ExosomeDetectionState {
     x: number | null;
     y: number | null;
   };
-  
+  /** When false, SAM prompts and RF brush overlay are not drawn (data unchanged). Cleared on Load Image. */
+  showCanvasUserMarks: boolean;
+
   // Debug logging
   debugLogging: boolean;
   debugLogs: Array<{
@@ -227,8 +393,10 @@ interface ExosomeDetectionState {
   rfModelStatus: string | null;
   rfModelWarning: string | null;
   rfModelSavedPath: string | null;
-  availableRfModels: SavedRfModelItem[];
-  selectedRfModelSourcePosition: string;
+  /** Disk snapshot for current sample+channel (flat + per-position rf_models). */
+  rfPersistedStatus: RfPersistedStatusPayload | null;
+  /** Absolute .pkl path for RF inference when not retraining (from status list). */
+  selectedRfModelPath: string;
 
   // Ground truth overlay
   showGroundTruth: boolean;
@@ -258,8 +426,12 @@ interface ExosomeDetectionState {
   cropPixelSizeSource: string | null; // 'metadata' | 'fallback'
 
   // Exosome-detection-only display mode (does NOT affect detection pipeline)
-  displayMode: 'raw_16bit' | 'enhanced' | 'minmax';
+  displayMode: 'raw_16bit' | 'enhanced' | 'minmax' | 'processed_result';
   displayLut: 'gray' | 'red';
+  /** Last preprocessing output_stage from session (same as Image Processing tab). */
+  preprocessFinalStage: string | null;
+  /** True when pipeline has run past raw (final_stage !== 'raw'). */
+  imageProcessingResultAvailable: boolean;
   // Normalization stats for the CURRENTLY displayed image (updated on every channel/mode change)
   currentNormStats: NormStats | null;
 }
@@ -589,8 +761,10 @@ interface DetectionTableProps {
   onRowClick: (idx: number) => void;
   filterArea: { min: string; max: string };
   filterCirc: { min: string; max: string };
+  filterPerimeter: { min: string; max: string };
   onFilterAreaChange: React.Dispatch<React.SetStateAction<{ min: string; max: string }>>;
   onFilterCircChange: React.Dispatch<React.SetStateAction<{ min: string; max: string }>>;
+  onFilterPerimeterChange: React.Dispatch<React.SetStateAction<{ min: string; max: string }>>;
   onFilteredIndicesChange: (indices: number[]) => void;
   onApplyFilters: () => void;
   onSaveFilter: () => void;
@@ -603,8 +777,10 @@ const DetectionTable: React.FC<DetectionTableProps> = React.memo(({
   onRowClick,
   filterArea,
   filterCirc,
+  filterPerimeter,
   onFilterAreaChange,
   onFilterCircChange,
+  onFilterPerimeterChange,
   onFilteredIndicesChange,
   onApplyFilters,
   onSaveFilter,
@@ -627,6 +803,8 @@ const DetectionTable: React.FC<DetectionTableProps> = React.memo(({
   const filtered = React.useMemo(() => {
     const aMin = filterArea.min !== '' ? parseFloat(filterArea.min) : -Infinity;
     const aMax = filterArea.max !== '' ? parseFloat(filterArea.max) :  Infinity;
+    const pMin = filterPerimeter.min !== '' ? parseFloat(filterPerimeter.min) : -Infinity;
+    const pMax = filterPerimeter.max !== '' ? parseFloat(filterPerimeter.max) :  Infinity;
     const cMin = filterCirc.min !== '' ? parseFloat(filterCirc.min) : -Infinity;
     const cMax = filterCirc.max !== '' ? parseFloat(filterCirc.max) :  Infinity;
 
@@ -634,6 +812,8 @@ const DetectionTable: React.FC<DetectionTableProps> = React.memo(({
       .map((d, origIdx) => ({ d, origIdx }))
       .filter(({ d }) => {
         if (d.area < aMin || d.area > aMax) return false;
+        const p = d.perimeter ?? 0;
+        if (p < pMin || p > pMax) return false;
         const c = d.circularity ?? 0;
         if (c < cMin || c > cMax) return false;
         return true;
@@ -646,7 +826,7 @@ const DetectionTable: React.FC<DetectionTableProps> = React.memo(({
         else if (sortKey === 'circularity') { av = a.d.circularity ?? 0;  bv = b.d.circularity ?? 0; }
         return sortDir === 'asc' ? av - bv : bv - av;
       });
-  }, [detections, sortKey, sortDir, filterArea, filterCirc]);
+  }, [detections, sortKey, sortDir, filterArea, filterPerimeter, filterCirc]);
 
   const applyFilters = () => {
     onFilteredIndicesChange(filtered.map(({ origIdx }) => origIdx));
@@ -654,8 +834,14 @@ const DetectionTable: React.FC<DetectionTableProps> = React.memo(({
   };
 
   const thStyle: React.CSSProperties = {
-    cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap',
-    padding: '6px 8px', background: '#f0f0f0', borderBottom: '2px solid #ccc',
+    cursor: 'pointer',
+    userSelect: 'none',
+    whiteSpace: 'nowrap',
+    padding: '6px 8px',
+    background: '#e8edf3',
+    color: '#0f172a',
+    fontWeight: 600,
+    borderBottom: '2px solid #94a3b8',
   };
   const filterInputStyle: React.CSSProperties = {
     width: '60px', padding: '2px 4px', border: '1px solid #ccc',
@@ -671,6 +857,8 @@ const DetectionTable: React.FC<DetectionTableProps> = React.memo(({
         <span style={{ fontWeight: 600 }}>Filter:</span>
         <label>Area min <input style={filterInputStyle} value={filterArea.min} onChange={e => onFilterAreaChange(p => ({ ...p, min: e.target.value }))} placeholder="—" /></label>
         <label>Area max <input style={filterInputStyle} value={filterArea.max} onChange={e => onFilterAreaChange(p => ({ ...p, max: e.target.value }))} placeholder="—" /></label>
+        <label>Perimeter min <input style={filterInputStyle} value={filterPerimeter.min} onChange={e => onFilterPerimeterChange(p => ({ ...p, min: e.target.value }))} placeholder="—" /></label>
+        <label>Perimeter max <input style={filterInputStyle} value={filterPerimeter.max} onChange={e => onFilterPerimeterChange(p => ({ ...p, max: e.target.value }))} placeholder="—" /></label>
         <label>Circ min <input style={filterInputStyle} value={filterCirc.min} onChange={e => onFilterCircChange(p => ({ ...p, min: e.target.value }))} placeholder="—" /></label>
         <label>Circ max <input style={filterInputStyle} value={filterCirc.max} onChange={e => onFilterCircChange(p => ({ ...p, max: e.target.value }))} placeholder="—" /></label>
         <button style={{ padding: '2px 8px', fontSize: '0.75rem' }} onClick={applyFilters}>Apply</button>
@@ -689,7 +877,16 @@ const DetectionTable: React.FC<DetectionTableProps> = React.memo(({
         >
           💾 Save Filter
         </button>
-        <button style={{ padding: '2px 8px', fontSize: '0.75rem' }} onClick={() => { onFilterAreaChange({ min: '', max: '' }); onFilterCircChange({ min: '', max: '' }); }}>Reset</button>
+        <button
+          style={{ padding: '2px 8px', fontSize: '0.75rem' }}
+          onClick={() => {
+            onFilterAreaChange({ min: '', max: '' });
+            onFilterPerimeterChange({ min: '', max: '' });
+            onFilterCircChange({ min: '', max: '' });
+          }}
+        >
+          Reset
+        </button>
         {!!saveMessage && (
           <span style={{ color: '#2563eb', fontWeight: 600 }}>
             {saveMessage}
@@ -736,34 +933,77 @@ const DetectionTable: React.FC<DetectionTableProps> = React.memo(({
 // ---------------------------------------------------------------------------
 
 /**
+ * Last completed preprocessing stage for (sample, position), from the same endpoint as Image Processing.
+ */
+async function fetchPreprocessFinalMeta(
+  apiBase: string,
+  sample: string,
+  position: string,
+): Promise<{ finalStage: string | null; available: boolean }> {
+  try {
+    const r = await fetch(
+      `${apiBase}/api/input/preprocess/final?sample=${encodeURIComponent(sample)}&position=${encodeURIComponent(position)}`,
+    );
+    const data = await r.json();
+    if (!data.success || !data.data) return { finalStage: null, available: false };
+    const fs = data.data.final_stage;
+    if (typeof fs === 'string' && fs.length > 0 && fs !== 'raw') {
+      return { finalStage: fs, available: true };
+    }
+    return { finalStage: typeof fs === 'string' ? fs : null, available: false };
+  } catch {
+    return { finalStage: null, available: false };
+  }
+}
+
+/**
  * Fetch the display-mode-correct preview URL for a channel.
- * - enhanced + gray  → reuse pre-cached preview_url from items (no extra round-trip)
- * - all other modes  → call /api/exosome/channel_display
+ * - enhanced + gray + no processed TIFF source  → reuse pre-cached preview_url from items (no extra round-trip)
+ * - all other combinations  → call /api/exosome/channel_display
  */
 async function fetchChannelDisplay(
   apiBase: string,
   sample: string,
   position: string,
   channel: string,
-  mode: string,
+  displayMode: 'raw_16bit' | 'enhanced' | 'minmax' | 'processed_result',
   lut: string,
   availableItems: ChannelItem[],
+  preprocessFinalStage: string | null,
 ): Promise<{ url: string; normStats: NormStats | null } | null> {
   if (!sample || !position || !channel) return null;
 
-  // enhanced + gray: the pre-generated preview from load_position is already correct
-  if (mode === 'enhanced' && lut === 'gray') {
-    const item = availableItems.find(i => i.key === channel);
+  const useProcessedStack =
+    displayMode === 'processed_result' &&
+    preprocessFinalStage != null &&
+    preprocessFinalStage !== '' &&
+    preprocessFinalStage !== 'raw';
+  /** Processed-stack preview always uses percentile stretch on that TIFF (matches prior "enhanced" behaviour). */
+  const modeForApi: 'raw_16bit' | 'enhanced' | 'minmax' =
+    displayMode === 'processed_result' ? 'enhanced' : displayMode;
+
+  if (!useProcessedStack && modeForApi === 'enhanced' && lut === 'gray') {
+    const item = availableItems.find((i) => i.key === channel);
     if (item?.preview_url) {
       return { url: item.preview_url, normStats: item.norm_stats || null };
     }
   }
 
   try {
+    const body: Record<string, unknown> = {
+      sample,
+      position,
+      channel,
+      mode: modeForApi,
+      lut,
+    };
+    if (useProcessedStack) {
+      body.source_stage = preprocessFinalStage;
+    }
     const resp = await fetch(`${apiBase}/api/exosome/channel_display`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sample, position, channel, mode, lut }),
+      body: JSON.stringify(body),
     });
     const data = await resp.json();
     if (data.success) {
@@ -816,7 +1056,11 @@ export type ExosomeDetectionImperativeHandle = {
   fitToViewport: () => void;
 };
 
-const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive?: boolean }>(
+type ExosomeDetectionOuterProps = {
+  isActive?: boolean;
+};
+
+const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, ExosomeDetectionOuterProps>(
   function ExosomeDetection({ isActive = true }, ref) {
   const [state, setState] = useState<ExosomeDetectionState>({
     selectedSample: '',
@@ -825,6 +1069,7 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
     availableSamples: [],
     availablePositions: [],
     availableItems: [],
+    alignArtifactChannels: [],
     loaded: false,
     currentImageUrl: null,
     imageWidth: 0,
@@ -876,7 +1121,8 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
     // Click History
     clickHistory: [],
     brushPreview: { x: null, y: null },
-    
+    showCanvasUserMarks: true,
+
     // Debug logging
     debugLogging: false,
     debugLogs: [],
@@ -887,8 +1133,8 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
     rfModelStatus: null,
     rfModelWarning: null,
     rfModelSavedPath: null,
-    availableRfModels: [],
-    selectedRfModelSourcePosition: '',
+    rfPersistedStatus: null,
+    selectedRfModelPath: '',
 
     showGroundTruth: false,
     groundTruthPoints: [],
@@ -915,8 +1161,15 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
 
     displayMode: 'raw_16bit',
     displayLut: 'gray',
+    preprocessFinalStage: null,
+    imageProcessingResultAvailable: false,
     currentNormStats: null,
   });
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const handleRunSegmentationRef = useRef<
+    ((options?: { forceRetrain?: boolean; autoLoad?: boolean }) => Promise<void>) | undefined
+  >(undefined);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
@@ -936,6 +1189,7 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
   const zoomStateRef = useRef(zoomState);
   zoomStateRef.current = zoomState;
   const [filterArea, setFilterArea] = useState<{ min: string; max: string }>({ min: '', max: '' });
+  const [filterPerimeter, setFilterPerimeter] = useState<{ min: string; max: string }>({ min: '', max: '' });
   const [filterCirc, setFilterCirc] = useState<{ min: string; max: string }>({ min: '', max: '' });
   const [showFilteredOnly, setShowFilteredOnly] = useState(false);
   const [showGuideFromRef, setShowGuideFromRef] = useState(false);
@@ -946,6 +1200,7 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
   /** Bumps only on a fresh detection batch (new segmentation, clear, or load position) so filter indices are not reset on incidental state churn. */
   const [detectionBatchId, setDetectionBatchId] = useState(0);
   const [saveFilterMessage, setSaveFilterMessage] = useState<string>('');
+  const [segmentationRestoreNote, setSegmentationRestoreNote] = useState<string | null>(null);
   const isPanningRef = useRef<boolean>(false);
   const panStartRef = useRef<{ x: number; y: number } | null>(null);
   /** True while pointer is inside the RF canvas viewport (for cursor: none + brush preview). */
@@ -1022,33 +1277,11 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
         setSaveFilterMessage('Select sample/position/channel first');
         return;
       }
-      const storageKey = `sea_filtered_detections_${sample}_${position}_${channel}`;
       const objectIds = filteredDetectionIndices
         .map((i) => state.detections[i]?.id)
         .filter((id): id is number => typeof id === 'number' && Number.isFinite(id));
 
-      const filterPayload = JSON.stringify({
-        enabled: true,
-        objectIds,
-        totalDetections: state.detections.length,
-        savedAt: Date.now(),
-      });
-      await storage.set(storageKey, filterPayload);
-      void storage.mergeExosomeStorageKeysOnDisk(sample, { [storageKey]: filterPayload });
-
-      // Investigation logs (remove after debugging)
-      try {
-        const raw = await storage.get(storageKey);
-        const parsed = raw ? JSON.parse(raw) : null;
-        const ids = Array.isArray(parsed?.objectIds) ? parsed.objectIds : [];
-        const uniq = new Set(ids.map((v: any) => String(v)));
-        console.log('[SaveFilter] key=', storageKey);
-        console.log('[SaveFilter] totalDetections=', parsed?.totalDetections, 'objectIds.length=', ids.length);
-        console.log('[SaveFilter] idTypeSample=', ids.slice(0, 5).map((v: any) => typeof v), 'idSample=', ids.slice(0, 5));
-        console.log('[SaveFilter] uniqueCount=', uniq.size, 'hasDuplicates=', uniq.size !== ids.length);
-      } catch (e) {
-        console.log('[SaveFilter] failed to log saved payload', e);
-      }
+      await persistFilterToDisk(sample, position, channel, objectIds, state.detections.length);
 
       setSaveFilterMessage(`Saved ${objectIds.length} filtered detections`);
       window.setTimeout(() => setSaveFilterMessage(''), 2500);
@@ -1389,6 +1622,9 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
       const items: ChannelItem[] = data.data.items || [];
       const firstItem = items[0];
       const d = data.data;
+      const alignArtifactChannels: string[] = Array.isArray(d.align_artifact_channels)
+        ? (d.align_artifact_channels as string[])
+        : [];
 
       let initialChannel = firstItem?.key || '';
       try {
@@ -1396,11 +1632,20 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
         const wantCh = (diskUi.ui as { exosome?: { channel?: string } } | undefined)?.exosome?.channel;
         if (wantCh && items.some(i => i.key === wantCh)) initialChannel = wantCh;
       } catch { /* keep default */ }
-      
+
+      const ipMeta = await fetchPreprocessFinalMeta(
+        getApiBase(),
+        state.selectedSample,
+        state.selectedPosition,
+      );
+      const effectiveDisplayMode =
+        state.displayMode === 'processed_result' && !ipMeta.available ? 'enhanced' : state.displayMode;
+
       setDetectionBatchId(b => b + 1);
       setState(prev => ({
         ...prev,
         availableItems: items,
+        alignArtifactChannels,
         selectedChannel: initialChannel,
         loaded: items.length > 0,
         currentImageUrl: firstItem?.preview_url || null,
@@ -1409,7 +1654,8 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
         masks: null,
         scores: null,
         detections: [],
-        clickHistory: [], // Reset click history when loading new image
+        showCanvasUserMarks: false,
+        brushPreview: { x: null, y: null },
         debugLogs: [], // Reset debug logs when loading new image
         // Crop mode metadata
         cropMode: d.crop_mode ?? false,
@@ -1419,6 +1665,11 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
         cropNumChannels: d.n_channels ?? null,
         cropPixelSizeUm: d.pixel_size_um ?? null,
         cropPixelSizeSource: d.pixel_size_source ?? null,
+        preprocessFinalStage: ipMeta.finalStage,
+        imageProcessingResultAvailable: ipMeta.available,
+        ...(state.displayMode === 'processed_result' && !ipMeta.available
+          ? { displayMode: 'enhanced' as const }
+          : {}),
       }));
 
       // Auto-load ground truth for this sample/position
@@ -1447,9 +1698,10 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
           state.selectedSample,
           state.selectedPosition,
           initialChannel || firstItem.key,
-          state.displayMode,
+          effectiveDisplayMode,
           state.displayLut,
           items,
+          ipMeta.finalStage,
         );
         if (result) {
           const img = new Image();
@@ -1466,6 +1718,23 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
             requestAnimationFrame(() => {
               console.log('[FIT TRIGGER]', { source: 'handleLoadPosition:img-onload-rAF' });
               fitToViewport();
+              const snap = stateRef.current;
+              if (snap.detectionMethod !== 'random_forest') return;
+              void (async () => {
+                try {
+                  const stResp = await fetch(
+                    `${getApiBase()}/api/exosome/rf_model/status?sample=${encodeURIComponent(snap.selectedSample)}&channel=${encodeURIComponent(snap.selectedChannel)}`
+                  );
+                  const st = await stResp.json();
+                  if (st.success && st.data) {
+                    setState(prev => ({ ...prev, rfPersistedStatus: st.data as RfPersistedStatusPayload }));
+                  }
+                  if (!st.success || !st.data?.exists) return;
+                  await handleRunSegmentationRef.current?.({ autoLoad: true });
+                } catch (e) {
+                  console.warn('[ExosomeDetection] Auto RF inference skipped:', e);
+                }
+              })();
             });
           };
           const url = result.url.startsWith('http') ? result.url : `${getApiBase()}${result.url}`;
@@ -1510,7 +1779,12 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
       if (!raw) { alert('No saved click history for this sample/position/channel/method.'); return; }
       try {
         const { clickHistory, annotations } = JSON.parse(raw);
-        setState(prev => ({ ...prev, clickHistory: clickHistory || [], annotations: annotations || [] }));
+        setState(prev => ({
+          ...prev,
+          clickHistory: clickHistory || [],
+          annotations: annotations || [],
+          showCanvasUserMarks: true,
+        }));
       } catch { alert('Failed to parse saved click history.'); }
     })();
   };
@@ -1533,31 +1807,97 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.clickHistory]);
 
-  // Auto-restore click history when channel or method changes
+  // Reload click history + annotations from storage when sample, position, channel, or method changes.
   useEffect(() => {
     const { selectedSample, selectedPosition, selectedChannel, detectionMethod } = state;
-    if (!selectedSample || !selectedPosition || !selectedChannel) return;
+    if (!selectedSample || !selectedPosition || !selectedChannel) {
+      setState((prev) => ({
+        ...prev,
+        clickHistory: [],
+        annotations: [],
+        showCanvasUserMarks: true,
+      }));
+      return;
+    }
+    const snapshot = {
+      selectedSample,
+      selectedPosition,
+      selectedChannel,
+      detectionMethod,
+    };
     let cancelled = false;
     const restoreClickHistory = async () => {
-      const raw = await storage.get(clickStorageKey(selectedSample, selectedPosition, selectedChannel, detectionMethod));
+      const raw = await storage.get(
+        clickStorageKey(
+          snapshot.selectedSample,
+          snapshot.selectedPosition,
+          snapshot.selectedChannel,
+          snapshot.detectionMethod,
+        ),
+      );
       if (cancelled) return;
+      const cur = stateRef.current;
+      if (
+        cur.selectedSample !== snapshot.selectedSample ||
+        cur.selectedPosition !== snapshot.selectedPosition ||
+        cur.selectedChannel !== snapshot.selectedChannel ||
+        cur.detectionMethod !== snapshot.detectionMethod
+      ) {
+        return;
+      }
       if (!raw) {
-        setState(prev => ({ ...prev, clickHistory: [], annotations: [] }));
+        setState((prev) => ({
+          ...prev,
+          clickHistory: [],
+          annotations: [],
+          showCanvasUserMarks: true,
+        }));
         return;
       }
       try {
         const { clickHistory, annotations } = JSON.parse(raw);
         if (!cancelled) {
-          setState(prev => ({ ...prev, clickHistory: clickHistory || [], annotations: annotations || [] }));
+          const cur2 = stateRef.current;
+          if (
+            cur2.selectedSample !== snapshot.selectedSample ||
+            cur2.selectedPosition !== snapshot.selectedPosition ||
+            cur2.selectedChannel !== snapshot.selectedChannel ||
+            cur2.detectionMethod !== snapshot.detectionMethod
+          ) {
+            return;
+          }
+          setState((prev) => ({
+            ...prev,
+            clickHistory: clickHistory || [],
+            annotations: annotations || [],
+            showCanvasUserMarks: true,
+          }));
         }
       } catch {
-        // ignore corrupt storage
+        if (!cancelled) {
+          const cur3 = stateRef.current;
+          if (
+            cur3.selectedSample !== snapshot.selectedSample ||
+            cur3.selectedPosition !== snapshot.selectedPosition ||
+            cur3.selectedChannel !== snapshot.selectedChannel ||
+            cur3.detectionMethod !== snapshot.detectionMethod
+          ) {
+            return;
+          }
+          setState((prev) => ({
+            ...prev,
+            clickHistory: [],
+            annotations: [],
+            showCanvasUserMarks: true,
+          }));
+        }
       }
     };
     void restoreClickHistory();
-    return () => { cancelled = true; };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.selectedChannel, state.detectionMethod]);
+    return () => {
+      cancelled = true;
+    };
+  }, [state.selectedSample, state.selectedPosition, state.selectedChannel, state.detectionMethod]);
 
   // Update image when channel, display mode, or LUT changes
   useEffect(() => {
@@ -1572,6 +1912,7 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
       state.displayMode,
       state.displayLut,
       state.availableItems,
+      state.preprocessFinalStage,
     ).then(result => {
       if (cancelled || !result) return;
       const img = new Image();
@@ -1601,7 +1942,64 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
     });
     return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.selectedChannel, state.loaded, state.displayMode, state.displayLut]);
+  }, [
+    state.selectedChannel,
+    state.loaded,
+    state.displayMode,
+    state.displayLut,
+    state.preprocessFinalStage,
+    state.imageProcessingResultAvailable,
+  ]);
+
+  // Refresh Image Processing final-stage metadata when returning to this tab (e.g. after running preprocess elsewhere).
+  useEffect(() => {
+    if (!isActive || !state.loaded || !state.selectedSample || !state.selectedPosition) return;
+    let cancelled = false;
+    void (async () => {
+      const ipMeta = await fetchPreprocessFinalMeta(
+        getApiBase(),
+        state.selectedSample,
+        state.selectedPosition,
+      );
+      if (cancelled) return;
+      setState((prev) => ({
+        ...prev,
+        preprocessFinalStage: ipMeta.finalStage,
+        imageProcessingResultAvailable: ipMeta.available,
+        ...(prev.displayMode === 'processed_result' && !ipMeta.available
+          ? { displayMode: 'enhanced' as const }
+          : {}),
+      }));
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [isActive, state.loaded, state.selectedSample, state.selectedPosition]);
+
+  // When returning to the browser tab, refresh final-stage metadata (e.g. after Image Processing in another tab).
+  useEffect(() => {
+    if (!state.loaded || !state.selectedSample || !state.selectedPosition) return;
+    const refresh = () => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      void (async () => {
+        const ipMeta = await fetchPreprocessFinalMeta(
+          getApiBase(),
+          state.selectedSample,
+          state.selectedPosition,
+        );
+        setState((prev) => ({
+          ...prev,
+          preprocessFinalStage: ipMeta.finalStage,
+          imageProcessingResultAvailable: ipMeta.available,
+          ...(prev.displayMode === 'processed_result' && !ipMeta.available
+            ? { displayMode: 'enhanced' as const }
+            : {}),
+        }));
+      })();
+    };
+    document.addEventListener('visibilitychange', refresh);
+    return () => document.removeEventListener('visibilitychange', refresh);
+  }, [state.loaded, state.selectedSample, state.selectedPosition]);
 
   // Draw canvas with image, prompts, and masks
   const drawCanvas = useCallback(() => {
@@ -1646,79 +2044,91 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
       ctx.restore();
     }
 
-    // Draw box prompt (SAM only)
-    if (state.detectionMethod === 'sam' && state.boxPrompt) {
-      const [x1, y1, x2, y2] = state.boxPrompt;
-      ctx.strokeStyle = '#00ff00';
-      ctx.lineWidth = 2;
-      ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-    }
+    // Draw box prompt (SAM only) and point prompts; RF brush strokes / preview (user marks only)
+    if (state.showCanvasUserMarks) {
+      // Draw box prompt (SAM only)
+      if (state.detectionMethod === 'sam' && state.boxPrompt) {
+        const [x1, y1, x2, y2] = state.boxPrompt;
+        ctx.strokeStyle = '#00ff00';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+      }
 
-    // Draw point prompts (SAM only)
-    if (state.detectionMethod === 'sam') {
-      state.pointPrompts.forEach(prompt => {
-      ctx.beginPath();
-      ctx.arc(prompt.x, prompt.y, 5, 0, 2 * Math.PI);
-      ctx.fillStyle = prompt.label === 1 ? '#00ff00' : '#ff0000';
-      ctx.fill();
-      ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = 2;
-      ctx.stroke();
-      });
-    }
-    
-    // Draw Random Forest annotations (fill only, no outline).
-    // Use offscreen canvas so overlapping points don't compound opacity.
-    if (state.detectionMethod === 'random_forest') {
-      if (state.annotations.length > 0) {
-        const offscreen = document.createElement('canvas');
-        offscreen.width = canvas.width;
-        offscreen.height = canvas.height;
-        const offCtx = offscreen.getContext('2d');
-        if (offCtx) {
-          state.annotations.forEach(ann => {
-            const fillColor = ann.label === 1 
-              ? 'rgb(0, 255, 0)'
-              : 'rgb(255, 0, 0)';
+      // Draw point prompts (SAM only)
+      if (state.detectionMethod === 'sam') {
+        state.pointPrompts.forEach(prompt => {
+        ctx.beginPath();
+        ctx.arc(prompt.x, prompt.y, 5, 0, 2 * Math.PI);
+        ctx.fillStyle = prompt.label === 1 ? '#00ff00' : '#ff0000';
+        ctx.fill();
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        });
+      }
 
-            offCtx.fillStyle = fillColor;
-            // Overlay always follows discrete ann.points so eraser holes match state. brushDabs is
-            // kept for bookkeeping / persistence but does not define the raster preview.
-            // One beginPath + fill per group: boolean union so overlaps do not darken via AA fringe.
-            offCtx.beginPath();
-            ann.points.forEach(([x, y]) => {
-              const pr = 2;
-              offCtx.moveTo(x + pr, y);
-              offCtx.arc(x, y, pr, 0, Math.PI * 2);
+      // Draw Random Forest annotations (fill only, no outline).
+      // Use offscreen canvas so overlapping points don't compound opacity.
+      if (state.detectionMethod === 'random_forest') {
+        if (state.annotations.length > 0) {
+          const offscreen = document.createElement('canvas');
+          offscreen.width = canvas.width;
+          offscreen.height = canvas.height;
+          const offCtx = offscreen.getContext('2d');
+          if (offCtx) {
+            state.annotations.forEach(ann => {
+              const fillColor = ann.label === 1 
+                ? 'rgb(0, 255, 0)'
+                : 'rgb(255, 0, 0)';
+
+              offCtx.fillStyle = fillColor;
+              // Each entry in ann.points is one image pixel (see addBrushPoint). Draw 1×1 rects so the
+              // overlay matches the brush disk — not larger circles (old code used a fixed pr=2 arc per
+              // pixel, which bloated the stroke vs the brush preview that uses state.brushSize in image space).
+              // One beginPath + fill: union fill without stacking opacity on overlaps.
+              offCtx.beginPath();
+              ann.points.forEach(([x, y]) => {
+                offCtx.rect(x, y, 1, 1);
+              });
+              offCtx.fill();
             });
-            offCtx.fill();
-          });
 
+            ctx.save();
+            ctx.globalAlpha = 0.45;
+            ctx.drawImage(offscreen, 0, 0);
+            ctx.restore();
+          }
+        }
+
+        // Draw brush preview (semi-transparent circle following cursor)
+        if (state.brushPreview.x !== null && state.brushPreview.y !== null) {
           ctx.save();
-          ctx.globalAlpha = 0.45;
-          ctx.drawImage(offscreen, 0, 0);
+          ctx.beginPath();
+          const bs = state.brushSize;
+          // Match stored pixels: bs<=1 is a single lattice cell; draw ~one pixel, not r=1 Euclidean disk.
+          if (bs <= 1) {
+            const px = Math.round(state.brushPreview.x);
+            const py = Math.round(state.brushPreview.y);
+            ctx.arc(px + 0.5, py + 0.5, 0.5, 0, Math.PI * 2);
+          } else {
+            ctx.arc(state.brushPreview.x, state.brushPreview.y, bs, 0, Math.PI * 2);
+          }
+          if (state.annotationMode === 'eraser') {
+            ctx.fillStyle = 'rgba(255, 165, 0, 0.4)';
+            ctx.fill();
+          } else {
+            const previewColor = state.annotationMode === 'exosome'
+              ? 'rgba(0, 255, 0, 0.4)'
+              : 'rgba(255, 0, 0, 0.4)';
+            ctx.fillStyle = previewColor;
+            ctx.fill();
+          }
           ctx.restore();
         }
       }
+    }
 
-      // Draw brush preview (semi-transparent circle following cursor)
-      if (state.brushPreview.x !== null && state.brushPreview.y !== null) {
-        ctx.save();
-        ctx.beginPath();
-        ctx.arc(state.brushPreview.x, state.brushPreview.y, state.brushSize, 0, Math.PI * 2);
-        if (state.annotationMode === 'eraser') {
-          ctx.fillStyle = 'rgba(255, 165, 0, 0.4)';
-          ctx.fill();
-        } else {
-          const previewColor = state.annotationMode === 'exosome'
-            ? 'rgba(0, 255, 0, 0.4)'
-            : 'rgba(255, 0, 0, 0.4)';
-          ctx.fillStyle = previewColor;
-          ctx.fill();
-        }
-        ctx.restore();
-      }
-      
+    if (state.detectionMethod === 'random_forest') {
       // Draw confidence map if enabled (use offscreen canvas to preserve image underneath)
       if (state.showConfidenceMap && state.probabilityMap) {
         const cmCanvas = document.createElement('canvas');
@@ -2043,7 +2453,7 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
       }
     }
     console.log('[DRAW COMPLETE]');
-  }, [state.boxPrompt, state.pointPrompts, state.masks, state.maskOpacity, state.showMaskOutlines, state.detections, state.annotations, state.clickHistory, state.probabilityMap, state.showConfidenceMap, state.detectionMethod, state.calibrationMode, state.debugLogs, state.brushPreview, state.brushSize, state.annotationMode, state.showGroundTruth, state.groundTruthPoints, state.groundTruthPixelSizeUm, state.gtImageWidth, state.gtImageHeight, state.rawGtSampleUm, state.gtDebugMode, state.gtSwapXY, state.gtYFlip, state.gtOffsetX, state.gtOffsetY, zoomState, showFilteredOnly, filteredDetectionIndices, filteredOutIndices, filterApplyNonce, detectionBatchId, showGuideFromRef, guideRefPoints, state.selectedChannel]);
+  }, [state.boxPrompt, state.pointPrompts, state.masks, state.maskOpacity, state.showMaskOutlines, state.detections, state.annotations, state.clickHistory, state.probabilityMap, state.showConfidenceMap, state.detectionMethod, state.calibrationMode, state.debugLogs, state.brushPreview, state.brushSize, state.annotationMode, state.showCanvasUserMarks, state.showGroundTruth, state.groundTruthPoints, state.groundTruthPixelSizeUm, state.gtImageWidth, state.gtImageHeight, state.rawGtSampleUm, state.gtDebugMode, state.gtSwapXY, state.gtYFlip, state.gtOffsetX, state.gtOffsetY, zoomState, showFilteredOnly, filteredDetectionIndices, filteredOutIndices, filterApplyNonce, detectionBatchId, showGuideFromRef, guideRefPoints, state.selectedChannel]);
 
   // Helper: HSL to RGB
   const hslToRgb = (h: number, s: number, l: number): [number, number, number] => {
@@ -2460,21 +2870,26 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
     fitToViewport();
   };
 
-  // Add brush point with radius (Random Forest)
+  // Add brush point with radius (Random Forest).
+  // Integer disk dx²+dy²≤r² for r=1 is only the center + 4 orthogonals (a "+" shape), not a blob.
+  // For brushSize<=1 we store exactly one pixel so a click is a tight dot; r>=2 uses the filled disk.
   const addBrushPoint = useCallback((x: number, y: number, label: number, annotationId?: string) => {
     const radius = state.brushSize;
     const dab = { x, y, radius };
     const points: Array<[number, number]> = [];
-    
-    // Generate points in a circle
-    for (let dy = -radius; dy <= radius; dy++) {
-      for (let dx = -radius; dx <= radius; dx++) {
-        if (dx * dx + dy * dy <= radius * radius) {
-          points.push([Math.round(x + dx), Math.round(y + dy)]);
+
+    if (radius <= 1) {
+      points.push([Math.round(x), Math.round(y)]);
+    } else {
+      for (let dy = -radius; dy <= radius; dy++) {
+        for (let dx = -radius; dx <= radius; dx++) {
+          if (dx * dx + dy * dy <= radius * radius) {
+            points.push([Math.round(x + dx), Math.round(y + dy)]);
+          }
         }
       }
     }
-    
+
     currentAnnotationPointsRef.current.push(...points);
     
     // Update annotations state
@@ -2490,7 +2905,7 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
             points: [...updated[existingIndex].points, ...points],
             brushDabs: [...prevDabs, dab],
           };
-          return { ...prev, annotations: updated };
+          return { ...prev, annotations: updated, showCanvasUserMarks: true };
         }
       }
       
@@ -2499,38 +2914,45 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
       return {
         ...prev,
         annotations: [...prev.annotations, { id: newId, points, label, brushDabs: [dab] }],
+        showCanvasUserMarks: true,
       };
     });
     
-    drawCanvas();
-  }, [state.brushSize, drawCanvas]);
+  }, [state.brushSize]);
 
-  /** Remove annotation points within brush radius of (cx, cy) from all groups (Random Forest eraser). */
-  const eraseBrushAt = useCallback((cx: number, cy: number) => {
+  /**
+   * Remove annotation points within brush radius of (cx, cy) (Random Forest eraser).
+   * When `targetLabel` is 0 or 1, only annotations with that `label` are modified; otherwise all groups.
+   */
+  const eraseBrushAt = useCallback((cx: number, cy: number, targetLabel?: 0 | 1) => {
     const r = state.brushSize;
-    const r2 = r * r;
     setState(prev => {
       const nextAnnotations = prev.annotations
-        .map(ann => ({
-          ...ann,
-          points: ann.points.filter(([px, py]) => {
+        .map((ann) => {
+          if (targetLabel !== undefined && ann.label !== targetLabel) {
+            return ann;
+          }
+          const points = ann.points.filter(([px, py]) => {
+            if (r <= 1) {
+              return Math.round(px) !== Math.round(cx) || Math.round(py) !== Math.round(cy);
+            }
             const dx = px - cx;
             const dy = py - cy;
-            return dx * dx + dy * dy > r2;
-          }),
-        }))
-        .map((ann) => {
+            return dx * dx + dy * dy > r * r;
+          });
           const dabs = ann.brushDabs;
-          if (!dabs || dabs.length === 0) return ann;
+          if (!dabs || dabs.length === 0) {
+            return { ...ann, points };
+          }
           const nextDabs = dabs.filter((dab) => {
             const dr2 = dab.radius * dab.radius;
-            return ann.points.some(([px, py]) => {
+            return points.some(([px, py]) => {
               const dx = px - dab.x;
               const dy = py - dab.y;
               return dx * dx + dy * dy <= dr2;
             });
           });
-          return { ...ann, brushDabs: nextDabs.length > 0 ? nextDabs : undefined };
+          return { ...ann, points, brushDabs: nextDabs.length > 0 ? nextDabs : undefined };
         })
         .filter(ann => ann.points.length > 0);
 
@@ -2545,10 +2967,9 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
               );
             })();
 
-      return { ...prev, annotations: nextAnnotations, clickHistory: nextClickHistory };
+      return { ...prev, annotations: nextAnnotations, clickHistory: nextClickHistory, showCanvasUserMarks: true };
     });
-    drawCanvas();
-  }, [state.brushSize, drawCanvas]);
+  }, [state.brushSize]);
   
   // Canvas mouse handlers for box/point prompts (SAM only) and brush annotation (Random Forest)
   const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -2563,7 +2984,9 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
         isAnnotatingRef.current = true;
         currentAnnotationPointsRef.current = [];
         currentAnnotationIdRef.current = null;
-        eraseBrushAt(x, y);
+        const targetLabel: 0 | 1 | undefined =
+          e.button === 0 ? 1 : e.button === 2 ? 0 : undefined;
+        eraseBrushAt(x, y, targetLabel);
         return;
       }
 
@@ -2613,19 +3036,21 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
         setState(prev => ({
           ...prev,
           clickHistory: [clickEntry, ...prev.clickHistory].slice(0, 100),
+          showCanvasUserMarks: true,
         }));
       }
     } else if (state.detectionMethod === 'sam') {
       if (state.detectionMode === 'box') {
         isDrawingRef.current = true;
         startPosRef.current = { x, y };
-        setState(prev => ({ ...prev, boxPrompt: [x, y, x, y] }));
+        setState(prev => ({ ...prev, boxPrompt: [x, y, x, y], showCanvasUserMarks: true }));
       } else if (state.detectionMode === 'point') {
         // Toggle point: left click = positive, right click = negative
         const label = e.button === 0 ? 1 : 0;
         setState(prev => ({
           ...prev,
           pointPrompts: [...prev.pointPrompts, { x, y, label }],
+          showCanvasUserMarks: true,
         }));
       }
     }
@@ -2637,7 +3062,7 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
     const { x, y } = getCanvasCoords(e);
     
     // Update brush preview position (for Random Forest)
-    if (state.detectionMethod === 'random_forest') {
+    if (state.detectionMethod === 'random_forest' && state.showCanvasUserMarks) {
       setState(prev => ({
         ...prev,
         brushPreview: { x, y },
@@ -2647,8 +3072,14 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
     
     if (state.detectionMethod === 'random_forest' && isAnnotatingRef.current) {
       if (state.annotationMode === 'eraser') {
-        if (e.buttons & 1 || e.buttons & 2) {
-          eraseBrushAt(x, y);
+        const left = !!(e.buttons & 1);
+        const right = !!(e.buttons & 2);
+        if (left || right) {
+          let targetLabel: 0 | 1 | undefined;
+          if (left && !right) targetLabel = 1;
+          else if (right && !left) targetLabel = 0;
+          else targetLabel = undefined;
+          eraseBrushAt(x, y, targetLabel);
         }
       } else {
         // Continue brush stroke with the same annotation ID
@@ -2664,6 +3095,7 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
           boxPrompt: prev.boxPrompt
             ? [Math.min(startPosRef.current!.x, x), Math.min(startPosRef.current!.y, y), Math.max(startPosRef.current!.x, x), Math.max(startPosRef.current!.y, y)]
             : null,
+          showCanvasUserMarks: true,
         }));
       }
     }
@@ -2842,31 +3274,45 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
   
   // Canvas wheel handler removed - all wheel events handled by container
 
-  const refreshRfModelList = useCallback(async () => {
+  const refreshRfPersistedStatus = useCallback(async () => {
     if (!state.selectedSample || !state.selectedChannel) {
-      setState(prev => ({ ...prev, availableRfModels: [], selectedRfModelSourcePosition: '' }));
+      setState(prev => ({ ...prev, rfPersistedStatus: null }));
       return;
     }
     try {
       const response = await fetch(
-        `${getApiBase()}/api/exosome/rf_model/list?sample=${encodeURIComponent(state.selectedSample)}&channel=${encodeURIComponent(state.selectedChannel)}`
+        `${getApiBase()}/api/exosome/rf_model/status?sample=${encodeURIComponent(state.selectedSample)}&channel=${encodeURIComponent(state.selectedChannel)}`
       );
       const data = await response.json();
       if (!data.success) {
-        throw new Error(data.error || 'Failed to load saved models');
+        throw new Error(data.error || 'Failed to read RF model status');
       }
-      const models: SavedRfModelItem[] = Array.isArray(data.data) ? data.data : [];
+      setState(prev => ({ ...prev, rfPersistedStatus: data.data as RfPersistedStatusPayload }));
+    } catch (err: any) {
       setState(prev => ({
         ...prev,
-        availableRfModels: models,
-        selectedRfModelSourcePosition: models.some(m => m.position === prev.selectedRfModelSourcePosition)
-          ? prev.selectedRfModelSourcePosition
-          : (models[0]?.position || ''),
+        rfPersistedStatus: null,
+        rfModelStatus: `RF disk status failed: ${err.message}`,
       }));
-    } catch (err: any) {
-      setState(prev => ({ ...prev, rfModelStatus: `Failed to list RF models: ${err.message}` }));
     }
   }, [state.selectedSample, state.selectedChannel]);
+
+  const rfInventoryKey = useMemo(() => {
+    const m = state.rfPersistedStatus?.available_models;
+    if (!m?.length) return '';
+    return m.map((x) => `${x.path}@${x.saved_at || ''}`).join('||');
+  }, [state.rfPersistedStatus?.available_models]);
+
+  useEffect(() => {
+    if (state.detectionMethod !== 'random_forest') return;
+    const models = state.rfPersistedStatus?.available_models;
+    if (!models?.length) {
+      setState((p) => (p.selectedRfModelPath !== '' ? { ...p, selectedRfModelPath: '' } : p));
+      return;
+    }
+    const next = pickDefaultRfModelPath(models, state.selectedPosition) || '';
+    setState((p) => ({ ...p, selectedRfModelPath: next }));
+  }, [state.detectionMethod, state.selectedPosition, rfInventoryKey]);
 
   const handleSaveRfModel = async () => {
     if (!state.loaded || !state.selectedSample || !state.selectedPosition || !state.selectedChannel) {
@@ -2874,11 +3320,11 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
       return;
     }
     if (state.annotations.length === 0) {
-      alert('Please annotate pixels before saving model');
+      alert('Please annotate pixels before training a model');
       return;
     }
     try {
-      setState(prev => ({ ...prev, rfModelStatus: 'Saving RF model...', rfModelWarning: null }));
+      setState(prev => ({ ...prev, rfModelStatus: 'Training and saving RF model to disk...', rfModelWarning: null }));
       const response = await fetch(`${getApiBase()}/api/exosome/rf_model/save`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2895,240 +3341,296 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
       }
       setState(prev => ({
         ...prev,
-        rfModelStatus: `RF model saved: ${data.saved_path}`,
+        rfModelStatus: `RF model saved (${data.channel_stem || 'channel'}): ${data.saved_path}`,
         rfModelSavedPath: data.saved_path || null,
       }));
-      await refreshRfModelList();
+      await refreshRfPersistedStatus();
     } catch (err: any) {
       setState(prev => ({ ...prev, rfModelStatus: `Failed to save RF model: ${err.message}` }));
       alert(`Failed to save RF model: ${err.message}`);
     }
   };
 
-  const handleLoadRfModelAndSegment = async () => {
-    if (!state.loaded || !state.selectedSample || !state.selectedPosition || !state.selectedChannel) {
-      alert('Please load an image first');
-      return;
-    }
-    if (!state.selectedRfModelSourcePosition) {
-      alert('Please select a saved model position');
-      return;
-    }
-    setState(prev => ({
-      ...prev,
-      isDetecting: true,
-      exportStatus: null,
-      rfModelStatus: `Running segmentation with model from ${state.selectedRfModelSourcePosition}...`,
-      rfModelWarning: null,
-    }));
+  async function handleRunSegmentation(options?: { forceRetrain?: boolean; autoLoad?: boolean }) {
+    const forceRetrain = options?.forceRetrain ?? false;
+    const autoLoad = options?.autoLoad ?? false;
+    const sr = stateRef.current;
 
-    try {
-      const response = await fetch(`${getApiBase()}/api/exosome/rf_model/load_and_segment`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sample: state.selectedSample,
-          position: state.selectedPosition,
-          channel: state.selectedChannel,
-          model_source_position: state.selectedRfModelSourcePosition,
-          confidence_threshold: state.confidenceThreshold,
-          min_area: state.minArea,
-          apply_morphology: state.fillHoles,
-        }),
-      });
-      const data = await response.json();
-      if (!data.success) {
-        throw new Error(data.error || 'RF model segmentation failed');
-      }
-
-      const masksRaw = data.data.masks || [];
-      const scores = data.data.scores || [];
-      const detections: DetectionResult[] = (data.data.detections || []).map((d: any, idx: number) => ({
-        id: idx + 1,
-        area: d.area || 0,
-        centroid: d.centroid || [0, 0],
-        bbox: d.bbox || [0, 0, 0, 0],
-        score: idx < scores.length ? scores[idx] : undefined,
-        perimeter: d.perimeter != null ? d.perimeter : undefined,
-        circularity: d.circularity != null ? d.circularity : undefined,
-      }));
-
-      setDetectionBatchId(b => b + 1);
-      setState(prev => ({
-        ...prev,
-        masks: masksRaw.length > 0 ? masksRaw : null,
-        scores,
-        detections,
-        probabilityMap: data.data.probability_map || null,
-        isDetecting: false,
-        rfModelStatus: `Loaded model from ${state.selectedRfModelSourcePosition} and segmented ${state.selectedPosition}`,
-        rfModelWarning: data.model_warning || data.data._model_warning || null,
-      }));
-    } catch (err: any) {
-      setState(prev => ({
-        ...prev,
-        isDetecting: false,
-        rfModelStatus: `Failed to run loaded model: ${err.message}`,
-      }));
-      alert(`RF model load-and-segment failed: ${err.message}`);
-    }
-  };
-
-  // Run segmentation
-  const handleRunSegmentation = async () => {
-    if (!state.loaded || !state.selectedSample || !state.selectedPosition || !state.selectedChannel) {
+    if (!sr.loaded || !sr.selectedSample || !sr.selectedPosition || !sr.selectedChannel) {
       alert('Please load an image first');
       return;
     }
 
-    if (!state.checkpointPath) {
-      alert('Please specify SAM checkpoint path');
-      return;
-    }
-
-    if (state.detectionMethod === 'sam') {
-      if (state.detectionMode === 'box' && !state.boxPrompt) {
-        alert('Please draw a box prompt');
-        return;
-      }
-
-      if (state.detectionMode === 'point' && state.pointPrompts.length === 0) {
-        alert('Please add at least one point prompt');
-        return;
-      }
-
-      if (!state.checkpointPath) {
+    if (sr.detectionMethod === 'sam') {
+      if (!sr.checkpointPath) {
         alert('Please specify SAM checkpoint path');
         return;
       }
-    } else if (state.detectionMethod === 'random_forest') {
-      if (state.annotations.length === 0) {
-        alert('Please annotate some pixels first (draw on the image)');
+      if (sr.detectionMode === 'box' && !sr.boxPrompt) {
+        alert('Please draw a box prompt');
         return;
+      }
+      if (sr.detectionMode === 'point' && sr.pointPrompts.length === 0) {
+        alert('Please add at least one point prompt');
+        return;
+      }
+    } else if (sr.detectionMethod === 'random_forest') {
+      if (forceRetrain && sr.annotations.length === 0) {
+        alert('Retrain requires brush annotations on this image.');
+        return;
+      }
+      if (!forceRetrain && sr.annotations.length === 0 && !autoLoad) {
+        const resp = await fetch(
+          `${getApiBase()}/api/exosome/rf_model/status?sample=${encodeURIComponent(sr.selectedSample)}&channel=${encodeURIComponent(sr.selectedChannel)}`
+        );
+        const st = await resp.json();
+        if (!st.success || !st.data?.exists) {
+          alert(
+            'No saved RF model for this sample/channel yet. Add annotations and run segmentation once, or train from another field of view and reload.',
+          );
+          return;
+        }
       }
     }
 
+    setSegmentationRestoreNote(null);
     setState(prev => ({ ...prev, isDetecting: true, exportStatus: null }));
 
     try {
+      const sr2 = stateRef.current;
+      const modelPathTrim = (sr2.selectedRfModelPath || '').trim();
+      const pickerModelOtherPosition = isSelectedRfModelTrainedOnDifferentPosition(
+        sr2.rfPersistedStatus?.available_models,
+        modelPathTrim,
+        sr2.selectedPosition,
+      );
+      const useLoadAndSegment =
+        sr2.detectionMethod === 'random_forest' &&
+        !forceRetrain &&
+        !!modelPathTrim &&
+        (sr2.annotations.length === 0 || pickerModelOtherPosition);
+
       const prompts: any = {};
-      if (state.detectionMode === 'box' && state.boxPrompt) {
-        prompts.box = state.boxPrompt;
-      } else if (state.detectionMode === 'point') {
-        prompts.points = state.pointPrompts.map(p => [p.x, p.y]);
-        prompts.labels = state.pointPrompts.map(p => p.label);
+      if (sr2.detectionMode === 'box' && sr2.boxPrompt) {
+        prompts.box = sr2.boxPrompt;
+      } else if (sr2.detectionMode === 'point') {
+        prompts.points = sr2.pointPrompts.map(p => [p.x, p.y]);
+        prompts.labels = sr2.pointPrompts.map(p => p.label);
       }
 
-      const requestBody: any = {
-        sample: state.selectedSample,
-        position: state.selectedPosition,
-        channel: state.selectedChannel,
-        method: state.detectionMethod,
-        min_area: state.minArea,
-        max_area: state.maxArea,
-        remove_small_objects: state.removeSmallObjects,
-        fill_holes: state.fillHoles,
-      };
+      let data: { success?: boolean; error?: string; data?: Record<string, unknown> };
 
-      if (state.detectionMethod === 'sam') {
-        requestBody.mode = state.detectionMode;
-        requestBody.prompts = prompts;
-        requestBody.checkpoint_path = state.checkpointPath;
-        requestBody.model_type = state.modelType;
-        requestBody.device = state.device;
-        requestBody.score_thresh = state.confidenceThreshold;
-      } else if (state.detectionMethod === 'blob') {
-        requestBody.threshold = state.blobThreshold;
-        requestBody.min_circularity = state.blobMinCircularity;
-        requestBody.max_circularity = state.blobMaxCircularity;
-        requestBody.min_inertia_ratio = state.blobMinInertiaRatio;
-      } else if (state.detectionMethod === 'random_forest') {
-        requestBody.annotations = state.annotations;
-        requestBody.confidence_threshold = state.confidenceThreshold;
-        requestBody.apply_morphology = state.fillHoles;
-        requestBody.n_estimators = 100;
+      if (useLoadAndSegment) {
+        const response = await fetch(`${getApiBase()}/api/exosome/rf_model/load_and_segment`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sample: sr2.selectedSample,
+            position: sr2.selectedPosition,
+            channel: sr2.selectedChannel,
+            model_path: modelPathTrim,
+            confidence_threshold: sr2.confidenceThreshold,
+            min_area: sr2.minArea,
+            apply_morphology: sr2.fillHoles,
+          }),
+        });
+        data = await response.json();
+        console.log('[ExosomeDetection] load_and_segment response:', data);
+      } else {
+        const requestBody: any = {
+          sample: sr2.selectedSample,
+          position: sr2.selectedPosition,
+          channel: sr2.selectedChannel,
+          method: sr2.detectionMethod,
+          min_area: sr2.minArea,
+          max_area: sr2.maxArea,
+          remove_small_objects: sr2.removeSmallObjects,
+          fill_holes: sr2.fillHoles,
+        };
+
+        if (sr2.detectionMethod === 'sam') {
+          requestBody.mode = sr2.detectionMode;
+          requestBody.prompts = prompts;
+          requestBody.checkpoint_path = sr2.checkpointPath;
+          requestBody.model_type = sr2.modelType;
+          requestBody.device = sr2.device;
+          requestBody.score_thresh = sr2.confidenceThreshold;
+        } else if (sr2.detectionMethod === 'blob') {
+          requestBody.threshold = sr2.blobThreshold;
+          requestBody.min_circularity = sr2.blobMinCircularity;
+          requestBody.max_circularity = sr2.blobMaxCircularity;
+          requestBody.min_inertia_ratio = sr2.blobMinInertiaRatio;
+        } else if (sr2.detectionMethod === 'random_forest') {
+          requestBody.annotations = sr2.annotations;
+          requestBody.confidence_threshold = sr2.confidenceThreshold;
+          requestBody.apply_morphology = sr2.fillHoles;
+          requestBody.n_estimators = 100;
+          requestBody.force_retrain = forceRetrain;
+        }
+
+        console.log('[ExosomeDetection] Sending request:', { method: sr2.detectionMethod, ...requestBody });
+
+        const response = await fetch(`${getApiBase()}/api/exosome/segment`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(requestBody),
+        });
+
+        console.log('[ExosomeDetection] Response status:', response.status);
+        data = await response.json();
+        console.log('[ExosomeDetection] Response data:', data);
       }
 
-      console.log('[ExosomeDetection] Sending request:', { method: state.detectionMethod, ...requestBody });
-      
-      const response = await fetch(`${getApiBase()}/api/exosome/segment`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody),
-      });
-
-      console.log('[ExosomeDetection] Response status:', response.status);
-      const data = await response.json();
-      console.log('[ExosomeDetection] Response data:', data);
-      
       if (!data.success) {
         console.error('[ExosomeDetection] Error from backend:', data.error);
         throw new Error(data.error || 'Segmentation failed');
       }
 
-      // Convert masks from backend format (list of 2D boolean arrays)
-      const masksRaw = data.data.masks || [];
-      const scores = data.data.scores || [];
-      const masksOmitted = data.data._masks_omitted || false;
-      const warning = data.data._warning;
-      
-      console.log('[ExosomeDetection] Received masks:', masksRaw.length, 'scores:', scores.length, 'detections:', data.data.detections?.length || 0);
-      if (masksOmitted) {
-        console.warn('[ExosomeDetection] Masks omitted due to large response size. Using bboxes for visualization.');
-        if (warning) {
-          alert(`Warning: ${warning}\n\nVisualization will use bounding boxes instead of full masks.`);
-        }
-      }
-      
-      // Ensure masks are in the correct format (list of 2D boolean arrays)
-      const masks = masksRaw.map((mask: any) => {
-        if (Array.isArray(mask) && Array.isArray(mask[0])) {
-          return mask; // Already in correct format
-        }
-        return mask; // Fallback
+      const parsed = parseSegmentationDataPayload(data.data as Record<string, unknown>, {
+        includeProbabilityMap: sr2.detectionMethod === 'random_forest',
       });
-      
-      const detections: DetectionResult[] = (data.data.detections || []).map((d: any, idx: number) => ({
-        id: idx + 1,
-        area: d.area || 0,
-        centroid: d.centroid || [0, 0],
-        bbox: d.bbox || [0, 0, 0, 0],
-        score: idx < scores.length ? scores[idx] : undefined,
-        perimeter: d.perimeter != null ? d.perimeter : undefined,
-        circularity: d.circularity != null ? d.circularity : undefined,
-      }));
 
-      console.log('[ExosomeDetection] Processed detections:', detections.length);
+      console.log(
+        '[ExosomeDetection] Received masks:',
+        ((data.data?.masks as unknown[]) || []).length,
+        'scores:',
+        (parsed.scores || []).length,
+        'detections:',
+        parsed.detections.length,
+      );
+      if (parsed.masksOmitted && parsed.warning) {
+        console.warn('[ExosomeDetection] Masks omitted due to large response size. Using bboxes for visualization.');
+        alert(`Warning: ${parsed.warning}\n\nVisualization will use bounding boxes instead of full masks.`);
+      }
 
-      // Handle Random Forest specific results
-      let probabilityMap = null;
-      if (state.detectionMethod === 'random_forest' && data.data.probability_map) {
-        probabilityMap = data.data.probability_map;
+      console.log('[ExosomeDetection] Processed detections:', parsed.detections.length);
+
+      if (sr2.detectionMethod === 'random_forest' && parsed.probabilityMap) {
         console.log('[ExosomeDetection] Received probability map');
+      }
+
+      const payload = data.data as Record<string, unknown>;
+      const usedSaved = payload._rf_used_saved_model === true;
+      let rfStatusMsg: string | null = null;
+      if (sr2.detectionMethod === 'random_forest') {
+        if (useLoadAndSegment) {
+          rfStatusMsg = `RF: inference with selected model (${String(payload._rf_model_path || modelPathTrim)})`;
+        } else if (usedSaved) {
+          rfStatusMsg = `RF: used saved model (${String(payload._rf_model_path || 'disk')})`;
+        } else if (forceRetrain) {
+          rfStatusMsg = 'RF: preview (retrained in memory — not saved; use Train & Save to persist)';
+        } else if (sr2.annotations.length > 0) {
+          rfStatusMsg = 'RF: preview (trained in memory — not saved; use Train & Save to persist)';
+        }
       }
 
       setDetectionBatchId(b => b + 1);
       setState(prev => ({
         ...prev,
-        masks: masks.length > 0 ? masks : null, // null if masks omitted
-        scores: scores,
-        detections: detections,
-        probabilityMap: probabilityMap ?? null,
+        masks: parsed.masks,
+        scores: parsed.scores,
+        detections: parsed.detections,
+        probabilityMap: parsed.probabilityMap ?? null,
         isDetecting: false,
+        confidenceThreshold:
+          parsed.confidenceThreshold != null && Number.isFinite(parsed.confidenceThreshold)
+            ? parsed.confidenceThreshold
+            : prev.confidenceThreshold,
+        rfModelStatus: autoLoad ? null : (rfStatusMsg ?? prev.rfModelStatus),
+        rfModelWarning: (payload._model_warning as string | undefined) || null,
       }));
+
+      try {
+        await persistFilterToDisk(
+          sr2.selectedSample,
+          sr2.selectedPosition,
+          sr2.selectedChannel,
+          parsed.detections.map((d) => d.id),
+          parsed.detections.length,
+        );
+      } catch (e) {
+        console.warn('[ExosomeDetection] Auto-save filter after segmentation failed:', e);
+      }
+
+      if (sr2.detectionMethod === 'random_forest') {
+        await refreshRfPersistedStatus();
+      }
 
       console.log('[ExosomeDetection] State updated (canvas redraw via useEffect when drawCanvas deps change)');
     } catch (err: any) {
       console.error('Segmentation failed:', err);
-      alert('Segmentation failed: ' + err.message);
+      if (!autoLoad) {
+        alert('Segmentation failed: ' + err.message);
+      }
       setState(prev => ({ ...prev, isDetecting: false }));
     }
-  };
+  }
+  handleRunSegmentationRef.current = handleRunSegmentation;
+
+  useEffect(() => {
+    if (!state.loaded || !state.selectedSample || !state.selectedPosition || !state.selectedChannel) {
+      setSegmentationRestoreNote(null);
+      return;
+    }
+    const sample = state.selectedSample;
+    const position = state.selectedPosition;
+    const channel = state.selectedChannel;
+    const ac = new AbortController();
+    setSegmentationRestoreNote(null);
+    (async () => {
+      try {
+        const url = `${getApiBase()}/api/exosome/latest_segment_result?sample=${encodeURIComponent(sample)}&position=${encodeURIComponent(position)}&channel=${encodeURIComponent(channel)}`;
+        const res = await fetch(url, { signal: ac.signal });
+        if (res.status === 404) {
+          return;
+        }
+        if (!res.ok) return;
+        const json = await res.json();
+        if (!json.success || !json.data || ac.signal.aborted) return;
+        if (
+          stateRef.current.selectedChannel !== channel ||
+          stateRef.current.selectedSample !== sample ||
+          stateRef.current.selectedPosition !== position
+        ) {
+          return;
+        }
+        if (stateRef.current.isDetecting) {
+          return;
+        }
+        const parsed = parseSegmentationDataPayload(json.data, {
+          includeProbabilityMap: !!json.data?.probability_map,
+        });
+        const hasContent =
+          parsed.detections.length > 0 || (parsed.masks && parsed.masks.length > 0);
+        if (!hasContent) {
+          return;
+        }
+        setDetectionBatchId((b) => b + 1);
+        setState((prev) => ({
+          ...prev,
+          masks: parsed.masks,
+          scores: parsed.scores,
+          detections: parsed.detections,
+          probabilityMap: parsed.probabilityMap ?? null,
+          confidenceThreshold:
+            parsed.confidenceThreshold != null && Number.isFinite(parsed.confidenceThreshold)
+              ? parsed.confidenceThreshold
+              : prev.confidenceThreshold,
+        }));
+        if (json.data._restored_from_disk) {
+          setSegmentationRestoreNote('Restored from last run');
+        }
+      } catch (e: unknown) {
+        if (e instanceof Error && e.name === 'AbortError') return;
+      }
+    })();
+    return () => ac.abort();
+  }, [state.loaded, state.selectedSample, state.selectedPosition, state.selectedChannel]);
 
   useEffect(() => {
     if (state.detectionMethod !== 'random_forest') return;
-    refreshRfModelList();
-  }, [state.detectionMethod, state.selectedSample, state.selectedChannel, refreshRfModelList]);
+    void refreshRfPersistedStatus();
+  }, [state.detectionMethod, state.selectedSample, state.selectedChannel, refreshRfPersistedStatus]);
 
   // Clear prompts
   const handleClearPrompts = () => {
@@ -3136,17 +3638,6 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
       ...prev,
       boxPrompt: null,
       pointPrompts: [],
-    }));
-  };
-
-  // Clear masks
-  const handleClearMasks = () => {
-    setDetectionBatchId(b => b + 1);
-    setState(prev => ({
-      ...prev,
-      masks: null,
-      scores: null,
-      detections: [],
     }));
   };
 
@@ -3227,14 +3718,17 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
               <label>Sample:</label>
               <select
                 value={state.selectedSample}
-                onChange={(e) => setState(prev => ({
-                  ...prev,
-                  selectedSample: e.target.value,
-                  availableRfModels: [],
-                  selectedRfModelSourcePosition: '',
-                  rfModelStatus: null,
-                  rfModelWarning: null,
-                }))}
+                onChange={(e) => {
+                  saveClickHistory();
+                  setState(prev => ({
+                    ...prev,
+                    selectedSample: e.target.value,
+                    alignArtifactChannels: [],
+                    rfPersistedStatus: null,
+                    rfModelStatus: null,
+                    rfModelWarning: null,
+                  }));
+                }}
               >
                 <option value="">-- Select sample --</option>
                 {state.availableSamples.map(sample => (
@@ -3246,14 +3740,17 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
               <label>Position:</label>
               <select
                 value={state.selectedPosition}
-                onChange={(e) => setState(prev => ({
-                  ...prev,
-                  selectedPosition: e.target.value,
-                  availableRfModels: [],
-                  selectedRfModelSourcePosition: '',
-                  rfModelStatus: null,
-                  rfModelWarning: null,
-                }))}
+                onChange={(e) => {
+                  saveClickHistory();
+                  setState(prev => ({
+                    ...prev,
+                    selectedPosition: e.target.value,
+                    alignArtifactChannels: [],
+                    rfPersistedStatus: null,
+                    rfModelStatus: null,
+                    rfModelWarning: null,
+                  }));
+                }}
                 disabled={!state.selectedSample}
               >
                 <option value="">-- Select position --</option>
@@ -3262,9 +3759,37 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
                 ))}
               </select>
             </div>
-            <div className="input-group">
-              <label>Channel:</label>
+            <div className="input-group" style={{ flexWrap: 'wrap', alignItems: 'center', columnGap: '0.5rem', rowGap: '0.25rem' }}>
+              <label htmlFor="exosome-channel-select">Channel:</label>
+              {state.loaded &&
+              state.selectedChannel &&
+              state.alignArtifactChannels.includes(state.selectedChannel) ? (
+                <span
+                  style={{
+                    fontSize: '0.72rem',
+                    color: '#1e8449',
+                    fontWeight: 600,
+                    whiteSpace: 'nowrap',
+                  }}
+                  title="Uses aligned TIFF from the sample align folder (saved when alignment runs)"
+                >
+                  Using aligned image
+                </span>
+              ) : null}
+              {segmentationRestoreNote ? (
+                <span
+                  style={{
+                    fontSize: '0.7rem',
+                    color: '#7f8c8d',
+                    fontStyle: 'italic',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {segmentationRestoreNote}
+                </span>
+              ) : null}
               <select
+                id="exosome-channel-select"
                 value={state.selectedChannel}
                 onChange={(e) => {
                   // Persist current channel annotations/history before switching context.
@@ -3280,8 +3805,7 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
                     probabilityMap: null,
                     boxPrompt: null,
                     pointPrompts: [],
-                    availableRfModels: [],
-                    selectedRfModelSourcePosition: '',
+                    rfPersistedStatus: null,
                     rfModelStatus: null,
                     rfModelWarning: null,
                   }));
@@ -3353,15 +3877,27 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
                     <div style={{ fontWeight: 700, color: '#2c3e50', marginBottom: 2 }}>📊 Display pipeline</div>
                     <div>
                       <span style={{ color: '#555' }}>mode:</span>{' '}
-                      <strong style={{ color: state.displayMode === 'raw_16bit' ? '#1565c0' : state.displayMode === 'enhanced' ? '#e65100' : '#4a148c' }}>
+                      <strong style={{
+                        color: state.displayMode === 'raw_16bit' ? '#1565c0'
+                          : state.displayMode === 'enhanced' ? '#e65100'
+                          : state.displayMode === 'processed_result' ? '#00695c'
+                          : '#4a148c',
+                      }}>
                         {state.displayMode === 'raw_16bit' ? 'ImageJ-like raw 16-bit' :
                          state.displayMode === 'enhanced'  ? 'Enhanced (p0.5–p99.5)' :
-                         'Raw min→max'}
+                         state.displayMode === 'processed_result'
+                           ? `Image Processing (${state.preprocessFinalStage || '—'})`
+                           : 'Raw min→max'}
                       </strong>
                       {state.displayMode === 'raw_16bit' && (
                         <span style={{ fontSize: '0.68rem', color: '#27ae60', marginLeft: 4 }}>(default)</span>
                       )}
                     </div>
+                    {state.displayMode === 'processed_result' && (
+                      <div style={{ fontSize: '0.68rem', color: '#00695c', marginTop: 2 }}>
+                        Last pipeline TIFF · preview p0.5–p99.5 (visualisation only — detection unchanged)
+                      </div>
+                    )}
                     <div>
                       <span style={{ color: '#555' }}>LUT:</span>{' '}
                       <strong style={{ color: state.displayLut === 'red' ? '#c0392b' : '#333' }}>
@@ -3385,7 +3921,7 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
                         </span>
                       </div>
                     )}
-                    {state.displayMode !== 'raw_16bit' && (
+                    {state.displayMode !== 'raw_16bit' && state.displayMode !== 'processed_result' && (
                       <div style={{ marginTop: 4, color: '#e65100', fontSize: '0.68rem' }}>
                         ⚠ Not default — switch to "ImageJ-like" for faithful comparison
                       </div>
@@ -3408,7 +3944,9 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
                     <div>
                       <span style={{ color: '#555' }}>Display:</span>{' '}
                       <span title={selItem.display_source} style={{ color: '#1565c0', wordBreak: 'break-all' }}>
-                        preview PNG (8-bit, stretched)
+                        {state.displayMode === 'processed_result'
+                          ? 'last Image Processing TIFF → preview PNG (8-bit)'
+                          : 'preview PNG (8-bit, stretched)'}
                       </span>
                     </div>
                     <div>
@@ -3439,13 +3977,37 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
               <label>Method:</label>
               <select
                 value={state.detectionMethod}
-                onChange={(e) => setState(prev => ({ ...prev, detectionMethod: e.target.value as 'sam' | 'blob' | 'random_forest' }))}
+                onChange={(e) => {
+                  saveClickHistory();
+                  setState((prev) => ({
+                    ...prev,
+                    detectionMethod: e.target.value as 'sam' | 'blob' | 'random_forest',
+                  }));
+                }}
               >
                 <option value="sam">SAM (Segment Anything Model)</option>
                 <option value="blob">Blob-Based Detection</option>
                 <option value="random_forest">Random Forest (Interactive, ML)</option>
               </select>
             </div>
+            {state.loaded && (
+              <div className="input-group" style={{ marginTop: '0.5rem' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={state.showCanvasUserMarks}
+                    onChange={(e) => {
+                      const v = e.target.checked;
+                      setState((prev) => ({ ...prev, showCanvasUserMarks: v }));
+                    }}
+                  />
+                  <span>Show brush strokes and prompt marks on image</span>
+                </label>
+                <small style={{ color: '#666', display: 'block', marginTop: '0.25rem' }}>
+                  Turned off when you use Load Image (saved data unchanged); enable here or by drawing again.
+                </small>
+              </div>
+            )}
           </div>
           
           {/* Random Forest Annotation Controls */}
@@ -3489,6 +4051,14 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
               />
               <small style={{color: '#666', display: 'block', marginTop: '0.25rem'}}>
                 Shortcuts: <b>[</b> / <b>]</b> brush size, <b>E</b> eraser toggle, or Shift + Mouse Wheel
+                {state.annotationMode === 'eraser' && (
+                  <>
+                    <br />
+                    <span style={{ color: '#b35c00' }}>
+                      Left click: erase exosome | Right click: erase background
+                    </span>
+                  </>
+                )}
               </small>
             </div>
             <button onClick={() => setState(prev => ({ ...prev, annotations: [], clickHistory: [] }))}>
@@ -3678,50 +4248,86 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
           <div className="control-section">
             <h3>Actions</h3>
             <button
-              onClick={handleRunSegmentation}
+              onClick={() => void handleRunSegmentation()}
               disabled={!state.loaded || state.isDetecting}
               className="primary-button"
             >
               {state.isDetecting ? 'Running...' : 'Run Segmentation'}
             </button>
-            <button onClick={handleClearPrompts}>Clear Prompts</button>
-            <button onClick={handleClearMasks}>Clear Masks</button>
+            {state.detectionMethod === 'sam' && (
+              <button onClick={handleClearPrompts}>Clear Prompts</button>
+            )}
             <button onClick={handleExport} disabled={state.detections.length === 0}>
               Export Results
             </button>
             {state.detectionMethod === 'random_forest' && (
-              <>
+              <div
+                style={{
+                  marginTop: '0.85rem',
+                  padding: '0.65rem 0.7rem',
+                  borderRadius: 8,
+                  border: '1px solid #cfd8dc',
+                  background: '#f8fafb',
+                }}
+              >
+                <h4
+                  style={{
+                    margin: '0 0 0.55rem 0',
+                    fontSize: '0.82rem',
+                    fontWeight: 700,
+                    color: '#37474f',
+                    letterSpacing: '0.02em',
+                  }}
+                >
+                  RF Model
+                </h4>
+                <div
+                  style={{
+                    padding: '0.45rem 0.55rem',
+                    borderRadius: 6,
+                    fontSize: '0.82rem',
+                    background: state.rfPersistedStatus?.exists ? '#e8f5e9' : '#fff',
+                    border: `1px solid ${state.rfPersistedStatus?.exists ? '#81c784' : '#e0e0e0'}`,
+                    color: '#222',
+                  }}
+                >
+                  <strong>RF on disk:</strong>{' '}
+                  {state.rfPersistedStatus?.exists
+                    ? `Model available (${state.rfPersistedStatus.channel_stem}${state.rfPersistedStatus.saved_at ? ` — saved ${new Date(state.rfPersistedStatus.saved_at).toLocaleString()}` : ''})`
+                    : 'No model trained yet for this sample/channel'}
+                </div>
+                {state.rfPersistedStatus?.available_models &&
+                  state.rfPersistedStatus.available_models.length > 1 && (
+                  <div className="input-group" style={{ marginTop: '0.45rem' }}>
+                    <label htmlFor="rf-model-picker" style={{ display: 'block', marginBottom: 4 }}>
+                      Saved model for inference
+                    </label>
+                    <select
+                      id="rf-model-picker"
+                      value={state.selectedRfModelPath}
+                      onChange={(e) =>
+                        setState((prev) => ({ ...prev, selectedRfModelPath: e.target.value }))
+                      }
+                      style={{ maxWidth: '100%', fontSize: '0.85rem' }}
+                    >
+                      {state.rfPersistedStatus.available_models.map((m) => (
+                        <option key={m.path} value={m.path}>
+                          {formatRfModelOptionLabel(m)}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
                 <button
+                  type="button"
                   onClick={handleSaveRfModel}
                   disabled={!state.loaded || state.isDetecting || state.annotations.length === 0}
-                  style={{ marginTop: '0.4rem' }}
-                  title="Train and save RF model for this sample/position/channel"
+                  className="primary-button"
+                  style={{ marginTop: '0.5rem' }}
+                  title="Train on current annotations and save to disk without running full segmentation response path"
                 >
-                  Save Model
+                  Train &amp; save to disk
                 </button>
-                <div style={{ marginTop: '0.6rem', border: '1px solid #ddd', borderRadius: 6, padding: '0.55rem' }}>
-                  <div style={{ fontWeight: 600, marginBottom: 4 }}>Load Model from Another Position</div>
-                  <select
-                    value={state.selectedRfModelSourcePosition}
-                    onChange={(e) => setState(prev => ({ ...prev, selectedRfModelSourcePosition: e.target.value }))}
-                    style={{ width: '100%', marginBottom: 6 }}
-                    disabled={!state.selectedSample || !state.selectedChannel}
-                  >
-                    <option value="">-- Select saved RF model --</option>
-                    {state.availableRfModels.map((model) => (
-                      <option key={model.path} value={model.position}>
-                        {`${model.position} | ${model.saved_at ? new Date(model.saved_at).toLocaleString() : 'unknown time'} | ${model.trained_on?.position || model.position}`}
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    onClick={handleLoadRfModelAndSegment}
-                    disabled={!state.selectedRfModelSourcePosition || state.isDetecting}
-                    style={{ width: '100%' }}
-                  >
-                    Segment with Loaded Model
-                  </button>
-                </div>
                 {state.rfModelStatus && (
                   <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: '#1a237e', wordBreak: 'break-all' }}>
                     {state.rfModelStatus}
@@ -3745,7 +4351,7 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
                     {state.rfModelWarning}
                   </div>
                 )}
-              </>
+              </div>
             )}
           </div>
         </div>
@@ -3771,15 +4377,36 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
                     ['raw_16bit', 'ImageJ-like raw 16-bit', '(default — arr/65535×255, dark)'],
                     ['enhanced',  'Enhanced stretch',       '(p0.5–p99.5, bright)'],
                     ['minmax',    'Raw min→max',            '(arr.min→arr.max)'],
+                    ['processed_result', 'Image Processing result', '(last pipeline step TIFF)'],
                   ] as [string, string, string][]
-                ).map(([val, label, hint]) => (
-                  <label key={val} style={{ display: 'flex', alignItems: 'baseline', gap: 5, cursor: 'pointer', fontSize: '0.78rem' }}>
+                ).map(([val, label, hint]) => {
+                  const disabled = val === 'processed_result' && !state.imageProcessingResultAvailable;
+                  return (
+                  <label
+                    key={val}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'baseline',
+                      gap: 5,
+                      cursor: disabled ? 'not-allowed' : 'pointer',
+                      fontSize: '0.78rem',
+                      opacity: disabled ? 0.5 : 1,
+                    }}
+                    title={disabled ? 'Run Image Processing first' : undefined}
+                  >
                     <input
                       type="radio"
                       name="exo-display-mode"
                       value={val}
+                      disabled={disabled}
                       checked={state.displayMode === val}
-                      onChange={() => setState(prev => ({ ...prev, displayMode: val as 'raw_16bit' | 'enhanced' | 'minmax' }))}
+                      onChange={() => {
+                        if (disabled) return;
+                        setState((prev) => ({
+                          ...prev,
+                          displayMode: val as 'raw_16bit' | 'enhanced' | 'minmax' | 'processed_result',
+                        }));
+                      }}
                     />
                     <span style={{ fontWeight: state.displayMode === val ? 700 : 400 }}>{label}</span>
                     {state.displayMode === val && (
@@ -3789,7 +4416,8 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
                       <span style={{ color: '#888', fontSize: '0.68rem' }}>(default)</span>
                     )}
                   </label>
-                ))}
+                  );
+                })}
               </div>
               {/* LUT toggle */}
               <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -3971,6 +4599,11 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
           <div
             ref={viewportRef}
             className="canvas-container"
+            title={
+              state.detectionMethod === 'random_forest' && state.annotationMode === 'eraser'
+                ? 'Left click: erase exosome | Right click: erase background'
+                : undefined
+            }
             onPointerEnter={() => {
               setRfPointerOverViewport(true);
             }}
@@ -4122,8 +4755,10 @@ const ExosomeDetection = forwardRef<ExosomeDetectionImperativeHandle, { isActive
                 selectedIdx={selectedDetectionRef.current}
                 onRowClick={(idx) => { selectedDetectionRef.current = idx; drawCanvas(); }}
                 filterArea={filterArea}
+                filterPerimeter={filterPerimeter}
                 filterCirc={filterCirc}
                 onFilterAreaChange={setFilterArea}
+                onFilterPerimeterChange={setFilterPerimeter}
                 onFilterCircChange={setFilterCirc}
                 onFilteredIndicesChange={handleFilteredIndicesChange}
                 onApplyFilters={handleApplyFilters}

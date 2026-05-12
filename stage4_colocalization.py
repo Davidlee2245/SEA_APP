@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from itertools import combinations
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -15,11 +16,34 @@ from scipy.stats import fisher_exact
 from statsmodels.stats.multitest import multipletests
 from upsetplot import UpSet, from_memberships
 
-from stage1_loader import ID_COL, PANEV_MARKER, POSITION_COL, RELEVANT_MARKERS, SAMPLE_COL, load_cygnus_object
+from stage1_loader import ID_COL, marker_base_columns, score_column, POSITION_COL, SAMPLE_COL, valid_marker_names, load_cygnus_object
 from stage3_preprocessing import apply_qc_filters, binarize_markers, normalize_by_panev, scale_expression_matrix
 
 
 sns.set_theme(style="whitegrid")
+
+_LOG = logging.getLogger(__name__)
+
+REFERENCE_COLOC_COLUMNS = [
+    "reference_marker",
+    "target_marker",
+    "reference_positive_count",
+    "double_positive_count",
+    "fraction_among_reference",
+    "background_rate",
+    "enrichment_vs_all",
+    "pvalue",
+    "fdr_pvalue",
+    "significance",
+]
+
+
+def _placeholder_figure(title: str, message: str) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.axis("off")
+    ax.set_title(title, fontsize=12)
+    ax.text(0.5, 0.5, message, ha="center", va="center", fontsize=11, transform=ax.transAxes)
+    return fig
 
 
 def _sig_label(pval: float) -> str:
@@ -62,7 +86,33 @@ def compute_colocalization(
 ) -> dict:
     """Compute observed/expected co-expression and permutation p-values."""
     binary_mat = _get_binary_matrix(ao)
-    markers = [m for m in RELEVANT_MARKERS if m in binary_mat.columns]
+    markers = [m for m in valid_marker_names(ao) if m in binary_mat.columns]
+    if len(markers) < 2:
+        _LOG.warning(
+            "Skipping colocalization: need at least 2 valid markers present in the binary matrix; found %s (%s).",
+            len(markers),
+            markers,
+        )
+        empty_cols = [
+            "combination",
+            "markers",
+            "degree",
+            "observed_count",
+            "observed_frequency",
+            "expected_count",
+            "deviation",
+            "empirical_pvalue",
+            "bonferroni_pvalue",
+            "fdr_pvalue",
+            "significance",
+        ]
+        result_df = pd.DataFrame(columns=empty_cols)
+        if ao.get("colocalization") is None:
+            ao["colocalization"] = {}
+        ao["colocalization"].setdefault("reference_centered", {})
+        ao["colocalization"]["all_combinations"] = result_df
+        return ao
+
     if max_degree is None:
         max_degree = len(markers)
 
@@ -139,20 +189,7 @@ def compute_reference_colocalization(ao: dict, reference_marker: str) -> pd.Data
             f"[WARNING] Reference marker '{reference_marker}' has 0 positive objects. "
             "Skipping reference-centered colocalization."
         )
-        ref_df = pd.DataFrame(
-            columns=[
-                "reference_marker",
-                "target_marker",
-                "reference_positive_count",
-                "double_positive_count",
-                "fraction_among_reference",
-                "background_rate",
-                "enrichment_vs_all",
-                "pvalue",
-                "fdr_pvalue",
-                "significance",
-            ]
-        )
+        ref_df = pd.DataFrame(columns=REFERENCE_COLOC_COLUMNS)
         if ao.get("colocalization") is None:
             ao["colocalization"] = {}
         ao["colocalization"].setdefault("reference_centered", {})
@@ -160,7 +197,8 @@ def compute_reference_colocalization(ao: dict, reference_marker: str) -> pd.Data
         return ref_df
 
     rows = []
-    for target in [m for m in RELEVANT_MARKERS if m != reference_marker and m in binary_mat.columns]:
+    markers_order = valid_marker_names(ao)
+    for target in [m for m in markers_order if m != reference_marker and m in binary_mat.columns]:
         target_pos_mask = binary_mat[target].astype(int) == 1
         double_pos = int((ref_pos_mask & target_pos_mask).sum())
         frac_among_ref = double_pos / ref_positive_count
@@ -193,8 +231,7 @@ def compute_reference_colocalization(ao: dict, reference_marker: str) -> pd.Data
         ref_df["significance"] = ref_df["fdr_pvalue"].map(_sig_label)
         ref_df = ref_df.sort_values(["fdr_pvalue", "double_positive_count"], ascending=[True, False]).reset_index(drop=True)
     else:
-        ref_df["fdr_pvalue"] = []
-        ref_df["significance"] = []
+        ref_df = pd.DataFrame(columns=REFERENCE_COLOC_COLUMNS)
 
     if ao.get("colocalization") is None:
         ao["colocalization"] = {}
@@ -215,11 +252,22 @@ def plot_upset(
     """Plot UpSet intersections from combination table."""
     col_df = (ao.get("colocalization") or {}).get("all_combinations")
     if col_df is None or col_df.empty:
-        raise ValueError("No colocalization combinations found. Run compute_colocalization first.")
+        msg = "Colocalization was skipped (fewer than 2 valid markers) or not computed."
+        fig = _placeholder_figure("Marker intersection UpSet plot", msg)
+        if save_path:
+            out = Path(save_path)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(out, dpi=200, bbox_inches="tight")
+        return fig
 
     df_plot = col_df.copy()
+    # Legacy: when pan-score stem appeared in combinations, it could be excluded; dynamic markers
+    # use only *_positive-derived bases, so this is usually a no-op.
     if not include_panev:
-        df_plot = df_plot[~df_plot["markers"].apply(lambda ms: PANEV_MARKER in ms)]
+        sc = str(score_column(ao))
+        score_stem = sc[: -len("_score")] if sc.endswith("_score") else sc
+        if score_stem:
+            df_plot = df_plot[~df_plot["markers"].apply(lambda ms: score_stem in ms)]
     df_plot = df_plot[(df_plot["observed_count"] >= min_count) & (df_plot["degree"] >= min_degree)]
     if df_plot.empty:
         raise ValueError("No intersections remain after min_count/min_degree filtering.")
@@ -277,7 +325,13 @@ def plot_volcano(
     """Plot volcano chart for combination significance."""
     col_df = (ao.get("colocalization") or {}).get("all_combinations")
     if col_df is None or col_df.empty:
-        raise ValueError("No colocalization combinations found. Run compute_colocalization first.")
+        msg = "Colocalization was skipped (fewer than 2 valid markers) or not computed."
+        fig = _placeholder_figure("Colocalization volcano plot", msg)
+        if save_path:
+            out = Path(save_path)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(out, dpi=200, bbox_inches="tight")
+        return fig
     if p_col not in col_df.columns:
         raise ValueError(f"p_col '{p_col}' not present.")
 
@@ -360,7 +414,18 @@ def plot_expression_heatmap(
 ):
     """Plot average marker expression by sample/position/cluster label."""
     matrix = _get_matrix(ao, input_matrix=input_matrix).copy()
-    markers = [m for m in matrix.columns if include_panev or m != PANEV_MARKER]
+    scol = score_column(ao)
+    vm = set(valid_marker_names(ao))
+    markers: List[str] = []
+    for m in matrix.columns:
+        if m == scol:
+            if include_panev:
+                markers.append(m)
+            continue
+        if m in vm:
+            markers.append(m)
+    if not markers:
+        raise ValueError("No valid marker columns in the selected matrix for the heatmap.")
 
     base_df = ao["cleaned_data"][[ID_COL, SAMPLE_COL, POSITION_COL]].copy()
     if group_by == "sample":
@@ -384,17 +449,38 @@ def plot_expression_heatmap(
 
     cmap = "RdBu_r" if input_matrix == "scaled" else "viridis"
 
-    if cluster_rows or cluster_cols:
-        fig = sns.clustermap(
-            grouped_mean,
-            cmap=cmap,
-            row_cluster=cluster_rows,
-            col_cluster=cluster_cols,
-            linewidths=0.3,
-            figsize=(10, 7),
-        )
-        fig.fig.suptitle(f"Average expression heatmap by {group_by}", y=1.02)
-        out_fig = fig.fig
+    # scipy/seaborn: hierarchical clustering needs ≥2 leaves; otherwise pdist is empty
+    # and scipy.spatial.distance.num_obs_y raises ValueError on an empty distance matrix.
+    nr, nc = grouped_mean.shape
+    row_cl = bool(cluster_rows and nr >= 2)
+    col_cl = bool(cluster_cols and nc >= 2)
+
+    if row_cl or col_cl:
+        try:
+            fig = sns.clustermap(
+                grouped_mean,
+                cmap=cmap,
+                row_cluster=row_cl,
+                col_cluster=col_cl,
+                linewidths=0.3,
+                figsize=(10, 7),
+            )
+            fig.fig.suptitle(f"Average expression heatmap by {group_by}", y=1.02)
+            out_fig = fig.fig
+        except ValueError as err:
+            # e.g. scipy.spatial.distance.num_obs_y: empty distance matrix (edge cases in clustering)
+            if "distance matrix" not in str(err).lower():
+                raise
+            _LOG.warning(
+                "clustermap failed for %s heatmap (%s); using plain heatmap.",
+                group_by,
+                err,
+            )
+            out_fig, ax = plt.subplots(figsize=(10, 6))
+            sns.heatmap(grouped_mean, cmap=cmap, linewidths=0.3, ax=ax)
+            ax.set_title(f"Average expression heatmap by {group_by}")
+            ax.set_xlabel("Markers")
+            ax.set_ylabel("Groups")
     else:
         out_fig, ax = plt.subplots(figsize=(10, 6))
         sns.heatmap(grouped_mean, cmap=cmap, linewidths=0.3, ax=ax)
@@ -416,7 +502,24 @@ def run_stage4(ao: Dict[str, Any], output_dir: Optional[str] = None) -> Dict[str
         out_dir.mkdir(parents=True, exist_ok=True)
 
     ao = compute_colocalization(ao)
-    compute_reference_colocalization(ao, reference_marker="EpCAM")
+    vm = valid_marker_names(ao)
+    ref = vm[0] if vm else None
+    if len(vm) >= 2:
+        compute_reference_colocalization(ao, reference_marker=ref)
+    elif len(vm) == 1:
+        _LOG.warning(
+            "Skipping reference-centered colocalization: need at least 2 valid markers for pairwise targets; found 1 (%r).",
+            ref,
+        )
+        if ao.get("colocalization") is None:
+            ao["colocalization"] = {}
+        ao["colocalization"].setdefault("reference_centered", {})
+        ao["colocalization"]["reference_centered"][ref] = pd.DataFrame(columns=REFERENCE_COLOC_COLUMNS)
+    else:
+        _LOG.warning("Skipping reference-centered colocalization: no valid markers.")
+        if ao.get("colocalization") is None:
+            ao["colocalization"] = {}
+        ao["colocalization"].setdefault("reference_centered", {})
 
     upset_fig = plot_upset(ao, save_path=str(out_dir / "upset_plot.png") if out_dir else None)
     volcano_fig = plot_volcano(ao, save_path=str(out_dir / "volcano_plot.png") if out_dir else None)
@@ -443,9 +546,10 @@ def run_stage4(ao: Dict[str, Any], output_dir: Optional[str] = None) -> Dict[str
 
     if out_dir:
         ao["colocalization"]["all_combinations"].to_csv(out_dir / "colocalization_all_combinations.csv", index=False)
-        ao["colocalization"]["reference_centered"]["EpCAM"].to_csv(
-            out_dir / "colocalization_reference_EpCAM.csv", index=False
-        )
+        if ref is not None:
+            ref_df = ao["colocalization"]["reference_centered"].get(ref)
+            if ref_df is not None:
+                ref_df.to_csv(out_dir / f"colocalization_reference_{ref}.csv", index=False)
 
     return ao
 

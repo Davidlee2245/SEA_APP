@@ -136,6 +136,7 @@ export interface ExosomeColocalizationResult {
   summary: ExosomeColocalizationSummary;
   channel_summary: ExosomeColocalizationChannelSummary[];
   combination_summary: ExosomeColocalizationCombination[];
+  background_intensities?: Record<string, number | null>;
   overlay?: {
     positive_reference_ids: number[];
     reference_channel: string;

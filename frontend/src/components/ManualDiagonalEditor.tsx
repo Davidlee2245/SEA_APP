@@ -159,17 +159,42 @@ const ManualDiagonalEditor: React.FC<Props> = ({ imageUrl, box, onBoxChange, cha
 
     ctx.save();
 
-    // Extended guide lines — one per box edge, clipped to canvas
+    // Extended guide lines — one per box edge, clipped to canvas.
+    // Under-stroke (dark halo) + brighter core: readable on bright images, still thinner than box (2px).
     {
       ctx.save();
       ctx.beginPath();
       ctx.rect(0, 0, dw, dh);
       ctx.clip();
-      ctx.strokeStyle = 'rgba(255, 255, 0, 0.30)';
-      ctx.lineWidth = 1;
       ctx.setLineDash([]);
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
       const EXTEND = 10000;
       const edgePairs: [number, number][] = [[0, 1], [1, 2], [2, 3], [3, 0]];
+      const strokeExtendedEdge = (ux: number, uy: number, mx: number, my: number) => {
+        const x0 = mx - ux * EXTEND;
+        const y0 = my - uy * EXTEND;
+        const x1 = mx + ux * EXTEND;
+        const y1 = my + uy * EXTEND;
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(x1, y1);
+        ctx.strokeStyle = 'rgba(0, 0, 0, 0.42)';
+        ctx.lineWidth = 4.0;
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(x1, y1);
+        ctx.strokeStyle = 'rgba(255, 235, 80, 0.82)';
+        ctx.lineWidth = 1.55;
+        ctx.shadowColor = 'rgba(0, 0, 0, 0.55)';
+        ctx.shadowBlur = 2.5;
+        ctx.shadowOffsetX = 0;
+        ctx.shadowOffsetY = 0;
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+        ctx.shadowColor = 'transparent';
+      };
       for (const [ai, bi] of edgePairs) {
         const [ax, ay] = corners[ai];
         const [bx, by] = corners[bi];
@@ -178,10 +203,7 @@ const ManualDiagonalEditor: React.FC<Props> = ({ imageUrl, box, onBoxChange, cha
         if (len < 1) continue;
         const ux = dx / len, uy = dy / len;
         const mx = (ax + bx) / 2, my = (ay + by) / 2;
-        ctx.beginPath();
-        ctx.moveTo(mx - ux * EXTEND, my - uy * EXTEND);
-        ctx.lineTo(mx + ux * EXTEND, my + uy * EXTEND);
-        ctx.stroke();
+        strokeExtendedEdge(ux, uy, mx, my);
       }
       ctx.restore();
     }

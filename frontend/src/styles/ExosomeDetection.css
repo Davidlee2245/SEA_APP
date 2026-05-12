@@ -305,8 +305,13 @@
 }
 
 .detections-table thead {
-  background: #34495e;
-  color: white;
+  background: #e8edf3;
+  color: #0f172a;
+}
+
+.detections-table thead th {
+  color: #0f172a;
+  font-weight: 600;
 }
 
 .detections-table th,

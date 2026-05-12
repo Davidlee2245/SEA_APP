@@ -9,7 +9,7 @@ from flask_sock import Sock
 from pathlib import Path
 import json
 import numpy as np
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import tifffile
 from io import BytesIO
 from PIL import Image
@@ -78,6 +78,8 @@ INPUT_ROOT        = Path("data/input")
 DATA_ROOT         = Path(os.getenv('SEA_DATA_ROOT', 'data/input'))
 PREVIEW_CACHE     = Path("previews")
 PROCESSING_OUTPUT = Path("data/processing")
+# Written next to aligned_from_<stage>/*_aligned.tif for mirror-save raw recomputation.
+ALIGNMENT_WARP_META_JSON = "alignment_warp_meta.json"
 
 # Global state for WebSocket clients
 ws_clients = set()
@@ -86,6 +88,41 @@ ws_lock = threading.Lock()
 # Session state: Track preprocessing stages per position
 # Structure: {f"{sample}/{position}": {"raw": {...}, "contrast": {...}, "step1": {...}, ...}}
 preprocessing_cache: Dict[str, Dict[str, Dict[str, Path]]] = {}
+
+
+def _safe_position_segment(position_name: str) -> str:
+    """Safe single path segment for position (no traversal)."""
+    seg = (position_name or "").strip().replace("\\", "_").replace("/", "_")
+    if seg in (".", ".."):
+        seg = "default"
+    return seg or "default"
+
+
+def _colocalization_results_dir(sample_name: str, position_name: str) -> Path:
+    """DATA_ROOT/<sample>/results/<position>/ — persisted colocalization outputs."""
+    sn = (sample_name or "").strip()
+    pn = _safe_position_segment(position_name)
+    d = DATA_ROOT / sn / "results" / pn
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _colocalization_dir_for_read(sample_name: str, position_name: str, exo_base: Path) -> Path:
+    """Prefer DATA_ROOT results; fall back to legacy OUTPUT_ROOT exosome colocalization folder."""
+    data_dir = DATA_ROOT / sample_name / "results" / _safe_position_segment(position_name)
+    legacy = exo_base / "colocalization"
+
+    def _has_outputs(p: Path) -> bool:
+        return (
+            (p / "colocalization_summary.json").exists()
+            or (p / "colocalization_reference_table.json").exists()
+        )
+
+    if _has_outputs(data_dir):
+        return data_dir
+    if _has_outputs(legacy):
+        return legacy
+    return data_dir
 
 
 def get_session(sample_name: str, position_name: str):
@@ -400,44 +437,52 @@ def save_sample_sea_state(sample):
 
     return jsonify({'success': True})
 
-# Marker mapping cache: {cycle_upper: {channel_upper: marker}}
-# Example: {"C1": {"CH1": "p62", "CH2": "CD63"}, ...}
-marker_map: Dict[str, Dict[str, str]] = {}
-MARKER_EXCEL_PATH = Path("data/label/Marker_info.xlsx")
+# Marker mapping cache keyed by sanitized sample id:
+# { sample_id: { cycle_upper: { channel_upper: marker } } }
+marker_map_cache: Dict[str, Dict[str, Dict[str, str]]] = {}
+# Ordered channel rows for intensity export (same workbook, parsed separately)
+_marker_ordered_channels_cache: Dict[str, List[Dict[str, str]]] = {}
+
 
 def clear_marker_cache():
-    """Clear the marker mapping cache to force reload."""
-    global marker_map
-    marker_map = {}
+    """Clear per-sample marker caches to force reload."""
+    global marker_map_cache, _marker_ordered_channels_cache
+    marker_map_cache = {}
+    _marker_ordered_channels_cache = {}
 
 
-def load_marker_mapping() -> Dict[str, Dict[str, str]]:
+def load_marker_mapping(sample_name: str) -> Dict[str, Dict[str, str]]:
     """
-    Load marker mapping from Excel file.
+    Load marker mapping from DATA_ROOT/<sample_id>/Marker_info.xlsx.
     Columns: D = Cycle, E = Channel, F = Marker
     
     Returns:
         Dictionary: {cycle_upper: {channel_upper: marker}}
         Example: {"C1": {"CH1": "p62", "CH2": "CD63"}}
     """
-    global marker_map
-    
-    # Return cached if already loaded
-    if marker_map:
-        return marker_map
-    
-    marker_map = {}
-    
-    excel_path = Path(MARKER_EXCEL_PATH)
-    if not excel_path.exists():
+    global marker_map_cache
+
+    sn = _sanitize_sample_dir_name((sample_name or "").strip())
+    if not sn:
+        print("Warning: Invalid or empty sample name for marker mapping; returning empty mapping.")
+        return {}
+
+    if sn in marker_map_cache:
+        return marker_map_cache[sn]
+
+    marker_map: Dict[str, Dict[str, str]] = {}
+    excel_path = DATA_ROOT / sn / "Marker_info.xlsx"
+    if not excel_path.is_file():
         print(f"Warning: Marker mapping file not found: {excel_path}")
+        marker_map_cache[sn] = marker_map
         return marker_map
     
     # Check if openpyxl is available
     if not _openpyxl_available:
         print(f"ERROR: Cannot load marker mapping - openpyxl is not installed!")
         print(f"Please install it with: pip install openpyxl")
-        return marker_map
+        marker_map_cache[sn] = {}
+        return {}
     
     try:
         # Import openpyxl here to ensure it's loaded before pandas tries to use it
@@ -492,22 +537,24 @@ def load_marker_mapping() -> Dict[str, Dict[str, str]]:
     except Exception as e:
         print(f"Error loading marker mapping: {e}")
         marker_map = {}
-    
+
+    marker_map_cache[sn] = marker_map
     return marker_map
 
 
-def get_marker(cycle: str, channel: str) -> Optional[str]:
+def get_marker(cycle: str, channel: str, sample_name: str) -> Optional[str]:
     """
     Get marker for a given cycle and channel.
     
     Args:
         cycle: Cycle string (e.g., "C1")
         channel: Channel string (e.g., "Ch1")
+        sample_name: Sample id (reads DATA_ROOT/<sample>/Marker_info.xlsx)
     
     Returns:
         Marker string or None if not found
     """
-    mapping = load_marker_mapping()
+    mapping = load_marker_mapping(sample_name)
     cycle_upper = cycle.upper()
     channel_upper = channel.upper()
     
@@ -966,7 +1013,6 @@ def _load_position_crop(
     ch_cache_dir.mkdir(parents=True, exist_ok=True)
 
     mtime = best_tiff.stat().st_mtime
-    marker_mapping = load_marker_mapping()
 
     items = []
     channel_files_dict = {}
@@ -979,7 +1025,7 @@ def _load_position_crop(
         ch_tiff_path = ch_cache_dir / f"{ch_hash}.tif"
         _save_channel_tiff_cache(ch_slice, ch_tiff_path)
 
-        marker = get_marker(cycle, channel_str)
+        marker = get_marker(cycle, channel_str, sample_name)
         display_label = f"{key}({marker})" if marker else key
 
         preview_url, norm_stats = generate_preview_png_from_array(
@@ -1494,7 +1540,7 @@ def load_exosome_results_by_position(sample_name: str, position_name: str) -> Tu
                 if '_ch' in channel_key:
                     cycle = channel_key.split('_')[0]
                     ch = channel_key.split('_')[1].replace('ch', 'CH')
-                    marker_name = get_marker(cycle, ch) or ''
+                    marker_name = get_marker(cycle, ch, sample_name) or ''
             except Exception:
                 marker_name = ''
             channel_markers[channel_key] = marker_name
@@ -1566,7 +1612,7 @@ def load_exosome_results_by_position(sample_name: str, position_name: str) -> Tu
         if final_results:
             trace['selected_path'] = str(exo_base)
             print(f"[Results][exosome] selected {exo_base} with {len(final_results)} files")
-            coloc_dir = exo_base / 'colocalization'
+            coloc_dir = _colocalization_dir_for_read(sample_name, position_name, exo_base)
             coloc_summary_path = coloc_dir / 'colocalization_summary.json'
             coloc_combo_path = coloc_dir / 'colocalization_combinations.csv'
             coloc_reference_json = coloc_dir / 'colocalization_reference_table.json'
@@ -1659,6 +1705,7 @@ def load_exosome_results_by_position(sample_name: str, position_name: str) -> Tu
                             }
                             for ch in marker_channels:
                                 row[f"{ch}_positive"] = False
+                                row[f"{ch}_positive_geom"] = False
                                 row[f"{ch}_count"] = 0
                                 row[f"{ch}_nearest_distance"] = None
                                 row[f"{ch}_matched_ids"] = []
@@ -1849,6 +1896,85 @@ def load_exosome_results_by_position(sample_name: str, position_name: str) -> Tu
     return None, trace
 
 
+def _load_saved_reference_filter_object_ids(
+    sample_name: str,
+    position_name: str,
+    reference_channel: str,
+) -> Optional[Set[int]]:
+    """
+    Read sea_filtered_detections_<sample>_<position>_<channel> from exosome_state.json
+    (INPUT_ROOT/<sample>/.sea_state/exosome_state.json → exosome.storage).
+
+    Returns:
+        None — no saved filter or disabled / invalid → use all reference detections.
+        Set[int] — restrict colocalization to these reference object IDs (may be empty).
+    """
+    sn = _sanitize_sample_dir_name((sample_name or "").strip())
+    if not sn:
+        return None
+
+    path = INPUT_ROOT / sn / '.sea_state' / _SEA_STATE_FILES['exosome']
+    if not path.is_file():
+        return None
+
+    try:
+        blob = json.loads(path.read_text(encoding='utf8'))
+    except Exception as e:
+        print(f"[Coloc] Could not read exosome state for reference filter: {e}")
+        return None
+
+    storage = blob.get('storage') if isinstance(blob, dict) else None
+    if not isinstance(storage, dict):
+        return None
+
+    key = f"sea_filtered_detections_{sample_name}_{position_name}_{reference_channel}"
+    raw = storage.get(key)
+    if raw is None or not isinstance(raw, str) or not raw.strip():
+        return None
+
+    try:
+        parsed = json.loads(raw)
+    except Exception as e:
+        print(f"[Coloc] Could not parse saved filter JSON for {key}: {e}")
+        return None
+
+    if not isinstance(parsed, dict):
+        return None
+    if parsed.get('enabled') is False:
+        return None
+
+    ids_raw = parsed.get('objectIds')
+    if not isinstance(ids_raw, list):
+        return None
+
+    out: Set[int] = set()
+    for v in ids_raw:
+        try:
+            n = int(float(v))
+        except (TypeError, ValueError):
+            continue
+        out.add(n)
+
+    print(f"[Coloc] Applying saved reference filter {key} ({len(out)} object IDs)")
+    return out
+
+
+def _subset_reference_label_mask_for_ids(
+    label_mask: Optional[np.ndarray],
+    keep_ids: Set[int],
+) -> Optional[np.ndarray]:
+    """Zero out reference label-mask pixels whose object id is not in keep_ids."""
+    if label_mask is None:
+        return None
+    if not keep_ids:
+        return np.zeros_like(label_mask)
+    out = np.zeros_like(label_mask)
+    for oid in keep_ids:
+        o = int(oid)
+        out[label_mask == o] = o
+    return out
+
+
 def _load_latest_exosome_artifacts(sample_name: str, position_name: str) -> Dict[str, Any]:
     """Load latest per-channel exosome detection artifacts from disk."""
     exo_base = OUTPUT_ROOT / 'exosome_detection' / sample_name / position_name
@@ -1871,7 +1997,7 @@ def _load_latest_exosome_artifacts(sample_name: str, position_name: str) -> Dict
             with open(latest_csv, 'r', newline='') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    rows.append({
+                    rdict = {
                         'id': int(float(row.get('id', 0) or 0)),
                         'area': float(row.get('area', 0) or 0),
                         'perimeter': float(row.get('perimeter', 0) or 0),
@@ -1883,7 +2009,16 @@ def _load_latest_exosome_artifacts(sample_name: str, position_name: str) -> Dict
                         'bbox_x2': float(row.get('bbox_x2', 0) or 0),
                         'bbox_y2': float(row.get('bbox_y2', 0) or 0),
                         'score': float(row.get('score', 0) or 0),
-                    })
+                    }
+                    mi_raw = row.get('mean_intensity')
+                    if mi_raw is not None and str(mi_raw).strip() != '':
+                        try:
+                            mi = float(mi_raw)
+                            if np.isfinite(mi):
+                                rdict['mean_intensity'] = mi
+                        except (TypeError, ValueError):
+                            pass
+                    rows.append(rdict)
         except Exception as e:
             print(f"[Coloc] Failed to read {latest_csv}: {e}")
             rows = []
@@ -1907,7 +2042,7 @@ def _load_latest_exosome_artifacts(sample_name: str, position_name: str) -> Dict
             if '_ch' in channel:
                 cycle = channel.split('_')[0]
                 ch = channel.split('_')[1].replace('ch', 'CH')
-                marker_name = get_marker(cycle, ch) or ''
+                marker_name = get_marker(cycle, ch, sample_name) or ''
         except Exception:
             marker_name = ''
 
@@ -1924,13 +2059,82 @@ def _load_latest_exosome_artifacts(sample_name: str, position_name: str) -> Dict
     return artifacts
 
 
+def _marker_mean_intensity_by_channel_from_artifacts(
+    artifacts: Dict[str, Any],
+) -> Dict[str, Dict[int, float]]:
+    """object_id -> mean_intensity from detection CSV per channel (only where CSV had values)."""
+    out: Dict[str, Dict[int, float]] = {}
+    for ch, info in artifacts.items():
+        id_map: Dict[int, float] = {}
+        for row in info.get('rows', []):
+            oid = int(row.get('id', 0) or 0)
+            if oid <= 0 or 'mean_intensity' not in row:
+                continue
+            try:
+                v = float(row['mean_intensity'])
+                if np.isfinite(v):
+                    id_map[oid] = v
+            except (TypeError, ValueError):
+                continue
+        out[ch] = id_map
+    return out
+
+
+def _compute_exosome_channel_background_intensity(
+    sample_name: str,
+    position_name: str,
+    channel_name: str,
+) -> Tuple[Optional[float], float, int, Optional[str]]:
+    """
+    Mean intensity over pixels with probability below the run threshold (RF background).
+
+    Returns:
+        (background_intensity or None if no pixels, threshold_used, pixel_count, error or None)
+    """
+    prob_path = _resolve_latest_probability_map_path(sample_name, position_name, channel_name)
+    if prob_path is None or not prob_path.is_file():
+        return None, 0.5, 0, 'no_probability_map'
+
+    tiff_path = _resolve_detection_image_path(sample_name, position_name, channel_name)
+    if tiff_path is None or not tiff_path.is_file():
+        return None, 0.5, 0, 'image_not_found'
+
+    run_json_path = _run_json_path_for_probability_map(prob_path)
+    threshold_used = _confidence_threshold_from_run_json(run_json_path, default=0.5) if run_json_path else 0.5
+
+    try:
+        prob_map = np.load(str(prob_path))
+        if getattr(prob_map, 'ndim', 0) != 2:
+            return None, threshold_used, 0, 'bad_probability_map_shape'
+        prob_f = np.asarray(prob_map, dtype=np.float64)
+
+        raw_img = _read_tiff_as_array(str(tiff_path))
+        if raw_img is None:
+            return None, threshold_used, 0, 'tiff_read_failed'
+        if raw_img.shape != prob_f.shape:
+            return None, threshold_used, 0, 'shape_mismatch'
+
+        bg_mask = prob_f < float(threshold_used)
+        pixel_count = int(np.count_nonzero(bg_mask))
+        if pixel_count == 0:
+            return None, threshold_used, 0, None
+        m = float(raw_img[bg_mask].mean())
+        if not np.isfinite(m):
+            return None, threshold_used, pixel_count, None
+        return m, threshold_used, pixel_count, None
+    except Exception as e:
+        return None, threshold_used, 0, str(e)
+
+
 def _load_reference_colocalization(sample_name: str, position_name: str) -> List[Dict[str, Any]]:
     """
     Load the latest persisted reference colocalization table for sample/position.
     Returns [] when not available.
     """
-    coloc_json = OUTPUT_ROOT / 'exosome_detection' / sample_name / position_name / 'colocalization' / 'colocalization_reference_table.json'
-    coloc_csv = OUTPUT_ROOT / 'exosome_detection' / sample_name / position_name / 'colocalization' / 'colocalization_reference_table.csv'
+    exo_base = OUTPUT_ROOT / 'exosome_detection' / sample_name / position_name
+    coloc_dir = _colocalization_dir_for_read(sample_name, position_name, exo_base)
+    coloc_json = coloc_dir / 'colocalization_reference_table.json'
+    coloc_csv = coloc_dir / 'colocalization_reference_table.csv'
 
     if coloc_json.exists():
         try:
@@ -2000,25 +2204,40 @@ def cygnus_health():
 
 @app.route('/api/cygnus/run', methods=['POST'])
 def run_cygnus_pipeline():
-    if 'file' not in request.files:
-        return jsonify({"success": False, "message": "No file provided."}), 400
+    from cygnus_upload_merge import merge_cygnus_upload_files
 
-    f = request.files['file']
-    if not f.filename or not f.filename.lower().endswith(".csv"):
-        return jsonify({"success": False, "message": "Only CSV files are supported."}), 400
+    uploads = [f for f in request.files.getlist("files") if getattr(f, "filename", None)]
+    if not uploads:
+        f0 = request.files.get("file")
+        if f0 and f0.filename:
+            uploads = [f0]
+
+    if not uploads:
+        return jsonify({"success": False, "message": "No file provided."}), 400
 
     tmp_path = None
     output_dir = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+        t_pipe = time.perf_counter()
+        from run_pipeline import cygnus_pipeline_log, run_full_pipeline
+
+        cygnus_pipeline_log("merge_files_start", t_pipe, detail=f"upload_count={len(uploads)}")
+        merged = merge_cygnus_upload_files(uploads, _openpyxl_available)
+        cygnus_pipeline_log(
+            "merge_files_done",
+            t_pipe,
+            detail=f"rows={len(merged)} cols={merged.shape[1]}",
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w", newline="") as tmp:
             tmp_path = tmp.name
-        f.save(tmp_path)
+        merged.to_csv(tmp_path, index=False)
+        cygnus_pipeline_log("temp_csv_written", t_pipe, detail=f"path={tmp_path}")
 
         output_dir = tempfile.mkdtemp()
+        cygnus_pipeline_log("temp_output_dir", t_pipe, detail=f"path={output_dir}")
 
-        from run_pipeline import run_full_pipeline
-
-        run_full_pipeline(filepath=tmp_path, output_dir=output_dir)
+        run_full_pipeline(filepath=tmp_path, output_dir=output_dir, pipeline_t0=t_pipe)
 
         report_path = os.path.join(output_dir, "cygnus_report.html")
         if not os.path.isfile(report_path):
@@ -2027,8 +2246,15 @@ def run_cygnus_pipeline():
         with open(report_path, encoding="utf-8") as rfile:
             report_html = rfile.read()
 
+        cygnus_pipeline_log(
+            "response_ready",
+            t_pipe,
+            detail=f"report_html_chars={len(report_html)}",
+        )
         return jsonify({"success": True, "report_html": report_html})
 
+    except ValueError as e:
+        return jsonify({"success": False, "message": str(e)}), 400
     except Exception as e:
         return jsonify({
             "success": False,
@@ -2164,6 +2390,184 @@ def get_exosome_channel_detections():
     })
 
 
+def _exosome_bundle_timestamp_from_results_csv(csv_path: Path, channel: str) -> Optional[str]:
+    m = re.match(rf'^{re.escape(channel)}_results_(.+)\.csv$', csv_path.name, re.IGNORECASE)
+    if not m:
+        return None
+    return m.group(1).strip()
+
+
+def _load_latest_exosome_segment_api_payload(
+    sample_name: str,
+    position_name: str,
+    channel_name: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Build a dict matching the successful /api/exosome/segment ``data`` payload from
+    the latest persisted bundle under OUTPUT_ROOT/exosome_detection/...
+    """
+    exo_base = OUTPUT_ROOT / 'exosome_detection' / sample_name / position_name / channel_name
+    if not exo_base.is_dir():
+        return None
+
+    csv_files = sorted(exo_base.glob(f'{channel_name}_results_*.csv'))
+    if not csv_files:
+        return None
+
+    latest_csv = csv_files[-1]
+    timestamp = _exosome_bundle_timestamp_from_results_csv(latest_csv, channel_name)
+    if not timestamp:
+        return None
+
+    masks_path = exo_base / f'{channel_name}_masks_{timestamp}.npz'
+    run_json_path = exo_base / f'{channel_name}_run_{timestamp}.json'
+    prob_path = exo_base / f'{channel_name}_run_{timestamp}_probability_map.npy'
+
+    detections: List[Dict[str, Any]] = []
+    try:
+        with open(latest_csv, 'r', newline='') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    area = float(row.get('area', 0) or 0)
+                except (TypeError, ValueError):
+                    area = 0.0
+                try:
+                    perimeter = float(row.get('perimeter', 0) or 0)
+                except (TypeError, ValueError):
+                    perimeter = 0.0
+                try:
+                    circularity = float(row.get('circularity', 0) or 0)
+                except (TypeError, ValueError):
+                    circularity = 0.0
+                try:
+                    cx = float(row.get('centroid_x', 0) or 0)
+                    cy = float(row.get('centroid_y', 0) or 0)
+                except (TypeError, ValueError):
+                    cx, cy = 0.0, 0.0
+                try:
+                    bx1 = float(row.get('bbox_x1', 0) or 0)
+                    by1 = float(row.get('bbox_y1', 0) or 0)
+                    bx2 = float(row.get('bbox_x2', 0) or 0)
+                    by2 = float(row.get('bbox_y2', 0) or 0)
+                except (TypeError, ValueError):
+                    bx1 = by1 = bx2 = by2 = 0.0
+                try:
+                    score = float(row.get('score', 0) or 0)
+                except (TypeError, ValueError):
+                    score = 0.0
+                detections.append({
+                    'area': area,
+                    'centroid': [cx, cy],
+                    'bbox': [int(bx1), int(by1), int(bx2), int(by2)],
+                    'perimeter': round(perimeter, 2) if perimeter else 0.0,
+                    'circularity': circularity,
+                    '_csv_score': score,
+                })
+    except Exception as e:
+        app.logger.warning(f"[Exosome Restore] Failed to read {latest_csv}: {e}")
+        return None
+
+    scores_list: List[float] = []
+    masks_payload: List[Any] = []
+    if masks_path.is_file():
+        try:
+            npz = np.load(masks_path, allow_pickle=True)
+            m_arr = npz.get('masks')
+            sc = npz.get('scores')
+            if m_arr is not None and getattr(m_arr, 'ndim', 0) == 3:
+                n = int(m_arr.shape[0])
+                for i in range(n):
+                    masks_payload.append(np.asarray(m_arr[i], dtype=bool).tolist())
+            if sc is not None:
+                sc_f = np.asarray(sc, dtype=np.float64).reshape(-1)
+                scores_list = [float(x) if np.isfinite(x) else 0.0 for x in sc_f.tolist()]
+        except Exception as e:
+            app.logger.warning(f"[Exosome Restore] Failed to load masks npz {masks_path}: {e}")
+
+    if len(scores_list) < len(detections):
+        pad = len(detections) - len(scores_list)
+        fallback_scores = [float(d.get('_csv_score', 0.0) or 0.0) for d in detections[len(scores_list):]]
+        scores_list = scores_list + fallback_scores[:pad]
+
+    for d in detections:
+        d.pop('_csv_score', None)
+
+    n_det = len(detections)
+    n_m = len(masks_payload)
+    # RF persistence uses one combined (H,W) mask with many detections; SAM uses one mask per detection.
+    if n_m == 1 and n_det >= 1:
+        pass
+    elif n_m > n_det:
+        masks_payload = masks_payload[:n_det]
+    elif n_m < n_det and n_m > 1:
+        app.logger.warning(
+            f"[Exosome Restore] Mask count {n_m} != detection count {n_det}; truncating detections to masks"
+        )
+        detections = detections[:n_m]
+        scores_list = scores_list[:n_m]
+
+    probability_map: Any = None
+    if prob_path.is_file():
+        try:
+            prob_arr = np.load(str(prob_path))
+            prob_arr = np.asarray(prob_arr, dtype=np.float32)
+            if prob_arr.ndim == 2 and prob_arr.size > 0:
+                probability_map = prob_arr.tolist()
+        except Exception as e:
+            app.logger.warning(f"[Exosome Restore] Failed to load probability map {prob_path}: {e}")
+
+    confidence_threshold: Optional[float] = None
+    if run_json_path.is_file():
+        try:
+            with open(run_json_path, 'r') as rf:
+                run_data = json.load(rf)
+            settings = run_data.get('settings') if isinstance(run_data.get('settings'), dict) else {}
+            raw_ct = settings.get('confidence_threshold')
+            if raw_ct is not None:
+                confidence_threshold = float(raw_ct)
+        except Exception as e:
+            app.logger.warning(f"[Exosome Restore] Failed to read run json {run_json_path}: {e}")
+
+    out: Dict[str, Any] = {
+        'masks': masks_payload,
+        'scores': scores_list,
+        'detections': detections,
+        '_restored_from_disk': True,
+    }
+    if probability_map is not None:
+        out['probability_map'] = probability_map
+    if confidence_threshold is not None:
+        out['confidence_threshold'] = confidence_threshold
+    return out
+
+
+@app.route('/api/exosome/latest_segment_result', methods=['GET'])
+def get_exosome_latest_segment_result():
+    """
+    Return the latest persisted segmentation for one channel in the same shape as
+    ``/api/exosome/segment`` success ``data`` (masks, scores, detections, optional probability_map).
+    """
+    sample_name = (request.args.get('sample') or '').strip()
+    position_name = (request.args.get('position') or '').strip()
+    channel_name = (request.args.get('channel') or '').strip()
+
+    if not sample_name or not position_name or not channel_name:
+        return jsonify({
+            'success': False,
+            'error': 'sample, position, and channel query parameters are required',
+        }), 400
+
+    payload = _load_latest_exosome_segment_api_payload(sample_name, position_name, channel_name)
+    if payload is None:
+        return jsonify({
+            'success': False,
+            'error': f'No persisted segmentation results for {sample_name}/{position_name}/{channel_name}',
+        }), 404
+
+    return jsonify({'success': True, 'data': payload})
+
+
 @app.route('/api/colocalization_analysis', methods=['POST'])
 def run_colocalization_analysis():
     """
@@ -2205,6 +2609,13 @@ def run_colocalization_analysis():
     if not marker_channels:
         return jsonify({'success': False, 'error': 'No marker channels available'}), 400
 
+    sample_data_dir = DATA_ROOT / sample_name
+    if not sample_data_dir.is_dir():
+        return jsonify({
+            'success': False,
+            'error': f'Sample directory not found under data root: {sample_data_dir}. Cannot save results.',
+        }), 404
+
     try:
         from exosome_detection.spatial_logic import DetectionObject, run_reference_colocalization
     except Exception as e:
@@ -2238,6 +2649,35 @@ def run_colocalization_analysis():
             label_masks_by_channel[ch] = info['label_mask']
         marker_names[ch] = info.get('marker_name', '')
 
+    applied_reference_filter_ids: Optional[Set[int]] = _load_saved_reference_filter_object_ids(
+        sample_name, position_name, reference_channel,
+    )
+    if applied_reference_filter_ids is not None:
+        ref_list = detections_by_channel.get(reference_channel, [])
+        detections_by_channel[reference_channel] = [
+            d for d in ref_list if d.object_id in applied_reference_filter_ids
+        ]
+        if reference_channel in label_masks_by_channel:
+            label_masks_by_channel[reference_channel] = _subset_reference_label_mask_for_ids(
+                label_masks_by_channel[reference_channel],
+                applied_reference_filter_ids,
+            )
+
+    background_intensities: Dict[str, float] = {}
+    for ch in marker_channels:
+        bg_val, _thr, _px, err = _compute_exosome_channel_background_intensity(
+            sample_name, position_name, ch,
+        )
+        if err != 'no_probability_map' and bg_val is not None and np.isfinite(bg_val):
+            background_intensities[ch] = float(bg_val)
+
+    intensity_by_id = _marker_mean_intensity_by_channel_from_artifacts(artifacts)
+
+    ref_dets = detections_by_channel.get(reference_channel, [])
+    raw_tiff_by_ref = _compute_reference_raw_tiff_intensities(
+        sample_name, position_name, ref_dets, marker_channels,
+    )
+
     result = run_reference_colocalization(
         reference_channel=reference_channel,
         marker_channels=marker_channels,
@@ -2246,12 +2686,25 @@ def run_colocalization_analysis():
         distance_threshold=distance_threshold,
         marker_names=marker_names,
         label_masks_by_channel=label_masks_by_channel,
+        background_intensities=background_intensities or None,
+        marker_mean_intensity_by_id=intensity_by_id,
     )
 
-    # Persist analysis outputs
-    exo_base = OUTPUT_ROOT / 'exosome_detection' / sample_name / position_name
-    coloc_dir = exo_base / 'colocalization'
-    coloc_dir.mkdir(parents=True, exist_ok=True)
+    for row in result.get('reference_table', []) or []:
+        rid = int(row.get('reference_object_id', 0) or 0)
+        per_ch = raw_tiff_by_ref.get(rid, {})
+        v0 = per_ch.get('C0')
+        row['C0_raw_tiff_mean'] = (
+            round(float(v0), 6) if v0 is not None and np.isfinite(v0) else None
+        )
+        for ch in marker_channels:
+            v = per_ch.get(ch)
+            row[f'{ch}_raw_tiff_mean'] = (
+                round(float(v), 6) if v is not None and np.isfinite(v) else None
+            )
+
+    # Persist analysis outputs under DATA_ROOT/<sample>/results/<position>/
+    coloc_dir = _colocalization_results_dir(sample_name, position_name)
 
     ref_table_csv = coloc_dir / 'colocalization_reference_table.csv'
     ref_table_json = coloc_dir / 'colocalization_reference_table.json'
@@ -2260,9 +2713,11 @@ def run_colocalization_analysis():
 
     reference_table = result.get('reference_table', [])
     if reference_table:
-        fieldnames = list(reference_table[0].keys())
+        fieldnames = list(dict.fromkeys(k for row in reference_table for k in row.keys()))
         with open(ref_table_csv, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer = csv.DictWriter(
+                f, fieldnames=fieldnames, extrasaction='ignore', restval='',
+            )
             writer.writeheader()
             for row in reference_table:
                 writer.writerow({
@@ -2292,14 +2747,20 @@ def run_colocalization_analysis():
         canvas = None
         if ref_overlay_src and Path(ref_overlay_src).exists():
             canvas = cv2.imread(str(ref_overlay_src), cv2.IMREAD_COLOR)
+        ref_rows_src = artifacts[reference_channel]['rows']
+        if applied_reference_filter_ids is not None:
+            ref_rows_src = [
+                r for r in ref_rows_src
+                if int(float(r.get('id', 0) or 0)) in applied_reference_filter_ids
+            ]
         if canvas is None:
             # fallback plain canvas based on bbox extents
-            max_x = int(max([r.get('bbox_x2', 0) for r in artifacts[reference_channel]['rows']] + [1024]))
-            max_y = int(max([r.get('bbox_y2', 0) for r in artifacts[reference_channel]['rows']] + [1024]))
+            max_x = int(max([r.get('bbox_x2', 0) for r in ref_rows_src] + [1024]))
+            max_y = int(max([r.get('bbox_y2', 0) for r in ref_rows_src] + [1024]))
             canvas = np.zeros((max(256, max_y), max(256, max_x), 3), dtype=np.uint8)
 
         positive_ids = set(result.get('overlay', {}).get('positive_reference_ids', []))
-        for row in artifacts[reference_channel]['rows']:
+        for row in ref_rows_src:
             oid = int(row.get('id', 0))
             x1 = int(float(row.get('bbox_x1', 0)))
             y1 = int(float(row.get('bbox_y1', 0)))
@@ -2312,19 +2773,31 @@ def run_colocalization_analysis():
         print(f"[Coloc] Failed to generate positive overlay: {e}")
         overlay_path = None
 
-    saved_files = [
-        str(ref_table_csv.relative_to(OUTPUT_ROOT)),
-        str(ref_table_json.relative_to(OUTPUT_ROOT)),
-        str(summary_json.relative_to(OUTPUT_ROOT)),
-        str(combos_csv.relative_to(OUTPUT_ROOT)),
-    ]
+    results_sample_root = DATA_ROOT / sample_name
+    saved_files: List[str] = []
+    for p in (ref_table_csv, ref_table_json, summary_json, combos_csv):
+        if p.exists():
+            try:
+                saved_files.append(str(p.relative_to(results_sample_root)).replace('\\', '/'))
+            except ValueError:
+                saved_files.append(str(p.resolve()))
     if overlay_path and overlay_path.exists():
-        saved_files.append(str(overlay_path.relative_to(OUTPUT_ROOT)))
+        try:
+            saved_files.append(str(overlay_path.relative_to(results_sample_root)).replace('\\', '/'))
+        except ValueError:
+            saved_files.append(str(overlay_path.resolve()))
+
+    pn = _safe_position_segment(position_name)
+    results_path_display = f"{sample_name}/results/{pn}/"
+
+    print(f"[Coloc] Analysis saved under {coloc_dir} (display: {results_path_display})")
 
     return jsonify({
         'success': True,
         'data': result,
         'saved_files': saved_files,
+        'results_path_display': results_path_display,
+        'message': f'Analysis complete. Results saved to {results_path_display}',
     })
 
 
@@ -2332,6 +2805,15 @@ def run_colocalization_analysis():
 def export_exosome_excel():
     """
     Build and return one-row-per-reference-object Excel from exosome outputs.
+
+    Workbook sheets:
+      - ``Raw Intensity``: metadata through ``circularity``, then ``Pan-EV`` (C0 raw
+        mean on mask), then per-marker raw intensities (bare marker names).
+      - ``BG Subtracted``: same leading columns + ``Pan-EV``, then per-marker
+        bg-subtracted intensities (bare marker names; zeros when not positive).
+      - ``Full``: ``Pan-EV_score``, ``Pan-EV`` (C0 raw mean from colocalization), then
+        legacy ``*_positive``, ``*_mean_intensity``, ``*_intensity_bg_subtracted`` per
+        marker (Data Analysis validation).
     """
     import io
 
@@ -2381,7 +2863,7 @@ def export_exosome_excel():
                 ref_df[col] = None
         ref_df = ref_df[base_cols].rename(columns={'score': 'Pan-EV_score'})
 
-        marker_mapping = load_marker_mapping()
+        marker_mapping = load_marker_mapping(sample_name)
         marker_channels: List[Tuple[str, str, str, str]] = []
         for cycle_key in sorted(marker_mapping.keys(), key=_cycle_sort_key):
             if str(cycle_key).upper() == 'C0':
@@ -2406,53 +2888,182 @@ def export_exosome_excel():
             if 'object_id' not in coloc_df.columns:
                 coloc_df['object_id'] = None
 
-            positive_cols = ['object_id'] + [c for c in coloc_df.columns if c.endswith('_positive')]
-            coloc_df = coloc_df[positive_cols].copy()
-
-            rename_map: Dict[str, str] = {}
-            lower_positive_lookup = {
-                str(col).lower(): str(col)
-                for col in coloc_df.columns
-                if str(col).endswith('_positive')
+            lower_pos = {
+                str(c).lower(): str(c)
+                for c in coloc_df.columns
+                if str(c).endswith('_positive')
             }
-            for _, _, marker_name, channel_col in marker_channels:
-                desired_lower = f"{channel_col}_positive".lower()
-                src = lower_positive_lookup.get(desired_lower)
-                if src:
-                    rename_map[src] = f"{marker_name}_positive"
-            coloc_df = coloc_df.rename(columns=rename_map)
+            lower_int = {
+                str(c).lower(): str(c)
+                for c in coloc_df.columns
+                if str(c).endswith('_intensity_bg_subtracted')
+            }
+            lower_mean = {
+                str(c).lower(): str(c)
+                for c in coloc_df.columns
+                if str(c).endswith('_mean_intensity')
+            }
+            lower_raw = {
+                str(c).lower(): str(c)
+                for c in coloc_df.columns
+                if str(c).endswith('_raw_tiff_mean')
+            }
 
-            result_df = ref_df.merge(coloc_df, on='object_id', how='left')
+            rename_merged: Dict[str, str] = {}
+            take_cols: List[str] = ['object_id']
+            used_names: Dict[str, int] = {}
+
+            for _, _, marker_name, channel_col in marker_channels:
+                base_pos = f"{marker_name}_positive"
+                if base_pos in used_names:
+                    used_names[base_pos] += 1
+                    pos_out = f"{base_pos}_{used_names[base_pos]}"
+                else:
+                    used_names[base_pos] = 1
+                    pos_out = base_pos
+
+                if used_names[base_pos] > 1:
+                    mean_out = f"{marker_name}_mean_intensity_{used_names[base_pos]}"
+                    int_out = f"{marker_name}_intensity_bg_subtracted_{used_names[base_pos]}"
+                    raw_out = f"{marker_name}_{used_names[base_pos]}"
+                else:
+                    mean_out = f"{marker_name}_mean_intensity"
+                    int_out = f"{marker_name}_intensity_bg_subtracted"
+                    raw_out = marker_name
+
+                src_p = lower_pos.get(f"{channel_col}_positive".lower())
+                if src_p:
+                    rename_merged[src_p] = pos_out
+                    if src_p not in take_cols:
+                        take_cols.append(src_p)
+
+                src_m = lower_mean.get(f"{channel_col}_mean_intensity".lower())
+                if src_m:
+                    rename_merged[src_m] = mean_out
+                    if src_m not in take_cols:
+                        take_cols.append(src_m)
+
+                src_r = lower_raw.get(f"{channel_col}_raw_tiff_mean".lower())
+                if src_r:
+                    rename_merged[src_r] = raw_out
+                    if src_r not in take_cols:
+                        take_cols.append(src_r)
+
+                src_i = lower_int.get(f"{channel_col}_intensity_bg_subtracted".lower())
+                if src_i:
+                    rename_merged[src_i] = int_out
+                    if src_i not in take_cols:
+                        take_cols.append(src_i)
+
+            c0_raw_src: Optional[str] = None
+            for c in coloc_df.columns:
+                if str(c).lower() == 'c0_raw_tiff_mean':
+                    c0_raw_src = str(c)
+                    break
+            if c0_raw_src is not None and c0_raw_src not in take_cols:
+                take_cols.append(c0_raw_src)
+                rename_merged[c0_raw_src] = 'Pan-EV'
+
+            coloc_merge = coloc_df[take_cols].copy().rename(columns=rename_merged)
+            result_df = ref_df.merge(coloc_merge, on='object_id', how='left')
         else:
             result_df = ref_df.copy()
 
-        marker_output_columns: List[str] = []
-        used_names: Dict[str, int] = {}
+        marker_positive_cols: List[str] = []
+        marker_mean_cols: List[str] = []
+        marker_intensity_cols: List[str] = []
+        marker_raw_cols: List[str] = []
+        used_out: Dict[str, int] = {}
         for _, _, marker_name, _ in marker_channels:
-            col_name = f"{marker_name}_positive"
-            if col_name in used_names:
-                used_names[col_name] += 1
-                col_name = f"{col_name}_{used_names[col_name]}"
+            base_pos = f"{marker_name}_positive"
+            if base_pos in used_out:
+                used_out[base_pos] += 1
+                pos_col = f"{base_pos}_{used_out[base_pos]}"
             else:
-                used_names[col_name] = 1
+                used_out[base_pos] = 1
+                pos_col = base_pos
 
-            if col_name not in result_df.columns:
-                result_df[col_name] = None
-            marker_output_columns.append(col_name)
+            if used_out[base_pos] > 1:
+                mean_col = f"{marker_name}_mean_intensity_{used_out[base_pos]}"
+                int_col = f"{marker_name}_intensity_bg_subtracted_{used_out[base_pos]}"
+                raw_col = f"{marker_name}_{used_out[base_pos]}"
+            else:
+                mean_col = f"{marker_name}_mean_intensity"
+                int_col = f"{marker_name}_intensity_bg_subtracted"
+                raw_col = marker_name
 
-        final_columns = [
+            marker_positive_cols.append(pos_col)
+            marker_mean_cols.append(mean_col)
+            marker_intensity_cols.append(int_col)
+            marker_raw_cols.append(raw_col)
+
+        for pos_col in marker_positive_cols:
+            if pos_col not in result_df.columns:
+                result_df[pos_col] = None
+        for mean_col in marker_mean_cols:
+            if mean_col not in result_df.columns:
+                result_df[mean_col] = None
+        for int_col in marker_intensity_cols:
+            if int_col not in result_df.columns:
+                result_df[int_col] = None
+        for raw_col in marker_raw_cols:
+            if raw_col not in result_df.columns:
+                result_df[raw_col] = None
+        if 'Pan-EV' not in result_df.columns:
+            result_df['Pan-EV'] = None
+
+        marker_output_columns: List[str] = []
+        for p, m, i in zip(marker_positive_cols, marker_mean_cols, marker_intensity_cols):
+            marker_output_columns.append(p)
+            marker_output_columns.append(m)
+            marker_output_columns.append(i)
+
+        columns_common_lead = [
             'object_id', 'sample', 'position', 'centroid_x', 'centroid_y',
-            'area', 'perimeter', 'circularity', 'Pan-EV_score'
-        ] + marker_output_columns
-        result_df = result_df[final_columns]
+            'area', 'perimeter', 'circularity',
+        ]
+        pan_ev_mean_col = 'Pan-EV'
+        full_columns = columns_common_lead + ['Pan-EV_score', pan_ev_mean_col] + marker_output_columns
+        raw_sheet_columns = columns_common_lead + [pan_ev_mean_col] + marker_raw_cols
+
+        for mc in marker_mean_cols:
+            if mc in result_df.columns:
+                result_df[mc] = pd.to_numeric(result_df[mc], errors='coerce')
+        for ic in marker_intensity_cols:
+            if ic in result_df.columns:
+                result_df[ic] = pd.to_numeric(result_df[ic], errors='coerce')
+        for rc in marker_raw_cols:
+            if rc in result_df.columns:
+                result_df[rc] = pd.to_numeric(result_df[rc], errors='coerce')
+        if pan_ev_mean_col in result_df.columns:
+            result_df[pan_ev_mean_col] = pd.to_numeric(result_df[pan_ev_mean_col], errors='coerce')
+
+        full_df = result_df[full_columns].copy()
+        raw_df = result_df[raw_sheet_columns].copy()
+
+        bg_df = result_df[columns_common_lead + [pan_ev_mean_col]].copy()
+        for p, ic, bare in zip(marker_positive_cols, marker_intensity_cols, marker_raw_cols):
+            pos_series = result_df[p].map(lambda x: bool(x) if pd.notna(x) else False)
+            int_series = pd.to_numeric(result_df[ic], errors='coerce').fillna(0.0)
+            bg_df[bare] = np.where(
+                pos_series.to_numpy(dtype=bool),
+                int_series.to_numpy(dtype=np.float64),
+                0.0,
+            )
+        for bare in marker_raw_cols:
+            if bare in bg_df.columns:
+                bg_df[bare] = pd.to_numeric(bg_df[bare], errors='coerce')
 
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            result_df.to_excel(writer, index=False, sheet_name='Results')
-            ws = writer.sheets['Results']
-            for col in ws.columns:
-                max_len = max(len(str(cell.value)) if cell.value is not None else 0 for cell in col)
-                ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 40)
+            raw_df.to_excel(writer, index=False, sheet_name='Raw Intensity', na_rep='')
+            bg_df.to_excel(writer, index=False, sheet_name='BG Subtracted', na_rep='')
+            full_df.to_excel(writer, index=False, sheet_name='Full', na_rep='')
+            for sheet_name in ('Raw Intensity', 'BG Subtracted', 'Full'):
+                ws = writer.sheets[sheet_name]
+                for col in ws.columns:
+                    max_len = max(len(str(cell.value)) if cell.value is not None else 0 for cell in col)
+                    ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 40)
 
         output.seek(0)
         filename = f"{sample_name}_{position_name}_results.xlsx"
@@ -2486,6 +3097,128 @@ def _read_tiff_as_array(tiff_path: str) -> Optional[np.ndarray]:
     except Exception as e:
         print(f"[WARN] Could not read TIFF {tiff_path}: {e}")
         return None
+
+
+def _mean_marker_tiff_in_bbox(
+    img: np.ndarray,
+    bbox: Tuple[float, float, float, float],
+) -> Optional[float]:
+    """Mean intensity over axis-aligned bbox (x1, y1, x2, y2); None if degenerate or empty."""
+    x1, y1, x2, y2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+    ix1 = int(np.floor(min(x1, x2)))
+    iy1 = int(np.floor(min(y1, y2)))
+    ix2 = int(np.ceil(max(x1, x2)))
+    iy2 = int(np.ceil(max(y1, y2)))
+    h, w = int(img.shape[0]), int(img.shape[1])
+    if h <= 0 or w <= 0:
+        return None
+    ix1 = max(0, min(ix1, w - 1))
+    ix2 = max(0, min(ix2, w - 1))
+    iy1 = max(0, min(iy1, h - 1))
+    iy2 = max(0, min(iy2, h - 1))
+    if ix2 < ix1 or iy2 < iy1:
+        return None
+    patch = img[iy1 : iy2 + 1, ix1 : ix2 + 1]
+    if patch.size == 0:
+        return None
+    m = float(np.mean(patch.astype(np.float64)))
+    return m if np.isfinite(m) else None
+
+
+def _mean_marker_tiff_centroid_window3(
+    img: np.ndarray,
+    centroid_x: float,
+    centroid_y: float,
+) -> Optional[float]:
+    """Mean intensity in a 3×3 window around (centroid_x, centroid_y), clipped to image bounds."""
+    h, w = int(img.shape[0]), int(img.shape[1])
+    if h <= 0 or w <= 0:
+        return None
+    cx = int(round(float(centroid_x)))
+    cy = int(round(float(centroid_y)))
+    cx = max(0, min(cx, w - 1))
+    cy = max(0, min(cy, h - 1))
+    ix0 = max(0, cx - 1)
+    ix1 = min(w, cx + 2)
+    iy0 = max(0, cy - 1)
+    iy1 = min(h, cy + 2)
+    if ix1 <= ix0 or iy1 <= iy0:
+        return None
+    patch = img[iy0:iy1, ix0:ix1]
+    if patch.size == 0:
+        return None
+    m = float(np.mean(patch.astype(np.float64)))
+    return m if np.isfinite(m) else None
+
+
+def _compute_reference_raw_tiff_intensities(
+    sample_name: str,
+    position_name: str,
+    reference_detections: List[Any],
+    marker_channels: List[str],
+) -> Dict[int, Dict[str, Optional[float]]]:
+    """
+    Per reference object_id × marker channel: mean marker-TIFF intensity over the
+    reference footprint (C0 label mask), independent of colocalization matching.
+
+    Also computes ``C0``: mean of the C0 aligned TIFF over each object's C0 mask
+    footprint (same geometry as other channels), stored under key ``'C0'``.
+
+    Fallback when mask/TIFF shapes differ or mask has no pixels for the id:
+    bbox mean from reference detection bbox, then 3×3 window at centroid.
+
+    Returns:
+        { object_id: { channel_key: float | None } }
+    """
+    out: Dict[int, Dict[str, Optional[float]]] = {}
+    if not reference_detections:
+        return out
+    channels = list(dict.fromkeys(list(marker_channels) + ['C0']))
+    if not channels:
+        return out
+
+    artifacts = _load_latest_exosome_artifacts(sample_name, position_name)
+    c0_info = artifacts.get('C0') if isinstance(artifacts, dict) else None
+    label_mask: Optional[np.ndarray] = None
+    if isinstance(c0_info, dict):
+        lm = c0_info.get('label_mask')
+        if lm is not None:
+            label_mask = np.asarray(lm, dtype=np.int32)
+
+    for det in reference_detections:
+        oid = int(getattr(det, 'object_id', 0) or 0)
+        if oid <= 0:
+            continue
+        out.setdefault(oid, {})
+
+    for ch in channels:
+        tiff_path = _resolve_detection_image_path(sample_name, position_name, ch)
+        img: Optional[np.ndarray] = None
+        if tiff_path is not None and tiff_path.is_file():
+            img = _read_tiff_as_array(str(tiff_path))
+        for det in reference_detections:
+            oid = int(getattr(det, 'object_id', 0) or 0)
+            if oid <= 0:
+                continue
+            val: Optional[float] = None
+            if img is not None and label_mask is not None and img.shape == label_mask.shape:
+                sel = label_mask == oid
+                if np.any(sel):
+                    vals = img[sel]
+                    if vals.size > 0 and np.all(np.isfinite(vals)):
+                        val = float(np.mean(vals.astype(np.float64)))
+            bbox = getattr(det, 'bbox', None)
+            if val is None and img is not None and isinstance(bbox, (tuple, list)) and len(bbox) >= 4:
+                val = _mean_marker_tiff_in_bbox(img, (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])))
+            if val is None and img is not None:
+                val = _mean_marker_tiff_centroid_window3(
+                    img,
+                    float(getattr(det, 'centroid_x', 0.0) or 0.0),
+                    float(getattr(det, 'centroid_y', 0.0) or 0.0),
+                )
+            out.setdefault(oid, {})[ch] = val if val is not None and np.isfinite(val) else None
+
+    return out
 
 
 def _extract_mask_intensity(img: np.ndarray, mask_npz_path: str, object_id: int) -> float:
@@ -2579,14 +3312,28 @@ def extract_marker_intensity(
     return float('nan')
 
 
-def _load_ordered_marker_channels_for_intensity() -> List[Dict[str, str]]:
+def _load_ordered_marker_channels_for_intensity(sample_name: str) -> List[Dict[str, str]]:
     """
-    Read Marker_info.xlsx directly to preserve cycle/channel order including C0 rows.
+    Read DATA_ROOT/<sample_id>/Marker_info.xlsx to preserve cycle/channel order including C0 rows.
     Returns: [{'cycle': 'C1', 'channel': 'CH1', 'marker': 'p62', 'channel_id': 'C1_ch1'}, ...]
     """
+    global _marker_ordered_channels_cache
+
+    sn = _sanitize_sample_dir_name((sample_name or "").strip())
+    if not sn:
+        return []
+
+    if sn in _marker_ordered_channels_cache:
+        return list(_marker_ordered_channels_cache[sn])
+
     ordered: List[Dict[str, str]] = []
-    excel_path = Path(MARKER_EXCEL_PATH)
-    if not excel_path.exists():
+    excel_path = DATA_ROOT / sn / "Marker_info.xlsx"
+    if not excel_path.is_file():
+        print(f"Warning: Marker mapping file not found: {excel_path}")
+        return ordered
+
+    if not _openpyxl_available:
+        print(f"ERROR: Cannot load marker mapping for intensity export - openpyxl is not installed!")
         return ordered
 
     try:
@@ -2620,10 +3367,11 @@ def _load_ordered_marker_channels_for_intensity() -> List[Dict[str, str]]:
                 'marker': marker,
                 'channel_id': channel_id,
             })
+        _marker_ordered_channels_cache[sn] = ordered
     except Exception as e:
         print(f"[WARN] Failed to parse marker Excel for intensity export: {e}")
 
-    return ordered
+    return list(ordered)
 
 
 def _resolve_channel_tiff_path(sample_name: str, position_name: str, channel_id: str) -> Optional[Path]:
@@ -2687,7 +3435,7 @@ def export_intensity_excel():
         ref_df['sample'] = sample_name
         ref_df['position'] = position_name
 
-        ordered_channels = _load_ordered_marker_channels_for_intensity()
+        ordered_channels = _load_ordered_marker_channels_for_intensity(sample_name)
         if not ordered_channels:
             return jsonify({'success': False, 'message': 'No marker channels found in marker Excel'}), 404
 
@@ -2710,7 +3458,7 @@ def export_intensity_excel():
             channel_dir = exo_base / ('C0' if channel_id == 'C0' else channel_id)
             npz_candidates = sorted(channel_dir.glob('*_masks_*.npz'))
             mask_npz_path = str(npz_candidates[-1]) if npz_candidates else None
-            tiff_path_obj = _resolve_channel_tiff_path(sample_name, position_name, channel_id)
+            tiff_path_obj = _resolve_detection_image_path(sample_name, position_name, channel_id)
 
             if tiff_path_obj is None or not tiff_path_obj.exists():
                 print(f"[WARN] No TIFF found for channel {channel_id} ({marker})")
@@ -3056,6 +3804,7 @@ def load_position():
 
             merge_sample_local_preprocess_state_into_cache(sample_name, position_name, position_key)
 
+            ac = _list_align_artifact_channel_keys(sample_name, position_name)
             return jsonify({
                 'success': True,
                 'data': {
@@ -3064,6 +3813,8 @@ def load_position():
                     'items': items,
                     'path': str(position_path),
                     **crop_meta,
+                    'align_artifact_channels': ac,
+                    'has_align_artifacts': len(ac) > 0,
                 }
             })
 
@@ -3071,7 +3822,7 @@ def load_position():
         # NORMAL MODE: separate per-cycle TIFF files
         # --------------------------------------------------------------------
         # Load marker mapping
-        marker_mapping = load_marker_mapping()
+        marker_mapping = load_marker_mapping(sample_name)
         
         # Pattern 1: multi-channel files  _C1_Ch1.tif  or  _C1-Ch1.tif
         cycle_channel_pattern = re.compile(
@@ -3097,7 +3848,7 @@ def load_position():
                 channel = f'Ch{channel_num}'
                 key = f'{cycle}_ch{channel_num}'  # e.g. C1_ch1
 
-                marker = get_marker(cycle, channel)
+                marker = get_marker(cycle, channel, sample_name)
                 print(f"[Load Position] Cycle={cycle}, Channel={channel}, Marker={marker}")
 
                 display_label = f'{cycle}_ch{channel_num}({marker})' if marker else f'{cycle}_ch{channel_num}'
@@ -3129,7 +3880,7 @@ def load_position():
                     key = cycle  # e.g. "C0", "C5"
                     channel = 'Ch1'  # treat as first (only) channel for sort purposes
 
-                    marker = get_marker(cycle, channel)
+                    marker = get_marker(cycle, channel, sample_name)
                     print(f"[Load Position] Single-channel cycle={cycle}, Marker={marker}")
 
                     display_label = f'{cycle}({marker})' if marker else cycle
@@ -3181,6 +3932,7 @@ def load_position():
             if cached_stages:
                 print(f"[Load Position] Restored processed stages: {cached_stages}")
         
+        sac = _list_align_artifact_channel_keys(sample_name, position_name)
         return jsonify({
             'success': True,
             'data': {
@@ -3189,6 +3941,8 @@ def load_position():
                 'items': items,
                 'path': str(position_path),
                 'crop_mode': False,
+                'align_artifact_channels': sac,
+                'has_align_artifacts': len(sac) > 0,
             }
         })
     except Exception as e:
@@ -4390,6 +5144,31 @@ def align_position():
                 except Exception as _out_stat_e:
                     print(f"[ManualDiagonal] could not stat output file for channel={ch!r}: {_out_stat_e}")
 
+            if input_stage != "raw":
+                raw_map_diag = preprocessing_cache.get(position_key, {}).get("raw", {})
+                raw_by_diag: Dict[str, np.ndarray] = {}
+                for ch in out_files.keys():
+                    rp = raw_map_diag.get(ch)
+                    if rp is None:
+                        print(f"[ManualDiagonal] WARN: no raw TIFF for {ch!r}; skipping raw_via for this channel")
+                        continue
+                    rimg = tifffile.imread(str(rp))
+                    while rimg.ndim > 2 and 1 in rimg.shape:
+                        rimg = np.squeeze(rimg)
+                    if rimg.ndim == 3:
+                        rimg = rimg[0]
+                    raw_by_diag[ch] = rimg
+                if raw_by_diag:
+                    rw_m = _warp_raw_channels_manual_diagonal(raw_by_diag, transformations)
+                    _write_aligned_raw_via_outputs(
+                        sample_name,
+                        position_name,
+                        input_stage,
+                        position_key,
+                        sorted(raw_by_diag.keys()),
+                        rw_m,
+                    )
+
             # Generate previews
             previews, stats = {}, {}
             for ch, fp in out_files.items():
@@ -4426,6 +5205,11 @@ def align_position():
                 f"[ManualDiagonal] transformations response payload: "
                 f"{json.dumps(transformations, default=str)}"
             )
+
+            _persist_alignment_warp_meta(
+                output_dir, ref_channel, input_stage, transformations, "manual_diagonal"
+            )
+            _copy_aligned_outputs_to_data_align(sample_name, position_name, out_files, input_stage)
 
             return jsonify({'success': True, 'data': {
                 'sample': sample_name, 'position': position_name,
@@ -4500,9 +5284,10 @@ def align_position():
                     images_dict[channel_name] = img_array
                     print(f"[Alignment]     Loaded: shape={img_array.shape}, dtype={img_array.dtype}")
                 
-                # Use the selected input_stage images as BOTH transform estimation input and
-                # final alignment output source. Do not switch back to raw images here.
-                print(f"[Alignment] Using '{input_stage}' images as alignment input and output source")
+                # Use the selected input_stage images to estimate transforms; when input_stage
+                # is not 'raw', the same transforms are also applied to raw TIFFs (see raw_via output).
+                print(f"[Alignment] Using '{input_stage}' images for transform estimation; "
+                      f"aligned processed outputs written under aligned_from_{input_stage}")
                 
                 # Initialize aligner with bicubic interpolation for sharpness
                 aligner_config = {
@@ -4683,7 +5468,43 @@ def align_position():
                               f"matches={trans_info.get('num_matches', 0)}")
                     else:
                         print(f"[Alignment]   {channel_name}: identity transform (no alignment needed)")
-                
+
+                if input_stage != "raw":
+                    raw_map_align = preprocessing_cache[position_key]["raw"]
+                    raw_by_ch_align: Dict[str, np.ndarray] = {}
+                    for channel_name in input_files.keys():
+                        rawp = raw_map_align.get(channel_name)
+                        if rawp is None:
+                            print(f"[Alignment] WARN: raw_via — no raw cache entry for {channel_name!r}")
+                            continue
+                        rarr = tifffile.imread(str(rawp))
+                        while rarr.ndim > 2 and 1 in rarr.shape:
+                            rarr = np.squeeze(rarr)
+                        if rarr.ndim == 3:
+                            rarr = rarr[0]
+                        if channel_name in images_dict and rarr.shape != images_dict[channel_name].shape:
+                            print(
+                                f"[Alignment] WARN: raw shape {rarr.shape} != processed "
+                                f"{images_dict[channel_name].shape} for {channel_name!r}"
+                            )
+                        raw_by_ch_align[channel_name] = rarr
+                    if raw_by_ch_align:
+                        raw_warped_align = _warp_raw_channels_with_aligner_transforms(
+                            aligner, raw_by_ch_align, transformations, ref_channel
+                        )
+                        _write_aligned_raw_via_outputs(
+                            sample_name,
+                            position_name,
+                            input_stage,
+                            position_key,
+                            sorted(raw_warped_align.keys()),
+                            raw_warped_align,
+                        )
+
+                _persist_alignment_warp_meta(
+                    output_dir, ref_channel, input_stage, transformations, method
+                )
+
             except ImportError as e:
                 print(f"[Alignment] WARNING: Cannot import Aligner: {e}")
                 print(f"[Alignment] Falling back to placeholder alignment")
@@ -4741,7 +5562,34 @@ def align_position():
                         'num_matches': 0,
                         'note': 'Placeholder alignment (no transform applied)'
                     }
-        
+
+            if input_stage != "raw":
+                raw_map_ph = preprocessing_cache.get(position_key, {}).get("raw", {})
+                raw_via_dir_ph = _align_processing_raw_via_dir(sample_name, position_name, input_stage)
+                raw_via_dir_ph.mkdir(parents=True, exist_ok=True)
+                raw_out_ph: Dict[str, Path] = {}
+                for channel_name in list(output_files.keys()):
+                    rawp = raw_map_ph.get(channel_name)
+                    if rawp is None or not Path(rawp).is_file():
+                        print(f"[Alignment] WARN: placeholder raw_via — missing raw for {channel_name!r}")
+                        continue
+                    destp = raw_via_dir_ph / f"{channel_name}_aligned.tif"
+                    shutil.copy2(str(rawp), str(destp))
+                    raw_out_ph[channel_name] = destp
+                if raw_out_ph:
+                    if position_key not in preprocessing_cache:
+                        preprocessing_cache[position_key] = {}
+                    preprocessing_cache[position_key][f"aligned_from_raw_via_{input_stage}"] = raw_out_ph
+                    print(f"[Alignment] Placeholder: copied {len(raw_out_ph)} raw channel(s) to {raw_via_dir_ph}")
+
+            ident_3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+            transformations_ph: Dict[str, Any] = {
+                ch_name: {"type": "identity", "transform": ident_3} for ch_name in output_files.keys()
+            }
+            _persist_alignment_warp_meta(
+                output_dir, ref_channel, input_stage, transformations_ph, "placeholder"
+            )
+
         # Update cache with aligned results
         aligned_stage_key = f"aligned_from_{input_stage}"
         if position_key not in preprocessing_cache:
@@ -4812,7 +5660,9 @@ def align_position():
             'method': 'placeholder' if not use_real_alignment else 'feature_based',
             'error': alignment_error if alignment_error else None
         }
-        
+
+        _copy_aligned_outputs_to_data_align(sample_name, position_name, output_files, input_stage)
+
         return jsonify({
             'success': True,
             'data': {
@@ -4934,6 +5784,533 @@ def export_tiff():
             as_attachment=True,
             download_name=filename,
         )
+
+
+def _align_processing_output_dir(sample_name: str, position_name: str, input_stage: str) -> Path:
+    """Full-field aligned TIFFs from the last alignment run (before DATA_ROOT mirror crop)."""
+    return PROCESSING_OUTPUT / sample_name / position_name / f"aligned_from_{input_stage}"
+
+
+def _parse_crop_rect_for_align_save(crop_rect: Optional[Dict[str, Any]]) -> Optional[Tuple[int, int, int, int]]:
+    """Return (x, y, width, height) or None for full field. Accepts w/h or width/height keys."""
+    if not crop_rect or not isinstance(crop_rect, dict):
+        return None
+    try:
+        x = int(crop_rect.get("x", 0))
+        y = int(crop_rect.get("y", 0))
+        w_raw = crop_rect.get("w", crop_rect.get("width"))
+        h_raw = crop_rect.get("h", crop_rect.get("height"))
+        if w_raw is None or h_raw is None:
+            return None
+        w = int(w_raw)
+        h = int(h_raw)
+    except (TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return x, y, w, h
+
+
+def _crop_2d_to_rect(arr: np.ndarray, rect: Tuple[int, int, int, int]) -> np.ndarray:
+    """Clip rect to image bounds; returns a view-safe cropped 2D array."""
+    x, y, w, h = rect
+    H, W = int(arr.shape[0]), int(arr.shape[1])
+    x0 = max(0, min(x, W - 1))
+    y0 = max(0, min(y, H - 1))
+    x1 = min(W, x0 + max(1, w))
+    y1 = min(H, y0 + max(1, h))
+    return np.asarray(arr[y0:y1, x0:x1], order="C")
+
+
+def _align_processing_raw_via_dir(sample_name: str, position_name: str, input_stage: str) -> Path:
+    """Raw-channel TIFFs warped with the same transform estimated on ``input_stage``."""
+    return PROCESSING_OUTPUT / sample_name / position_name / f"aligned_from_raw_via_{input_stage}"
+
+
+def _persist_alignment_warp_meta(
+    output_dir: Path,
+    ref_channel: str,
+    input_stage: str,
+    transformations: Dict[str, Any],
+    align_method: str,
+) -> None:
+    """Persist transforms so mirror-save can warp raw when ``aligned_from_raw_via_*`` omits a channel."""
+    try:
+        payload = {
+            "ref_channel": ref_channel,
+            "input_stage": input_stage,
+            "align_method": align_method,
+            "transformations": transformations,
+        }
+        p = output_dir / ALIGNMENT_WARP_META_JSON
+        with open(p, "w", encoding="utf8") as f:
+            json.dump(payload, f, indent=2, default=str)
+        print(f"[Alignment] Wrote warp metadata to {p}")
+    except Exception as e:
+        print(f"[Alignment] WARN: failed to write {ALIGNMENT_WARP_META_JSON}: {e}")
+
+
+def _load_alignment_warp_meta(aligned_proc_dir: Path) -> Tuple[str, Dict[str, Any], str]:
+    path = aligned_proc_dir / ALIGNMENT_WARP_META_JSON
+    if not path.is_file():
+        return "", {}, ""
+    try:
+        with open(path, encoding="utf8") as f:
+            blob = json.load(f)
+    except Exception:
+        return "", {}, ""
+    tr = blob.get("transformations")
+    if not isinstance(tr, dict):
+        tr = {}
+    return (str(blob.get("ref_channel") or ""), tr, str(blob.get("align_method") or ""))
+
+
+def _mirror_save_try_warp_raw_with_stored_transforms(
+    raw_img: np.ndarray,
+    ch: str,
+    transformations: Dict[str, Any],
+    ref_channel: str,
+) -> Optional[np.ndarray]:
+    """
+    Apply transforms from ``alignment_warp_meta.json`` to a single raw channel.
+    Returns None if metadata is unusable for this channel (caller may use unwarped raw).
+    """
+    if not transformations or not ref_channel:
+        return None
+    if ch == ref_channel:
+        return np.asarray(raw_img, order="C")
+    tinfo = transformations.get(ch) or {}
+    ttype = str(tinfo.get("type") or "identity").lower()
+    if ttype == "identity":
+        return np.asarray(raw_img, order="C")
+    tr = tinfo.get("transform")
+    if tr is None:
+        return None
+    M = np.asarray(tr, dtype=np.float64)
+    if M.shape == (3, 3):
+        warped_by = _warp_raw_channels_manual_diagonal({ch: raw_img}, transformations)
+        out = warped_by.get(ch)
+        return out if out is not None else None
+    try:
+        from agents import Aligner
+        import torch
+
+        aligner_config = {
+            "feature_detector": "superpoint",
+            "matcher": "superglue",
+            "initial_transform": "affine",
+            "fallback_transform": "tps",
+            "residual_threshold": 2.0,
+            "max_features": 1024,
+            "match_threshold": 0.7,
+            "min_matches": 4,
+            "llm_qa_enabled": False,
+            "interpolation_mode": "bicubic",
+        }
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        aligner = Aligner(aligner_config, device=device)
+        wmap = _warp_raw_channels_with_aligner_transforms(
+            aligner, {ch: raw_img}, transformations, ref_channel
+        )
+        return wmap.get(ch)
+    except Exception as e:
+        app.logger.warning("[AlignMirror] Aligner warp failed for channel %r: %s", ch, e)
+        return None
+
+
+def _float_aligned_to_original_dtype(aligned_f32: np.ndarray, original: np.ndarray) -> np.ndarray:
+    """Map float32 [0,1] registration output back to integer dtype of ``original``."""
+    original_dtype = original.dtype
+    if aligned_f32.dtype == np.float32 and np.issubdtype(original_dtype, np.integer):
+        if original_dtype == np.uint16:
+            return np.clip(aligned_f32 * 65535.0, 0, 65535).astype(np.uint16)
+        if original_dtype == np.uint8:
+            return np.clip(aligned_f32 * 255.0, 0, 255).astype(np.uint8)
+    if aligned_f32.dtype != original_dtype:
+        return aligned_f32.astype(original_dtype)
+    return aligned_f32
+
+
+def _warp_raw_channels_with_aligner_transforms(
+    aligner: Any,
+    raw_by_ch: Dict[str, np.ndarray],
+    transformations: Dict[str, Any],
+    ref_channel: str,
+) -> Dict[str, np.ndarray]:
+    """Apply feature/PCC alignment transforms (from processed run) to raw image arrays."""
+    import torch
+
+    out: Dict[str, np.ndarray] = {}
+    for ch, raw_img in raw_by_ch.items():
+        if ch == ref_channel:
+            out[ch] = np.asarray(raw_img, order="C")
+            continue
+        tinfo = transformations.get(ch) or {}
+        ttype = str(tinfo.get("type") or "identity").lower()
+        if ttype == "identity":
+            out[ch] = np.asarray(raw_img, order="C")
+            continue
+        tr = tinfo.get("transform")
+        if tr is None:
+            out[ch] = np.asarray(raw_img, order="C")
+            continue
+        try:
+            ttensor = torch.tensor(tr, dtype=torch.float32, device=aligner.device)
+            kt = ttype if ttype in ("affine", "translation", "euclidean", "tps") else "affine"
+            warped_f32 = aligner.apply_transform_kornia(
+                raw_img,
+                ttensor,
+                kt,
+                interpolation_mode=aligner.interpolation_mode,
+            )
+            out[ch] = _float_aligned_to_original_dtype(warped_f32, raw_img)
+        except Exception as e:
+            print(f"[Alignment] WARN: raw_via Aligner warp failed for {ch!r}: {e}; using unwarped raw")
+            out[ch] = np.asarray(raw_img, order="C")
+    return out
+
+
+def _warp_raw_channels_manual_diagonal(
+    raw_by_ch: Dict[str, np.ndarray],
+    transformations: Dict[str, Any],
+) -> Dict[str, np.ndarray]:
+    """Apply manual-diagonal 3×3 transforms to raw channels (same M as processed path)."""
+    out: Dict[str, np.ndarray] = {}
+    for ch, img in raw_by_ch.items():
+        tinfo = transformations.get(ch) or {}
+        tr = tinfo.get("transform")
+        if tr is None:
+            out[ch] = np.asarray(img, order="C")
+            continue
+        M = np.asarray(tr, dtype=np.float64)
+        if M.shape != (3, 3):
+            out[ch] = np.asarray(img, order="C")
+            continue
+        h, w = int(img.shape[0]), int(img.shape[1])
+        img_f32 = img.astype(np.float32)
+        if np.allclose(M[2], np.array([0.0, 0.0, 1.0]), atol=1e-8):
+            warped = cv2.warpAffine(
+                img_f32,
+                M[:2, :],
+                (w, h),
+                flags=cv2.INTER_CUBIC,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+        else:
+            warped = cv2.warpPerspective(
+                img_f32,
+                M,
+                (w, h),
+                flags=cv2.INTER_CUBIC,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+        if img.dtype == np.uint16:
+            warped = np.clip(warped, 0, 65535).astype(np.uint16)
+        elif img.dtype == np.uint8:
+            warped = np.clip(warped, 0, 255).astype(np.uint8)
+        else:
+            warped = warped.astype(img.dtype)
+        out[ch] = warped
+    return out
+
+
+def _write_aligned_raw_via_outputs(
+    sample_name: str,
+    position_name: str,
+    input_stage: str,
+    position_key: str,
+    channel_names: List[str],
+    raw_warped: Dict[str, np.ndarray],
+) -> Dict[str, Path]:
+    """Persist ``raw_warped`` under aligned_from_raw_via_<input_stage>/ and update cache."""
+    if input_stage == "raw":
+        return {}
+    out_dir = _align_processing_raw_via_dir(sample_name, position_name, input_stage)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_files: Dict[str, Path] = {}
+    for ch in channel_names:
+        arr = raw_warped.get(ch)
+        if arr is None:
+            continue
+        outp = out_dir / f"{ch}_aligned.tif"
+        tifffile.imwrite(str(outp), arr)
+        out_files[ch] = outp
+    if position_key not in preprocessing_cache:
+        preprocessing_cache[position_key] = {}
+    preprocessing_cache[position_key][f"aligned_from_raw_via_{input_stage}"] = out_files
+    print(f"[Alignment] Wrote {len(out_files)} raw-via-{input_stage} aligned TIFF(s) to {out_dir}")
+    return out_files
+
+
+def write_data_root_align_mirror_with_crop(
+    sample_name: str,
+    position_name: str,
+    input_stage: str,
+    crop_rect: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Write DATA_ROOT/<sample>/align/<position>/ per-channel TIFFs from PROCESSING_OUTPUT:
+
+    - ``<ch>_aligned.tif`` — raw intensities warped (``aligned_from_raw_via_<stage>/`` when
+      ``input_stage`` is not ``raw``, else ``aligned_from_<stage>/``), optional crop.
+    - ``<ch>_aligned_display.tif`` — same transform on processed stage (``aligned_from_<stage>/``),
+      optional crop. When ``input_stage`` is ``raw``, both files are duplicated from the same source.
+
+    Writes ``align_metadata.json`` with crop, dimensions, transform-estimation stage, and
+    ``detection_tiff_source_by_channel`` (``raw_warped``, ``raw_fallback``, or ``processed_aligned``).
+    """
+    from datetime import datetime, timezone
+
+    def _squeeze_2d(arr: Any, label: str, ch_name: str) -> np.ndarray:
+        while getattr(arr, "ndim", 0) > 2 and 1 in arr.shape:
+            arr = np.squeeze(arr)
+        if getattr(arr, "ndim", 0) == 3:
+            arr = arr[0]
+        if getattr(arr, "ndim", 0) != 2:
+            raise ValueError(
+                f"Channel {ch_name}: expected 2D {label} TIFF, got shape {getattr(arr, 'shape', None)}"
+            )
+        return arr
+
+    src_proc = _align_processing_output_dir(sample_name, position_name, input_stage)
+    if not src_proc.is_dir():
+        raise FileNotFoundError(
+            f"No aligned processing output at {src_proc}. Run alignment for this sample/position/stage first."
+        )
+
+    proc_tiffs = sorted(src_proc.glob("*_aligned.tif"))
+    if not proc_tiffs:
+        raise FileNotFoundError(f"No *_aligned.tif files under {src_proc}")
+
+    channels: List[str] = []
+    for tf in proc_tiffs:
+        stem = tf.stem
+        if stem.endswith("_aligned_display"):
+            continue
+        if not stem.endswith("_aligned"):
+            continue
+        channels.append(stem[: -len("_aligned")])
+
+    position_key = f"{sample_name}/{position_name}"
+    ref_ch_meta, transformations_meta, _align_method_meta = _load_alignment_warp_meta(src_proc)
+
+    src_raw_via: Optional[Path] = None
+    if input_stage != "raw":
+        rawvia_candidate = _align_processing_raw_via_dir(sample_name, position_name, input_stage)
+        if rawvia_candidate.is_dir():
+            src_raw_via = rawvia_candidate
+
+    dest_root = _data_root_align_dir(sample_name, position_name)
+    dest_root.mkdir(parents=True, exist_ok=True)
+
+    parsed = _parse_crop_rect_for_align_save(crop_rect)
+    proc_by_ch: Dict[str, np.ndarray] = {}
+    raw_by_ch: Dict[str, np.ndarray] = {}
+    detection_sources: Dict[str, str] = {}
+
+    for ch in channels:
+        pf = src_proc / f"{ch}_aligned.tif"
+        if not pf.is_file():
+            continue
+        pimg = _squeeze_2d(tifffile.imread(str(pf)), "aligned processed", ch)
+        proc_by_ch[ch] = pimg
+
+        if input_stage == "raw":
+            raw_by_ch[ch] = pimg
+            detection_sources[ch] = "processed_aligned"
+            continue
+
+        expected_raw_via = (
+            _align_processing_raw_via_dir(sample_name, position_name, input_stage) / f"{ch}_aligned.tif"
+        )
+        raw_via_path = (src_raw_via / f"{ch}_aligned.tif") if src_raw_via is not None else None
+        if raw_via_path is not None and raw_via_path.is_file():
+            rimg = _squeeze_2d(tifffile.imread(str(raw_via_path)), "raw_via", ch)
+            raw_by_ch[ch] = rimg
+            detection_sources[ch] = "raw_warped"
+            continue
+
+        raw_path_opt: Optional[Path] = None
+        cache_raw = preprocessing_cache.get(position_key, {}).get("raw", {}).get(ch)
+        if cache_raw is not None:
+            crp = Path(cache_raw)
+            if crp.is_file():
+                raw_path_opt = crp
+        if raw_path_opt is None:
+            rp2 = _resolve_channel_tiff_path(sample_name, position_name, ch)
+            if rp2 is not None and rp2.is_file():
+                raw_path_opt = rp2
+
+        if raw_path_opt is None:
+            app.logger.warning(
+                "[AlignMirror] Channel %r: missing %s and no raw TIFF in cache or DATA_ROOT; "
+                "using processed-aligned for detection (provenance=processed_aligned).",
+                ch,
+                expected_raw_via,
+            )
+            raw_by_ch[ch] = pimg
+            detection_sources[ch] = "processed_aligned"
+            continue
+
+        raw_arr = _squeeze_2d(tifffile.imread(str(raw_path_opt)), "raw", ch)
+        warped_try = _mirror_save_try_warp_raw_with_stored_transforms(
+            raw_arr, ch, transformations_meta, ref_ch_meta
+        )
+        if warped_try is not None:
+            if warped_try.shape != pimg.shape:
+                app.logger.warning(
+                    "[AlignMirror] Channel %r: recomputed warped raw shape %s != processed-aligned %s; "
+                    "using processed-aligned for detection (provenance=processed_aligned).",
+                    ch,
+                    warped_try.shape,
+                    pimg.shape,
+                )
+                raw_by_ch[ch] = pimg
+                detection_sources[ch] = "processed_aligned"
+            else:
+                raw_by_ch[ch] = warped_try
+                detection_sources[ch] = "raw_warped"
+                app.logger.warning(
+                    "[AlignMirror] Channel %r: missing %s; recomputed detection TIFF from raw using "
+                    "stored transform (provenance=raw_warped).",
+                    ch,
+                    expected_raw_via,
+                )
+            continue
+
+        if raw_arr.shape != pimg.shape:
+            app.logger.warning(
+                "[AlignMirror] Channel %r: missing %s and no usable stored transform in %s; "
+                "unwarped raw shape %s != processed-aligned %s; using processed-aligned for detection "
+                "(provenance=processed_aligned).",
+                ch,
+                expected_raw_via,
+                src_proc / ALIGNMENT_WARP_META_JSON,
+                raw_arr.shape,
+                pimg.shape,
+            )
+            raw_by_ch[ch] = pimg
+            detection_sources[ch] = "processed_aligned"
+            continue
+
+        raw_by_ch[ch] = raw_arr
+        detection_sources[ch] = "raw_fallback"
+        app.logger.warning(
+            "[AlignMirror] Channel %r: missing %s and no usable stored transform in %s; "
+            "using unwarped raw for detection (provenance=raw_fallback); display stays processed-aligned.",
+            ch,
+            expected_raw_via,
+            src_proc / ALIGNMENT_WARP_META_JSON,
+        )
+
+    channel_order = [c for c in channels if c in proc_by_ch]
+    if not channel_order:
+        raise FileNotFoundError(f"No readable *_aligned.tif channels under {src_proc}")
+
+    shapes_proc = {proc_by_ch[c].shape[:2] for c in channel_order}
+    shapes_raw = {raw_by_ch[c].shape[:2] for c in channel_order}
+    if len(shapes_proc) != 1 or len(shapes_raw) != 1:
+        raise ValueError(
+            "All aligned channels must share identical dimensions; "
+            f"processed: {shapes_proc} raw: {shapes_raw}"
+        )
+    proc_shape = next(iter(shapes_proc))
+    raw_shape = next(iter(shapes_raw))
+    if proc_shape != raw_shape:
+        raise ValueError(
+            f"Processed-aligned shape {proc_shape} != raw/detection shape {raw_shape} — cannot mirror."
+        )
+    H, W = int(proc_shape[0]), int(proc_shape[1])
+
+    if parsed is not None:
+        x, y, cw, crop_h = parsed
+        if x >= W or y >= H or x + cw <= 0 or y + crop_h <= 0:
+            raise ValueError(f"crop_rect {parsed} does not intersect image size {W}x{H}")
+        meta_crop = {"x": int(x), "y": int(y), "width": int(cw), "height": int(crop_h)}
+    else:
+        meta_crop = None
+        x = y = cw = crop_h = 0  # unused
+
+    written: List[str] = []
+    out_shape: Optional[Tuple[int, int]] = None
+    for ch in channel_order:
+        proc_img = proc_by_ch[ch]
+        raw_img = raw_by_ch[ch]
+        if parsed is not None:
+            out_raw = _crop_2d_to_rect(raw_img, (x, y, cw, crop_h))
+            out_disp = _crop_2d_to_rect(proc_img, (x, y, cw, crop_h))
+        else:
+            out_raw = np.asarray(raw_img, order="C")
+            out_disp = np.asarray(proc_img, order="C")
+        out_shape = (int(out_raw.shape[0]), int(out_raw.shape[1]))
+        tifffile.imwrite(str(dest_root / f"{ch}_aligned.tif"), out_raw)
+        tifffile.imwrite(str(dest_root / f"{ch}_aligned_display.tif"), out_disp)
+        written.append(ch)
+
+    meta_path = dest_root / "align_metadata.json"
+    meta: Dict[str, Any] = {
+        "sample": sample_name,
+        "position": position_name,
+        "transform_estimation_input_stage": input_stage,
+        "input_stage": input_stage,
+        "processing_aligned_subdir": f"aligned_from_{input_stage}",
+        "raw_warped_subdir": (
+            f"aligned_from_raw_via_{input_stage}" if input_stage != "raw" else f"aligned_from_{input_stage}"
+        ),
+        "detection_tiff_suffix": "_aligned.tif",
+        "display_tiff_suffix": "_aligned_display.tif",
+        "detection_tiff_source_by_channel": {ch: detection_sources.get(ch, "unknown") for ch in written},
+        "crop_rect": meta_crop,
+        "channels": sorted(written),
+        "full_image_dimensions": {"width": W, "height": H},
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if out_shape is not None:
+        meta["cropped_image_dimensions"] = {"width": out_shape[1], "height": out_shape[0]}
+    with open(meta_path, "w", encoding="utf8") as f:
+        json.dump(meta, f, indent=2)
+
+    print(
+        f"[AlignMirror] Wrote {len(written)} channel(s) raw+display to {dest_root} "
+        f"(crop={'yes' if meta_crop else 'full FoV'} transform_stage={input_stage!r})"
+    )
+    return {"dest_dir": str(dest_root), "channels": written, "metadata": str(meta_path), "crop_rect": meta_crop}
+
+
+@app.route('/api/input/align_save_mirror', methods=['POST'])
+def align_save_mirror():
+    """
+    Persist DATA_ROOT/<sample>/align/<position>/ dual aligned TIFFs from PROCESSING_OUTPUT:
+
+    - ``<ch>_aligned.tif`` from ``aligned_from_raw_via_<input_stage>/`` when input_stage is not
+      ``raw``, else from ``aligned_from_<input_stage>/``.
+    - ``<ch>_aligned_display.tif`` from processed-aligned ``aligned_from_<input_stage>/``.
+
+    Optional ``crop_rect`` applies to both. Writes ``align_metadata.json``.
+    Body: { "sample", "position", "input_stage", "crop_rect": null | {x,y,w,h} | {x,y,width,height} }
+    """
+    data = request.json or {}
+    sample = (data.get("sample") or "").strip()
+    position = (data.get("position") or "").strip()
+    input_stage = (data.get("input_stage") or "raw").strip() or "raw"
+    crop_rect = data.get("crop_rect")
+
+    if not sample or not position:
+        return jsonify({"success": False, "error": "sample and position are required"}), 400
+
+    try:
+        info = write_data_root_align_mirror_with_crop(sample, position, input_stage, crop_rect)
+        return jsonify({"success": True, "data": info})
+    except FileNotFoundError as e:
+        return jsonify({"success": False, "error": str(e)}), 404
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 def apply_contrast_enhancement(img_array: np.ndarray, method: str, params: dict) -> np.ndarray:
@@ -5842,6 +7219,95 @@ def get_pipeline_logs():
 # EXOSOME DETECTION ENDPOINTS
 # ============================================================================
 
+def _per_detection_mean_intensities(
+    raw_img: np.ndarray,
+    bool_masks: List[np.ndarray],
+    detections: List[Dict[str, Any]],
+) -> List[float]:
+    """
+    Mean raw TIff intensity inside each detection's pixel mask.
+
+    SAM/blob: one boolean mask per detection (same order).
+    RF: one merged foreground mask — split with connected components and match to
+    detections by label order, or by greedy nearest-centroid pairing if counts differ.
+    """
+    h, w = raw_img.shape[:2]
+    n = len(detections)
+    nan_list = [float('nan')] * n
+    if n == 0:
+        return []
+
+    if len(bool_masks) == n:
+        out: List[float] = []
+        for i in range(n):
+            m = bool_masks[i]
+            if m.shape == (h, w) and m.any():
+                out.append(float(raw_img[m].mean()))
+            else:
+                out.append(float('nan'))
+        return out
+
+    if len(bool_masks) == 1:
+        m0 = bool_masks[0]
+        if m0.shape != (h, w) or not m0.any():
+            return nan_list
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            (m0 > 0).astype(np.uint8) * 255,
+            connectivity=8,
+        )
+        if num_labels <= 1:
+            return nan_list
+
+        if num_labels - 1 == n:
+            out = []
+            for i in range(n):
+                comp = labels == (i + 1)
+                if comp.any():
+                    out.append(float(raw_img[comp].mean()))
+                else:
+                    out.append(float('nan'))
+            return out
+
+        # Count mismatch: match each detection to a component by centroid (one-to-one greedy).
+        pairs: List[Tuple[float, int, int]] = []
+        for i, det in enumerate(detections):
+            c = det.get('centroid', [0.0, 0.0])
+            cx = float(c[0]) if len(c) > 0 else 0.0
+            cy = float(c[1]) if len(c) > 1 else 0.0
+            for lbl in range(1, num_labels):
+                ddx = float(centroids[lbl][0]) - cx
+                ddy = float(centroids[lbl][1]) - cy
+                pairs.append((ddx * ddx + ddy * ddy, i, lbl))
+        pairs.sort(key=lambda t: t[0])
+        used_i: Set[int] = set()
+        used_l: Set[int] = set()
+        det_to_lbl: Dict[int, int] = {}
+        for _d2, i, lbl in pairs:
+            if i in used_i or lbl in used_l:
+                continue
+            det_to_lbl[i] = lbl
+            used_i.add(i)
+            used_l.add(lbl)
+        out = []
+        for i in range(n):
+            lbl = det_to_lbl.get(i)
+            if lbl is None:
+                out.append(float('nan'))
+                continue
+            comp = labels == lbl
+            if comp.any():
+                out.append(float(raw_img[comp].mean()))
+            else:
+                out.append(float('nan'))
+        return out
+
+    for i in range(min(n, len(bool_masks))):
+        m = bool_masks[i]
+        if m.shape == (h, w) and m.any():
+            nan_list[i] = float(raw_img[m].mean())
+    return nan_list
+
+
 def _persist_exosome_result_bundle(
     sample_name: str,
     position_name: str,
@@ -5852,9 +7318,10 @@ def _persist_exosome_result_bundle(
     settings: Optional[Dict[str, Any]] = None,
     image_path: Optional[Path] = None,
     source: str = 'auto_segment',
+    probability_map: Any = None,
 ) -> List[str]:
     """Persist exosome outputs to disk and return relative paths from OUTPUT_ROOT."""
-    settings = settings or {}
+    settings_in = dict(settings or {})
 
     output_dir = OUTPUT_ROOT / 'exosome_detection' / sample_name / position_name / channel_name
     output_dir.mkdir(exist_ok=True, parents=True)
@@ -5866,6 +7333,7 @@ def _persist_exosome_result_bundle(
     masks_path = output_dir / f"{channel_name}_masks_{timestamp}.npz"
     csv_path = output_dir / f"{channel_name}_results_{timestamp}.csv"
     run_json_path = output_dir / f"{channel_name}_run_{timestamp}.json"
+    prob_map_path = output_dir / f"{channel_name}_run_{timestamp}_probability_map.npy"
 
     def _to_bool_masks(raw_masks: Any) -> List[np.ndarray]:
         if raw_masks is None:
@@ -5935,7 +7403,18 @@ def _persist_exosome_result_bundle(
         except Exception as e:
             app.logger.warning(f"[Exosome Persist] Failed to save masks: {e}")
 
-    # 3) detections csv
+    # 3) detections csv (mean_intensity from raw / aligned TIFF, masked per detection)
+    mean_intensities: List[float] = []
+    if image_path and image_path.exists():
+        try:
+            raw_int = _read_tiff_as_array(str(image_path))
+            if raw_int is not None:
+                mean_intensities = _per_detection_mean_intensities(raw_int, bool_masks, detections)
+        except Exception as e:
+            app.logger.warning(f"[Exosome Persist] Failed to compute mean_intensity: {e}")
+    if len(mean_intensities) != len(detections):
+        mean_intensities = [float('nan')] * len(detections)
+
     try:
         with open(csv_path, 'w', newline='') as f:
             writer = csv.DictWriter(
@@ -5944,13 +7423,15 @@ def _persist_exosome_result_bundle(
                     'id', 'area', 'perimeter', 'circularity',
                     'centroid_x', 'centroid_y',
                     'bbox_x1', 'bbox_y1', 'bbox_x2', 'bbox_y2',
-                    'score'
+                    'score', 'mean_intensity',
                 ]
             )
             writer.writeheader()
             for i, det in enumerate(detections):
                 centroid = det.get('centroid', [0, 0])
                 bbox = det.get('bbox', [0, 0, 0, 0])
+                mi = mean_intensities[i] if i < len(mean_intensities) else float('nan')
+                mi_cell = '' if not np.isfinite(mi) else f'{float(mi):.6g}'
                 writer.writerow({
                     'id': i + 1,
                     'area': det.get('area', 0),
@@ -5963,19 +7444,43 @@ def _persist_exosome_result_bundle(
                     'bbox_x2': bbox[2] if len(bbox) > 2 else 0,
                     'bbox_y2': bbox[3] if len(bbox) > 3 else 0,
                     'score': scores[i] if isinstance(scores, list) and i < len(scores) else 0.0,
+                    'mean_intensity': mi_cell,
                 })
     except Exception as e:
         app.logger.warning(f"[Exosome Persist] Failed to save CSV: {e}")
 
+    # 3b) RF probability map (float32 .npy for compact storage vs JSON / float64)
+    if probability_map is not None:
+        try:
+            prob_arr = np.asarray(probability_map, dtype=np.float32)
+            if prob_arr.ndim == 2 and prob_arr.size > 0:
+                np.save(str(prob_map_path), np.ascontiguousarray(prob_arr))
+            else:
+                app.logger.warning(
+                    f"[Exosome Persist] Skipping probability_map save: expected 2D array, got shape {prob_arr.shape}"
+                )
+        except Exception as e:
+            app.logger.warning(f"[Exosome Persist] Failed to save probability_map: {e}")
+
     # 4) run metadata json
     try:
+        raw_ct = settings_in.get('confidence_threshold', None)
+        if raw_ct is None:
+            effective_ct = 0.5
+        else:
+            try:
+                effective_ct = float(raw_ct)
+            except (TypeError, ValueError):
+                effective_ct = 0.5
+        settings_in['confidence_threshold'] = effective_ct
+
         run_data = {
             'timestamp': timestamp,
             'sample': sample_name,
             'position': position_name,
             'channel': channel_name,
             'num_detections': len(detections),
-            'settings': settings,
+            'settings': settings_in,
             'source': source,
         }
         with open(run_json_path, 'w') as f:
@@ -5984,10 +7489,62 @@ def _persist_exosome_result_bundle(
         app.logger.warning(f"[Exosome Persist] Failed to save run.json: {e}")
 
     paths: List[str] = []
-    for p in (overlay_path, masks_path, csv_path, run_json_path):
+    for p in (overlay_path, masks_path, csv_path, prob_map_path, run_json_path):
         if p.exists():
             paths.append(str(p.relative_to(OUTPUT_ROOT)))
     return paths
+
+
+def _data_root_align_dir(sample_name: str, position_name: str) -> Path:
+    return DATA_ROOT / sample_name / "align" / position_name
+
+
+def _list_align_artifact_channel_keys(sample_name: str, position_name: str) -> List[str]:
+    """Channel keys that have DATA_ROOT/<sample>/align/<position>/<key>_aligned.tif."""
+    d = _data_root_align_dir(sample_name, position_name)
+    if not d.is_dir():
+        return []
+    keys: List[str] = []
+    for p in d.glob("*_aligned.tif"):
+        stem = p.stem
+        if stem.endswith("_aligned"):
+            keys.append(stem[: -len("_aligned")])
+    return sorted(keys)
+
+
+def _copy_aligned_outputs_to_data_align(
+    sample_name: str,
+    position_name: str,
+    processed_output_files: Dict[str, Path],
+    input_stage: str,
+) -> None:
+    """Mirror aligned TIFFs under DATA_ROOT/<sample>/align/<position>/ for segmentation and display."""
+    if not processed_output_files:
+        return
+    dest_root = _data_root_align_dir(sample_name, position_name)
+    raw_via_dir = _align_processing_raw_via_dir(sample_name, position_name, input_stage)
+    try:
+        dest_root.mkdir(parents=True, exist_ok=True)
+        for channel_name, proc_src in processed_output_files.items():
+            if proc_src is None:
+                continue
+            sp = Path(proc_src)
+            if not sp.is_file():
+                continue
+            raw_src = raw_via_dir / f"{channel_name}_aligned.tif"
+            if input_stage != "raw" and raw_src.is_file():
+                shutil.copy2(str(raw_src), str(dest_root / f"{channel_name}_aligned.tif"))
+                shutil.copy2(str(sp), str(dest_root / f"{channel_name}_aligned_display.tif"))
+                print(
+                    f"[Alignment] Copied raw+display aligned TIFFs to data align mirror: "
+                    f"{dest_root / (channel_name + '_aligned.tif')}"
+                )
+            else:
+                shutil.copy2(str(sp), str(dest_root / f"{channel_name}_aligned.tif"))
+                shutil.copy2(str(sp), str(dest_root / f"{channel_name}_aligned_display.tif"))
+                print(f"[Alignment] Copied aligned TIFF (raw-only path) to {dest_root / (channel_name + '_aligned.tif')}")
+    except Exception as e:
+        print(f"[Alignment] WARNING: Failed to mirror aligned TIFFs under {dest_root}: {e}")
 
 
 def _resolve_detection_image_path(sample_name: str, position_name: str, channel_name: str) -> Optional[Path]:
@@ -6001,6 +7558,12 @@ def _resolve_detection_image_path(sample_name: str, position_name: str, channel_
         Returns None when preprocessing cache and fallback input scans cannot
         resolve an existing image file.
     """
+    align_tif = _data_root_align_dir(sample_name, position_name) / f"{channel_name}_aligned.tif"
+    # Intentionally not *_aligned_display.tif — segmentation uses raw-warped intensities.
+    if align_tif.is_file():
+        print(f"[Exosome Detection] Using aligned TIFF from DATA_ROOT align mirror: {align_tif}")
+        return align_tif
+
     position_key = f"{sample_name}/{position_name}"
     image_path = None
     if position_key in preprocessing_cache:
@@ -6018,20 +7581,330 @@ def _resolve_detection_image_path(sample_name: str, position_name: str, channel_
     return _resolve_channel_tiff_path(sample_name, position_name, channel_name)
 
 
-def _rf_model_paths(sample_name: str, channel_name: str, source_position: str) -> Tuple[Path, Path]:
+def _resolve_latest_probability_map_path(
+    sample_name: str,
+    position_name: str,
+    channel_name: str,
+) -> Optional[Path]:
     """
-    Build canonical RF model and metadata paths for a source position.
+    Latest RF probability map written by _persist_exosome_result_bundle for this context.
 
     Returns:
-        (model_path, metadata_path) under data/input/<sample>/rf_models/<channel>/.
+        Absolute path to the newest matching ``*_probability_map.npy``, or None.
+    """
+    d = OUTPUT_ROOT / 'exosome_detection' / sample_name / position_name / channel_name
+    if not d.is_dir():
+        return None
+    candidates = list(d.glob('*_probability_map.npy'))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
 
-    Failure modes:
-        No exception by default; caller handles existence and permission checks.
+
+def _run_json_path_for_probability_map(prob_map_path: Path) -> Optional[Path]:
+    """``{channel}_run_{ts}_probability_map.npy`` → ``{channel}_run_{ts}.json``."""
+    stem = prob_map_path.stem
+    suffix = '_probability_map'
+    if not stem.endswith(suffix):
+        return None
+    return prob_map_path.parent / f'{stem[: -len(suffix)]}.json'
+
+
+def _confidence_threshold_from_run_json(run_json_path: Path, default: float = 0.5) -> float:
+    if not run_json_path.is_file():
+        return default
+    try:
+        with open(run_json_path, 'r') as f:
+            run_data = json.load(f)
+        settings = run_data.get('settings') or {}
+        raw_ct = settings.get('confidence_threshold', None)
+        if raw_ct is None:
+            return default
+        try:
+            return float(raw_ct)
+        except (TypeError, ValueError):
+            return default
+    except Exception:
+        return default
+
+
+@app.route('/api/exosome/background_intensity', methods=['GET'])
+def exosome_background_intensity():
+    """
+    Mean raw intensity over pixels classified as background by the latest RF probability map
+    (``probability_map < confidence_threshold``). Threshold is read from the matching run JSON.
+    """
+    sample_name = (request.args.get('sample') or '').strip()
+    position_name = (request.args.get('position') or '').strip()
+    channel_name = (request.args.get('channel') or '').strip()
+    if not sample_name or not position_name or not channel_name:
+        return jsonify({
+            'success': False,
+            'error': 'sample, position, and channel query parameters are required',
+        }), 400
+
+    bg_val, threshold_used, pixel_count, err = _compute_exosome_channel_background_intensity(
+        sample_name, position_name, channel_name,
+    )
+    if err == 'no_probability_map':
+        return jsonify({
+            'success': False,
+            'error': f'No probability map for {sample_name}/{position_name}/{channel_name}',
+        }), 404
+    if err == 'image_not_found':
+        return jsonify({
+            'success': False,
+            'error': f'Image not found for {sample_name}/{position_name}/{channel_name}',
+        }), 404
+    if err == 'bad_probability_map_shape':
+        return jsonify({
+            'success': False,
+            'error': 'Expected 2D probability map',
+        }), 400
+    if err == 'shape_mismatch':
+        return jsonify({
+            'success': False,
+            'error': 'Shape mismatch between image and probability map',
+        }), 400
+    if err == 'tiff_read_failed':
+        return jsonify({'success': False, 'error': 'Failed to read TIFF'}), 500
+    if err:
+        app.logger.error(f'background_intensity failed: {err}', exc_info=True)
+        return jsonify({'success': False, 'error': str(err)}), 500
+
+    out_bg = float(bg_val) if bg_val is not None and np.isfinite(bg_val) else None
+    return jsonify({
+        'success': True,
+        'background_intensity': out_bg,
+        'threshold_used': float(threshold_used),
+        'pixel_count': pixel_count,
+    })
+
+
+def _rf_channel_stem(channel_name: str) -> str:
+    """
+    Map channel API key to a filesystem stem: C0 -> ch0, C12 -> ch12.
+    Non-standard keys become ch_<slug> so paths stay portable.
+    """
+    s = (channel_name or '').strip()
+    if not s:
+        return 'ch_unknown'
+    m = re.match(r'^C(\d+)$', s, re.IGNORECASE)
+    if m:
+        return f"ch{m.group(1)}"
+    safe = re.sub(r'[^a-zA-Z0-9]+', '_', s).strip('_').lower()
+    if not safe:
+        return 'ch_unknown'
+    if safe.startswith('ch'):
+        return safe
+    return f'ch_{safe}'
+
+
+def _sample_channel_rf_model_paths(sample_name: str, channel_name: str) -> Tuple[Path, Path]:
+    """
+    Per-sample, per-channel persisted RF model (one file reused across positions).
+
+    Layout: <DATA_ROOT>/<sample>/rf_models/<stem>.pkl
+             <DATA_ROOT>/<sample>/rf_models/<stem>.metadata.json
+    """
+    stem = _rf_channel_stem(channel_name)
+    d = DATA_ROOT / sample_name / 'rf_models'
+    model_path = d / f'{stem}.pkl'
+    metadata_path = d / f'{stem}.metadata.json'
+    return model_path, metadata_path
+
+
+def _sample_channel_position_rf_model_paths(
+    sample_name: str, channel_name: str, position_name: str,
+) -> Tuple[Path, Path]:
+    """
+    Per-sample, per-channel, per-position RF model (non-overwriting across positions).
+
+    Layout: <DATA_ROOT>/<sample>/rf_models/<stem>_<safe_position>.pkl
+             <DATA_ROOT>/<sample>/rf_models/<stem>_<safe_position>.metadata.json
+    """
+    stem = _rf_channel_stem(channel_name)
+    pos_seg = _safe_position_segment(position_name)
+    d = DATA_ROOT / sample_name / 'rf_models'
+    base = f'{stem}_{pos_seg}'
+    return d / f'{base}.pkl', d / f'{base}.metadata.json'
+
+
+def _save_rf_model_to_per_position_and_copy_flat(
+    classifier: Any,
+    feature_params: Dict[str, Any],
+    sample_name: str,
+    channel_name: str,
+    position_name: str,
+) -> Dict[str, Any]:
+    """
+    Write RF model to per-position files, then copy pickle + metadata to flat ch<N> paths
+    (backward-compatible default).
+    """
+    from exosome_detection.random_forest_segmentation import save_rf_model
+
+    per_pkl, per_meta = _sample_channel_position_rf_model_paths(sample_name, channel_name, position_name)
+    flat_pkl, flat_meta = _sample_channel_rf_model_paths(sample_name, channel_name)
+    per_pkl.parent.mkdir(parents=True, exist_ok=True)
+    metadata = save_rf_model(classifier, feature_params, save_path=str(per_pkl))
+    shutil.copy2(per_pkl, flat_pkl)
+    shutil.copy2(per_meta, flat_meta)
+    return metadata
+
+
+def _resolve_explicit_rf_model_path(model_path_str: str) -> Tuple[Path, Path]:
+    """Validate an absolute model path from the client; return (pkl, metadata) paths."""
+    raw = Path(model_path_str)
+    if '..' in raw.parts:
+        raise ValueError('model_path must not contain ".."')
+    data_root = Path(os.getenv('SEA_DATA_ROOT', 'data/input')).resolve()
+    resolved = raw.resolve()
+    try:
+        resolved.relative_to(data_root)
+    except ValueError as exc:
+        raise ValueError('model_path must be under SEA_DATA_ROOT') from exc
+    parts = resolved.parts
+    if 'rf_models' not in parts:
+        raise ValueError('model_path must be under an rf_models directory')
+    if resolved.suffix.lower() != '.pkl':
+        raise ValueError('model_path must end with .pkl')
+    metadata_path = resolved.with_suffix('.metadata.json')
+    if not resolved.is_file() or not metadata_path.is_file():
+        raise ValueError(f'Model or metadata missing: {resolved} / {metadata_path}')
+    return resolved, metadata_path
+
+
+def _list_rf_models_for_sample_channel(sample_name: str, channel_name: str) -> List[Dict[str, Any]]:
+    """
+    Per-position and legacy RF models for the UI picker.
+
+    Excludes the flat ``<stem>.pkl`` copy (backward-compat only). Deduplicates by canonical
+    training position, keeping the most recently saved file per position.
+    """
+    from datetime import datetime
+
+    stem = _rf_channel_stem(channel_name)
+    root = DATA_ROOT / sample_name / 'rf_models'
+    if not root.is_dir():
+        return []
+
+    def saved_at_ts(val: Any) -> float:
+        if not val or not isinstance(val, str):
+            return 0.0
+        try:
+            return datetime.fromisoformat(val.replace('Z', '+00:00')).timestamp()
+        except (ValueError, TypeError, OSError):
+            return 0.0
+
+    candidates: List[Tuple[str, float, Dict[str, Any]]] = []
+
+    try:
+        for pkl in sorted(root.glob(f'{stem}_*.pkl')):
+            if pkl.name == f'{stem}.pkl':
+                continue
+            meta_path = pkl.with_suffix('.metadata.json')
+            if not meta_path.is_file():
+                app.logger.warning(f"Skipping RF model without metadata: {pkl}")
+                continue
+            slug = pkl.name[len(stem) + 1 : -len('.pkl')] if pkl.name.startswith(f'{stem}_') else ''
+            try:
+                with open(meta_path, 'r', encoding='utf-8') as f:
+                    meta: Dict[str, Any] = json.load(f)
+            except Exception as parse_err:
+                app.logger.warning(f"Skipping per-position RF model with corrupt metadata {pkl}: {parse_err}")
+                continue
+            trained_on = meta.get('trained_on', {}) if isinstance(meta.get('trained_on'), dict) else {}
+            pos_raw = trained_on.get('position')
+            pos_key = (
+                (str(pos_raw).strip() if pos_raw is not None else '')
+                or (slug.strip() if slug else '')
+                or pkl.stem
+            )
+            sa = meta.get('saved_at')
+            ts = saved_at_ts(sa)
+            item = {
+                'layout': 'per_position',
+                'position': pos_key,
+                'position_slug': slug,
+                'channel_stem': stem,
+                'saved_at': sa,
+                'trained_on': trained_on,
+                'sklearn_version': meta.get('sklearn_version'),
+                'path': str(pkl),
+            }
+            candidates.append((pos_key, ts, item))
+    except Exception as e:
+        app.logger.warning(f"Glob per-position RF models failed: {e}")
+
+    legacy_dir = root / channel_name
+    if legacy_dir.is_dir():
+        for model_path in sorted(legacy_dir.glob('*_rf_model.pkl')):
+            position_name = model_path.name[: -len('_rf_model.pkl')]
+            _, metadata_path = _rf_model_paths(sample_name, channel_name, position_name)
+            if not metadata_path.exists():
+                app.logger.warning(f"Skipping RF model without metadata: {model_path}")
+                continue
+            try:
+                with open(metadata_path, 'r', encoding='utf-8') as f:
+                    meta = json.load(f)
+            except Exception as parse_err:
+                app.logger.warning(f"Skipping legacy RF model with corrupt metadata {model_path}: {parse_err}")
+                continue
+            trained_on = meta.get('trained_on', {}) if isinstance(meta.get('trained_on'), dict) else {}
+            pos_raw = trained_on.get('position')
+            pos_key = (
+                (str(pos_raw).strip() if pos_raw is not None else '')
+                or (position_name.strip() if position_name else '')
+                or model_path.stem
+            )
+            sa = meta.get('saved_at')
+            ts = saved_at_ts(sa)
+            item = {
+                'layout': 'legacy_position',
+                'position': pos_key,
+                'position_slug': position_name,
+                'channel_stem': None,
+                'saved_at': sa,
+                'trained_on': trained_on,
+                'sklearn_version': meta.get('sklearn_version'),
+                'path': str(model_path),
+            }
+            candidates.append((pos_key, ts, item))
+
+    best: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+    for pos_key, ts, item in candidates:
+        prev = best.get(pos_key)
+        if prev is None or ts > prev[0] or (ts == prev[0] and item['path'] > prev[1]['path']):
+            best[pos_key] = (ts, item)
+
+    out = [t[1] for t in best.values()]
+    out.sort(key=lambda it: saved_at_ts(it.get('saved_at')), reverse=True)
+    return out
+
+
+def _rf_model_paths(sample_name: str, channel_name: str, source_position: str) -> Tuple[Path, Path]:
+    """
+    Legacy layout: data/input/<sample>/rf_models/<channel>/<position>_rf_model.pkl
     """
     model_dir = DATA_ROOT / sample_name / 'rf_models' / channel_name
     model_path = model_dir / f"{source_position}_rf_model.pkl"
     metadata_path = model_dir / f"{source_position}_metadata.json"
     return model_path, metadata_path
+
+
+def _resolve_saved_rf_model_paths(
+    sample_name: str,
+    channel_name: str,
+    legacy_source_position: str = '',
+) -> Tuple[Path, Path]:
+    """Prefer flat ch<N>.pkl; fall back to legacy per-position file when requested."""
+    flat_model, flat_meta = _sample_channel_rf_model_paths(sample_name, channel_name)
+    if flat_model.exists() and flat_meta.exists():
+        return flat_model, flat_meta
+    sp = (legacy_source_position or '').strip()
+    if sp:
+        return _rf_model_paths(sample_name, channel_name, sp)
+    return flat_model, flat_meta
 
 
 @app.route('/api/exosome/segment', methods=['POST'])
@@ -6187,43 +8060,114 @@ def exosome_segment():
                 traceback.print_exc()
                 raise
         elif method == 'random_forest':
-            annotations = data.get('annotations', [])  # List of {points: [[x,y],...], label: 0 or 1}
-            confidence_threshold = data.get('confidence_threshold', 0.5)
-            apply_morphology = data.get('apply_morphology', False)
-            n_estimators = data.get('n_estimators', 100)
-            
-            if not annotations or len(annotations) == 0:
-                return jsonify({
-                    'success': False,
-                    'error': 'annotations are required for Random Forest method. Please annotate some pixels first.'
-                }), 400
-            
-            # Import Random Forest service
-            try:
-                from exosome_detection import segment_with_random_forest
-            except ImportError as e:
-                return jsonify({
-                    'success': False,
-                    'error': f'Failed to import Random Forest service: {e}'
-                }), 500
-            
-            # Run Random Forest segmentation
-            print(f"[Exosome Detection] Running Random Forest with {len(annotations)} annotation groups, confidence_threshold={confidence_threshold}")
-            try:
-                result = segment_with_random_forest(
-                    image=image_array,
-                    annotations=annotations,
-                    confidence_threshold=confidence_threshold,
-                    min_area=min_area,
-                    apply_morphology=apply_morphology,
-                    n_estimators=n_estimators,
-                )
-                print(f"[Exosome Detection] Random Forest completed: found {len(result.get('detections', []))} objects")
-            except Exception as e:
-                print(f"[Exosome Detection] ERROR in Random Forest: {e}")
-                import traceback
-                traceback.print_exc()
-                raise
+            from exosome_detection.random_forest_segmentation import (
+                train_random_forest,
+                load_rf_model,
+                segment_with_loaded_random_forest,
+                validate_feature_params,
+            )
+
+            annotations = data.get('annotations') or []
+            if not isinstance(annotations, list):
+                annotations = []
+            force_retrain = bool(data.get('force_retrain', False))
+            confidence_threshold = float(data.get('confidence_threshold', 0.5))
+            apply_morphology = bool(data.get('apply_morphology', False))
+            n_estimators = int(data.get('n_estimators', 100))
+
+            flat_model, flat_meta = _sample_channel_rf_model_paths(sample_name, channel_name)
+            explicit_model = (data.get('model_path') or '').strip()
+            model_path = flat_model
+            metadata_path = flat_meta
+            can_use_saved = False
+            has_ann = bool(annotations and len(annotations) > 0)
+
+            if not force_retrain and not has_ann and explicit_model:
+                try:
+                    model_path, metadata_path = _resolve_explicit_rf_model_path(explicit_model)
+                    can_use_saved = True
+                except ValueError as ve:
+                    return jsonify({'success': False, 'error': str(ve)}), 400
+            elif not force_retrain and not has_ann:
+                model_path, metadata_path = flat_model, flat_meta
+                can_use_saved = flat_model.is_file() and flat_meta.is_file()
+
+            version_warning: Optional[str] = None
+            if can_use_saved:
+                print(f"[Exosome Detection] RF: loading saved model {model_path}")
+                try:
+                    classifier, loaded_meta, version_warning = load_rf_model(str(model_path))
+                except Exception as load_err:
+                    return jsonify({
+                        'success': False,
+                        'error': f'Failed to load saved RF model: {load_err}'
+                    }), 500
+                feature_params = loaded_meta.get('feature_params', {})
+                if not validate_feature_params(feature_params):
+                    return jsonify({
+                        'success': False,
+                        'error': 'Feature schema mismatch for saved RF model; delete the .pkl or retrain with annotations.',
+                    }), 400
+                try:
+                    result = segment_with_loaded_random_forest(
+                        image=image_array,
+                        classifier=classifier,
+                        confidence_threshold=confidence_threshold,
+                        min_area=min_area,
+                        apply_morphology=apply_morphology,
+                    )
+                except Exception as e:
+                    print(f"[Exosome Detection] ERROR in Random Forest (loaded): {e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
+                result['_rf_used_saved_model'] = True
+                result['_rf_model_path'] = str(model_path)
+                if version_warning:
+                    result['_model_warning'] = (
+                        result.get('_model_warning') or ''
+                    ) + (f" {version_warning}" if result.get('_model_warning') else version_warning)
+            else:
+                if not annotations or len(annotations) == 0:
+                    hint = ''
+                    if force_retrain:
+                        hint = ' Retrain requires annotations.'
+                    elif not flat_model.is_file():
+                        hint = ' No saved model for this sample/channel; add annotations and run again.'
+                    return jsonify({
+                        'success': False,
+                        'error': (
+                            'annotations are required for Random Forest when no saved model exists '
+                            'or when retraining.'
+                            + hint
+                        ),
+                    }), 400
+
+                print(f"[Exosome Detection] RF: training new model (force_retrain={force_retrain})")
+                try:
+                    classifier = train_random_forest(
+                        image=image_array,
+                        annotations=annotations,
+                        n_estimators=n_estimators,
+                        max_depth=None,
+                        class_weight='balanced',
+                    )
+                    result = segment_with_loaded_random_forest(
+                        image=image_array,
+                        classifier=classifier,
+                        confidence_threshold=confidence_threshold,
+                        min_area=min_area,
+                        apply_morphology=apply_morphology,
+                    )
+                except Exception as e:
+                    print(f"[Exosome Detection] ERROR in Random Forest: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
+
+                # Preview-only: train in memory for this request; persist RF weights via POST /api/exosome/rf_model/save.
+                result['_rf_used_saved_model'] = False
+                result['_rf_model_saved'] = False
         else:
             return jsonify({
                 'success': False,
@@ -6286,9 +8230,14 @@ def exosome_segment():
                     'max_area': max_area,
                     'score_thresh': data.get('score_thresh'),
                     'confidence_threshold': data.get('confidence_threshold'),
+                    'force_retrain': data.get('force_retrain'),
+                    'rf_used_saved_model': result.get('_rf_used_saved_model'),
+                    'rf_model_saved': result.get('_rf_model_saved'),
+                    'rf_model_path': result.get('_rf_model_path'),
                 },
                 image_path=image_path,
                 source='auto_segment',
+                probability_map=result.get('probability_map') if method == 'random_forest' else None,
             )
             print(f"[Exosome Detection] Auto-saved {len(auto_saved_paths)} artifact(s) for {sample_name}/{position_name}/{channel_name}")
         except Exception as persist_err:
@@ -6368,7 +8317,6 @@ def save_rf_model_api():
         image_array = tifffile.imread(str(image_path))
         from exosome_detection.random_forest_segmentation import (
             train_random_forest,
-            save_rf_model,
             get_feature_params,
         )
 
@@ -6379,55 +8327,40 @@ def save_rf_model_api():
             max_depth=None,
             class_weight='balanced',
         )
-        model_path, _ = _rf_model_paths(sample_name, channel_name, position_name)
-        metadata = save_rf_model(
+        per_pkl, _ = _sample_channel_position_rf_model_paths(sample_name, channel_name, position_name)
+        metadata = _save_rf_model_to_per_position_and_copy_flat(
             classifier,
-            feature_params={
+            {
                 'feature_params': get_feature_params(),
                 'trained_on': {
                     'sample': sample_name,
                     'position': position_name,
                     'channel': channel_name,
+                    'channel_stem': _rf_channel_stem(channel_name),
                 },
             },
-            save_path=str(model_path),
+            sample_name,
+            channel_name,
+            position_name,
         )
 
         return jsonify({
             'success': True,
-            'saved_path': str(model_path),
+            'saved_path': str(per_pkl),
+            'flat_path': str(_sample_channel_rf_model_paths(sample_name, channel_name)[0]),
             'metadata': metadata,
+            'channel_stem': _rf_channel_stem(channel_name),
         })
     except Exception as e:
         app.logger.error(f"RF model save failed: {e}", exc_info=True)
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-@app.route('/api/exosome/rf_model/list', methods=['GET'])
-def list_rf_models_api():
+@app.route('/api/exosome/rf_model/status', methods=['GET'])
+def rf_model_status_api():
     """
-    List available saved RF models for a sample/channel.
-
-    Query params:
-        sample: str
-        channel: str
-
-    Returns:
-        {
-            "success": bool,
-            "data": [
-                {
-                    "position": str,
-                    "saved_at": str,
-                    "trained_on": {...},
-                    "sklearn_version": str,
-                    "path": str
-                }, ...
-            ]
-        }
-
-    Failure modes:
-        400 for missing query params, 500 for filesystem read errors.
+    Return whether a persisted per-sample per-channel RF model exists (flat layout),
+    plus a deduplicated list of on-disk models for the picker (per-position and legacy; flat copy excluded).
     """
     try:
         sample_name = (request.args.get('sample') or '').strip()
@@ -6435,31 +8368,70 @@ def list_rf_models_api():
         if not sample_name or not channel_name:
             return jsonify({'success': False, 'error': 'sample and channel query params are required'}), 400
 
-        model_dir = DATA_ROOT / sample_name / 'rf_models' / channel_name
-        if not model_dir.exists():
-            return jsonify({'success': True, 'data': []})
+        stem = _rf_channel_stem(channel_name)
+        model_path, metadata_path = _sample_channel_rf_model_paths(sample_name, channel_name)
+        available_models = _list_rf_models_for_sample_channel(sample_name, channel_name)
+        exists = model_path.is_file() and metadata_path.is_file()
+        if not exists and available_models:
+            exists = True
 
-        items: List[Dict[str, Any]] = []
-        for model_path in sorted(model_dir.glob('*_rf_model.pkl')):
-            position_name = model_path.name[:-len('_rf_model.pkl')]
-            _, metadata_path = _rf_model_paths(sample_name, channel_name, position_name)
-            if not metadata_path.exists():
-                app.logger.warning(f"Skipping RF model without metadata: {model_path}")
-                continue
-            try:
-                with open(metadata_path, 'r', encoding='utf-8') as f:
-                    metadata: Dict[str, Any] = json.load(f)
-            except Exception as parse_err:
-                app.logger.warning(f"Skipping RF model with corrupt metadata for {model_path}: {parse_err}")
-                continue
-            items.append({
-                'position': position_name,
+        if not exists:
+            return jsonify({
+                'success': True,
+                'data': {
+                    'exists': False,
+                    'channel_stem': stem,
+                    'channel': channel_name,
+                    'available_models': available_models,
+                },
+            })
+
+        try:
+            with open(metadata_path, 'r', encoding='utf-8') as f:
+                metadata: Dict[str, Any] = json.load(f)
+        except Exception as parse_err:
+            app.logger.warning(f"RF model metadata unreadable: {metadata_path}: {parse_err}")
+            return jsonify({
+                'success': True,
+                'data': {
+                    'exists': False,
+                    'channel_stem': stem,
+                    'channel': channel_name,
+                    'available_models': available_models,
+                },
+            })
+
+        return jsonify({
+            'success': True,
+            'data': {
+                'exists': True,
+                'channel_stem': stem,
+                'channel': channel_name,
+                'path': str(model_path),
                 'saved_at': metadata.get('saved_at'),
                 'trained_on': metadata.get('trained_on', {}),
                 'sklearn_version': metadata.get('sklearn_version'),
-                'path': str(model_path),
-            })
+                'available_models': available_models,
+            },
+        })
+    except Exception as e:
+        app.logger.error(f"RF model status failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
 
+
+@app.route('/api/exosome/rf_model/list', methods=['GET'])
+def list_rf_models_api():
+    """
+    List saved RF models for a sample/channel: flat ch*.pkl, per-position <stem>_<position>.pkl,
+    and legacy per-position files under rf_models/<channel>/.
+    """
+    try:
+        sample_name = (request.args.get('sample') or '').strip()
+        channel_name = (request.args.get('channel') or '').strip()
+        if not sample_name or not channel_name:
+            return jsonify({'success': False, 'error': 'sample and channel query params are required'}), 400
+
+        items = _list_rf_models_for_sample_channel(sample_name, channel_name)
         return jsonify({'success': True, 'data': items})
     except Exception as e:
         app.logger.error(f"RF model list failed: {e}", exc_info=True)
@@ -6476,6 +8448,7 @@ def load_rf_model_and_segment_api():
             "sample": str,
             "position": str,  # target position to segment
             "channel": str,
+            "model_path": str (optional, absolute .pkl from list/status; when set, overrides flat/legacy resolution),
             "model_source_position": str,
             "confidence_threshold": float (optional),
             "min_area": int (optional),
@@ -6500,21 +8473,31 @@ def load_rf_model_and_segment_api():
         position_name = (data.get('position') or '').strip()
         channel_name = (data.get('channel') or '').strip()
         source_position = (data.get('model_source_position') or '').strip()
+        model_path_explicit = (data.get('model_path') or '').strip()
         confidence_threshold = float(data.get('confidence_threshold', 0.5))
         min_area = int(data.get('min_area', 0))
         apply_morphology = bool(data.get('apply_morphology', False))
 
-        if not sample_name or not position_name or not channel_name or not source_position:
+        if not sample_name or not position_name or not channel_name:
             return jsonify({
                 'success': False,
-                'error': 'sample, position, channel, and model_source_position are required'
+                'error': 'sample, position, and channel are required'
             }), 400
 
-        model_path, metadata_path = _rf_model_paths(sample_name, channel_name, source_position)
+        if model_path_explicit:
+            try:
+                model_path, metadata_path = _resolve_explicit_rf_model_path(model_path_explicit)
+            except ValueError as ve:
+                return jsonify({'success': False, 'error': str(ve)}), 400
+        else:
+            model_path, metadata_path = _resolve_saved_rf_model_paths(sample_name, channel_name, source_position)
         if not model_path.exists() or not metadata_path.exists():
             return jsonify({
                 'success': False,
-                'error': f'Saved model not found for {sample_name}/{channel_name}/{source_position}'
+                'error': (
+                    f'No saved RF model for {sample_name}/{channel_name}. '
+                    f'Train from annotations or use the flat rf_models/{_rf_channel_stem(channel_name)}.pkl layout.'
+                )
             }), 404
 
         image_path = _resolve_detection_image_path(sample_name, position_name, channel_name)
@@ -6558,6 +8541,7 @@ def load_rf_model_and_segment_api():
                 scores=result.get('scores', []),
                 settings={
                     'method': 'random_forest_loaded',
+                    'model_source': str(model_path),
                     'model_source_position': source_position,
                     'confidence_threshold': confidence_threshold,
                     'min_area': min_area,
@@ -6567,6 +8551,7 @@ def load_rf_model_and_segment_api():
                 },
                 image_path=image_path,
                 source='rf_model_load_and_segment',
+                probability_map=result.get('probability_map'),
             )
         except Exception as persist_err:
             app.logger.warning(f"[Exosome Detection] Auto-save failed (load_and_segment): {persist_err}")
@@ -6578,6 +8563,8 @@ def load_rf_model_and_segment_api():
                 f"current is {sklearn.__version__}. Results may differ."
             )
         result['_model_metadata'] = metadata
+        result['_rf_used_saved_model'] = True
+        result['_rf_model_path'] = str(model_path)
         return jsonify({'success': True, 'data': result})
     except Exception as e:
         app.logger.error(f"RF load_and_segment failed: {e}", exc_info=True)
@@ -6823,10 +8810,14 @@ def exosome_channel_display():
     Body:
       { "sample": str, "position": str, "channel": str,
         "mode": "raw_16bit" | "enhanced" | "minmax",
-        "lut":  "gray" | "red" }
+        "lut":  "gray" | "red",
+        "source_stage": optional str — e.g. "contrast_enhance", "step1". When set and
+        preprocessing_cache[position][source_stage][channel] exists, that TIFF is used
+        for display; otherwise falls back to raw (same cache entry as before).
 
     raw_16bit  — ImageJ-like: arr / 65535 * 255  (fixed 16-bit linear, DEFAULT)
-    enhanced   — percentile stretch p0.5–p99.5
+    enhanced   — percentile stretch p0.5–p99.5 (or, when source_stage is set and lut is gray,
+                 the same PNG/cache as generate_preview_png / Image Processing tab — no second stretch)
     minmax     — linear from arr.min() to arr.max()
 
     Returns: { "success": bool, "preview_url": str, "norm_stats": dict }
@@ -6837,6 +8828,7 @@ def exosome_channel_display():
     channel  = body.get('channel', '')
     mode     = body.get('mode', 'raw_16bit')
     lut      = body.get('lut',  'gray')
+    source_stage = (body.get('source_stage') or '').strip()
 
     if not sample or not position or not channel:
         return jsonify({'success': False, 'error': 'Missing sample/position/channel'}), 400
@@ -6857,9 +8849,75 @@ def exosome_channel_display():
         return jsonify({'success': False,
                         'error': f'Channel {channel!r} not found. Available: {sorted(raw_cache.keys())}'}), 404
 
-    tiff_path = raw_cache[channel]
+    align_root = _data_root_align_dir(sample, position)
+    align_disp = align_root / f"{channel}_aligned_display.tif"
+    align_raw = align_root / f"{channel}_aligned.tif"
+    using_ip_result = bool(source_stage and source_stage != 'raw')
+
+    tiff_path: Optional[Path] = None
+    if using_ip_result and align_disp.is_file():
+        tiff_path = align_disp
+    elif align_raw.is_file():
+        tiff_path = align_raw
+    else:
+        if using_ip_result:
+            stage_map = preprocessing_cache[position_key].get(source_stage)
+            if isinstance(stage_map, dict) and channel in stage_map:
+                cand = Path(stage_map[channel])
+                if cand.is_file():
+                    tiff_path = cand
+        if tiff_path is None:
+            tiff_path = Path(raw_cache[channel])
+
+    if not tiff_path.is_file():
+        return jsonify({'success': False, 'error': f'TIFF not found: {tiff_path}'}), 404
+
+    # Processed pipeline TIFF + enhanced gray: same preview file & cache key as
+    # generate_preview_png (Image Processing / preprocess final) — no duplicate percentile stretch.
+    reuse_image_processing_preview = (
+        bool(source_stage)
+        and source_stage != 'raw'
+        and mode == 'enhanced'
+        and lut == 'gray'
+    )
 
     try:
+        if reuse_image_processing_preview:
+            file_mtime = tiff_path.stat().st_mtime
+            scale_key = f"{None}:{None}"
+            ip_cache_key = hashlib.sha256(
+                f"{tiff_path}:{file_mtime}:{scale_key}".encode()
+            ).hexdigest()
+            ip_preview_path = PREVIEW_CACHE / f"{ip_cache_key}.png"
+            cache_hit = ip_preview_path.exists()
+            preview_url = generate_preview_png(tiff_path)
+            if not preview_url:
+                return jsonify({
+                    'success': False,
+                    'error': f'Could not build preview for {tiff_path}',
+                }), 500
+            ns = _quick_tiff_norm_stats(tiff_path) or {}
+            norm_stats = {
+                'dtype': str(ns.get('dtype', '')),
+                'original_min': round(float(ns.get('original_min', 0)), 2),
+                'original_max': round(float(ns.get('original_max', 0)), 2),
+                'p0_5': ns.get('p0_5'),
+                'p99_5': ns.get('p99_5'),
+                'display_min': ns.get('display_min'),
+                'display_max': ns.get('display_max'),
+                'normalization': ns.get('normalization', 'percentile_p0.5-p99.5'),
+                'mode': mode,
+                'lut': lut,
+                'source_stage': source_stage,
+                'cache_hit': cache_hit,
+                'preview_pipeline': 'generate_preview_png',
+            }
+            return jsonify({
+                'success': True,
+                'preview_url': preview_url,
+                'norm_stats': norm_stats,
+            })
+
         arr = tifffile.imread(str(tiff_path))
         # Squeeze singleton dims and take first slice if somehow still 3D
         while arr.ndim > 2 and 1 in arr.shape:
@@ -6907,18 +8965,21 @@ def exosome_channel_display():
         # ---- cache ----
         PREVIEW_CACHE.mkdir(parents=True, exist_ok=True)
         mtime = tiff_path.stat().st_mtime
+        stage_tag = source_stage if source_stage else 'raw'
         cache_key = hashlib.sha256(
-            f"exosome_display:{tiff_path}:{mtime}:{mode}:{lut}".encode()
+            f"exosome_display:{tiff_path}:{mtime}:{mode}:{lut}:{stage_tag}".encode()
         ).hexdigest()
         preview_path = PREVIEW_CACHE / f"{cache_key}.png"
         cache_hit = preview_path.exists()
         if not cache_hit:
             img_pil.save(preview_path, format='PNG')
             print(f"[ExoDisplay] Generated  mode={mode!r} lut={lut!r} channel={channel!r} "
+                  f"source_stage={stage_tag!r} tiff={tiff_path.name} "
                   f"dtype={orig_dtype} raw=[{orig_min:.0f},{orig_max:.0f}] "
                   f"stretch=[{display_min:.0f},{display_max:.0f}]")
         else:
-            print(f"[ExoDisplay] Cache hit   mode={mode!r} lut={lut!r} channel={channel!r}")
+            print(f"[ExoDisplay] Cache hit   mode={mode!r} lut={lut!r} channel={channel!r} "
+                  f"source_stage={stage_tag!r}")
 
         norm_stats = {
             'dtype':        orig_dtype,
@@ -6931,6 +8992,7 @@ def exosome_channel_display():
             'normalization': norm_method,
             'mode': mode,
             'lut':  lut,
+            'source_stage': stage_tag,
             'cache_hit': cache_hit,
         }
 
@@ -7106,11 +9168,9 @@ if __name__ == '__main__':
     print(f"Output dir:   {OUTPUT_ROOT.absolute()}")
     print("=" * 60)
 
-    # Load marker mapping on startup
-    print("\nLoading marker mapping on startup...")
+    # Marker_info.xlsx is loaded per sample from DATA_ROOT/<sample>/Marker_info.xlsx
     clear_marker_cache()
-    mapping = load_marker_mapping()
-    print(f"Marker mapping loaded: {len(mapping)} cycles")
+    print("\nMarker mapping: per-sample (DATA_ROOT/<sample_id>/Marker_info.xlsx)")
 
     # ------------------------------------------------------------------ #
     # Start server — use make_server so we can signal readiness AFTER     #

@@ -3,7 +3,7 @@
  * Displays output files and reference-centered exosome colocalization analysis.
  */
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ResultItem,
   ColocalizationStats,
@@ -13,6 +13,38 @@ import {
 } from '../types/alignment';
 import '../styles/ResultsVisualization.css';
 import { getApiBase } from '../lib/apiBase';
+
+function geometryChannelPositive(row: Record<string, unknown>, ch: string): boolean {
+  const geomKey = `${ch}_positive_geom`;
+  if (Object.prototype.hasOwnProperty.call(row, geomKey)) {
+    return !!(row[geomKey] as boolean);
+  }
+  return !!(row[`${ch}_positive`] as boolean);
+}
+
+function channelComboLabelFromKeys(positiveChannelKeys: string[]): string {
+  if (positiveChannelKeys.length === 0) return 'Negative';
+  if (positiveChannelKeys.length === 1) return `${positiveChannelKeys[0]} only`;
+  return [...positiveChannelKeys].sort().join(' + ');
+}
+
+function effectivePositiveChannels(row: Record<string, unknown>, markerChs: string[]): string[] {
+  return markerChs.filter((ch) => geometryChannelPositive(row, ch));
+}
+
+function effectiveCombinationLabel(row: Record<string, unknown>, markerChs: string[]): string {
+  return channelComboLabelFromKeys(effectivePositiveChannels(row, markerChs));
+}
+
+function effectiveTotalPositiveMarkerCount(
+  row: Record<string, unknown>,
+  markerChs: string[],
+): number {
+  return markerChs.reduce((sum, ch) => {
+    if (!geometryChannelPositive(row, ch)) return sum;
+    return sum + Number(row[`${ch}_count`] ?? 0);
+  }, 0);
+}
 
 interface ResultsVisualizationProps {
   results: ResultItem[];
@@ -51,9 +83,13 @@ const ResultsVisualization: React.FC<ResultsVisualizationProps> = ({
   const [colocData, setColocData] = useState<ExosomeColocalizationResult | null>(exosomeColocalization || null);
   const [isRunningColoc, setIsRunningColoc] = useState<boolean>(false);
   const [colocError, setColocError] = useState<string>('');
+  const [colocSuccessMessage, setColocSuccessMessage] = useState<string>('');
   const [filteredReferenceObjectIds, setFilteredReferenceObjectIds] = useState<number[] | null>(null);
   const [isExportingIntensity, setIsExportingIntensity] = useState<boolean>(false);
   const [intensityExportError, setIntensityExportError] = useState<string>('');
+  const [showDeltaIntensityColumns, setShowDeltaIntensityColumns] = useState<boolean>(true);
+  /** When true, skip syncing `exosomeColocalization` prop over POST-derived colocData until context changes. */
+  const colocDataFromRunRef = useRef(false);
 
   useEffect(() => {
     setResultItems(results);
@@ -68,8 +104,13 @@ const ResultsVisualization: React.FC<ResultsVisualizationProps> = ({
   }, [availableChannels, referenceChannel]);
 
   useEffect(() => {
+    colocDataFromRunRef.current = false;
+  }, [selectedSample, selectedPosition, referenceChannel]);
+
+  useEffect(() => {
+    if (colocDataFromRunRef.current) return;
     setColocData(exosomeColocalization || null);
-  }, [exosomeColocalization]);
+  }, [exosomeColocalization, selectedSample, selectedPosition, referenceChannel]);
 
   // If precomputed colocalization results exist, sync the reference channel dropdown
   // to the reference channel used by the backend for that dataset.
@@ -204,13 +245,35 @@ const ResultsVisualization: React.FC<ResultsVisualizationProps> = ({
     return baseReferenceRowsForFilter.filter((row) => idSet.has(row.reference_object_id));
   }, [baseReferenceRowsForFilter, filteredReferenceObjectIds]);
 
+  const colocMarkerChs = useMemo(() => {
+    const fromSummary = colocData?.summary?.marker_channels;
+    if (Array.isArray(fromSummary) && fromSummary.length > 0) {
+      return fromSummary;
+    }
+    return markerChannels;
+  }, [colocData?.summary?.marker_channels, markerChannels]);
+
   const summaryForDisplay = useMemo(() => {
     if (!baseReferenceRowsForFilter || baseReferenceRowsForFilter.length === 0) return null;
 
     const total = referenceRowsForDisplay.length;
-    const positiveCount = referenceRowsForDisplay.filter((r) => r.overall_status === 'Positive').length;
+    const chs = colocMarkerChs;
+    const positiveCount =
+      chs.length > 0
+        ? referenceRowsForDisplay.filter((r) =>
+            chs.some((ch) => geometryChannelPositive(r as unknown as Record<string, unknown>, ch)),
+          ).length
+        : referenceRowsForDisplay.filter((r) => r.overall_status === 'Positive').length;
     const negativeCount = total - positiveCount;
-    const matchedMarkers = referenceRowsForDisplay.reduce((sum, r) => sum + Number(r.total_positive_marker_count || 0), 0);
+    const matchedMarkers =
+      chs.length > 0
+        ? referenceRowsForDisplay.reduce(
+            (sum, r) =>
+              sum +
+              effectiveTotalPositiveMarkerCount(r as unknown as Record<string, unknown>, chs),
+            0,
+          )
+        : referenceRowsForDisplay.reduce((sum, r) => sum + Number(r.total_positive_marker_count || 0), 0);
 
     const rate = total > 0 ? (positiveCount / total) * 100.0 : 0.0;
 
@@ -222,18 +285,27 @@ const ResultsVisualization: React.FC<ResultsVisualizationProps> = ({
       total_matched_marker_objects: matchedMarkers,
       analysis_mode: colocData?.summary?.analysis_mode ?? analysisMode,
     };
-  }, [baseReferenceRowsForFilter, referenceRowsForDisplay, colocData?.summary?.analysis_mode, analysisMode]);
+  }, [
+    baseReferenceRowsForFilter,
+    referenceRowsForDisplay,
+    colocData?.summary?.analysis_mode,
+    analysisMode,
+    colocMarkerChs,
+  ]);
 
   const combinationSummaryForDisplay = useMemo(() => {
-    // If no filter was applied, use the backend-computed combo table.
-    if (filteredReferenceObjectIds === null) return colocData?.combination_summary || [];
+    const markerChs = colocMarkerChs;
     const total = referenceRowsForDisplay.length;
+    if (total === 0) return colocData?.combination_summary || [];
+    if (markerChs.length === 0) {
+      return colocData?.combination_summary || [];
+    }
     const counts = new Map<string, number>();
     referenceRowsForDisplay.forEach((row) => {
-      const key = row.biomarker_combination_label || 'Negative';
+      const key = effectiveCombinationLabel(row as unknown as Record<string, unknown>, markerChs);
       counts.set(key, (counts.get(key) || 0) + 1);
     });
-    const combos = Array.from(counts.entries())
+    return Array.from(counts.entries())
       .map(([combination, count]) => {
         const rate = total > 0 ? count / total : 0.0;
         return {
@@ -244,8 +316,11 @@ const ResultsVisualization: React.FC<ResultsVisualizationProps> = ({
         };
       })
       .sort((a, b) => b.count - a.count);
-    return combos;
-  }, [filteredReferenceObjectIds, referenceRowsForDisplay, colocData?.combination_summary]);
+  }, [
+    referenceRowsForDisplay,
+    colocData?.combination_summary,
+    colocMarkerChs,
+  ]);
 
   const multiChannelComboTableForDisplay = useMemo(() => {
     if (!comboAnalysis?.combo_table) return [];
@@ -274,6 +349,47 @@ const ResultsVisualization: React.FC<ResultsVisualizationProps> = ({
     return combos;
   }, [comboAnalysis, filteredReferenceObjectIds, referenceRowsForDisplay]);
 
+  const channelSummaryForDisplay = useMemo(() => {
+    const rows = referenceRowsForDisplay;
+    const chs = colocMarkerChs;
+    if (!rows.length || !chs.length) {
+      return colocData?.channel_summary || [];
+    }
+    const base = colocData?.channel_summary || [];
+    const refTotal = rows.length;
+    return chs.map((ch) => {
+      const meta = base.find((b) => b.channel === ch);
+      const positiveRows = rows.filter((r) =>
+        geometryChannelPositive(r as unknown as Record<string, unknown>, ch),
+      );
+      const posCount = positiveRows.length;
+      const avgCount =
+        posCount > 0
+          ? positiveRows.reduce(
+              (s, r) => s + Number((r as unknown as Record<string, unknown>)[`${ch}_count`] ?? 0),
+              0,
+            ) / posCount
+          : 0;
+      const nearestVals = positiveRows
+        .map((r) => (r as unknown as Record<string, unknown>)[`${ch}_nearest_distance`])
+        .filter((v) => v != null && Number.isFinite(Number(v)))
+        .map((v) => Number(v));
+      const medianNearest =
+        nearestVals.length > 0
+          ? [...nearestVals].sort((a, b) => a - b)[Math.floor(nearestVals.length / 2)]
+          : null;
+      return {
+        channel: ch,
+        biomarker: meta?.biomarker ?? channelMarkers[ch] ?? '',
+        total_marker_objects: meta?.total_marker_objects ?? 0,
+        positive_reference_objects: posCount,
+        positive_rate: refTotal > 0 ? (posCount / refTotal) * 100.0 : 0,
+        avg_marker_count_per_positive_reference: avgCount,
+        median_nearest_distance: medianNearest,
+      };
+    });
+  }, [referenceRowsForDisplay, colocMarkerChs, colocData?.channel_summary, channelMarkers]);
+
   const toggleMarkerChannel = (channel: string) => {
     setMarkerChannels((prev) =>
       prev.includes(channel) ? prev.filter((c) => c !== channel) : [...prev, channel]
@@ -296,6 +412,7 @@ const ResultsVisualization: React.FC<ResultsVisualizationProps> = ({
 
     setIsRunningColoc(true);
     setColocError('');
+    setColocSuccessMessage('');
     try {
       const response = await fetch(`${getApiBase()}/api/colocalization_analysis`, {
         method: 'POST',
@@ -309,37 +426,21 @@ const ResultsVisualization: React.FC<ResultsVisualizationProps> = ({
           distance_threshold: distanceThreshold,
         }),
       });
-      const data = await response.json();
-      if (!data.success) {
-        throw new Error(data.error || 'Colocalization analysis failed');
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || data.message || 'Colocalization analysis failed');
       }
 
       setColocData(data.data || null);
+      colocDataFromRunRef.current = true;
 
-      const savedPaths: string[] = data.saved_files || [];
-      if (savedPaths.length > 0) {
-        const newItems: ResultItem[] = savedPaths.map((path: string) => {
-          const name = path.split('/').pop() || path;
-          let type: ResultItem['type'] = 'file';
-          if (name.endsWith('.csv')) type = 'csv';
-          else if (name.endsWith('.json')) type = 'json';
-          else if (name.endsWith('.png')) type = 'overlay';
-          else if (name.endsWith('.npz')) type = 'npz';
-          return {
-            type,
-            name,
-            url: `${getApiBase()}/api/results/${path.split('/')[0]}/${path.split('/').slice(1).join('/')}`,
-            description: 'Generated by reference-centered colocalization analysis',
-          };
-        });
-
-        setResultItems((prev) => {
-          const dedup = new Map(prev.map((r) => [r.url, r]));
-          newItems.forEach((item) => dedup.set(item.url, item));
-          return Array.from(dedup.values());
-        });
-      }
+      const msg =
+        typeof data.message === 'string' && data.message.length > 0
+          ? data.message
+          : `Analysis complete. Results saved to ${typeof data.results_path_display === 'string' ? data.results_path_display : `${selectedSample}/results/${selectedPosition}/`}`;
+      setColocSuccessMessage(msg);
     } catch (err) {
+      setColocSuccessMessage('');
       setColocError(err instanceof Error ? err.message : 'Colocalization analysis failed');
     } finally {
       setIsRunningColoc(false);
@@ -631,6 +732,7 @@ const ResultsVisualization: React.FC<ResultsVisualizationProps> = ({
           {isRunningColoc ? 'Running Analysis...' : 'Run Colocalization Analysis'}
         </button>
         {colocError && <p className="coloc-error">{colocError}</p>}
+        {colocSuccessMessage && !colocError && <p className="coloc-success">{colocSuccessMessage}</p>}
       </div>
 
       {(colocData || referenceColocalization) && (
@@ -648,7 +750,7 @@ const ResultsVisualization: React.FC<ResultsVisualizationProps> = ({
             </div>
           )}
 
-          {colocData?.channel_summary && colocData.channel_summary.length > 0 && (
+          {channelSummaryForDisplay && channelSummaryForDisplay.length > 0 && (
             <div className="combo-table-container" style={{ marginTop: '1rem' }}>
               <h5>Biomarker / Channel Summary</h5>
               <table className="combo-table">
@@ -664,7 +766,7 @@ const ResultsVisualization: React.FC<ResultsVisualizationProps> = ({
                   </tr>
                 </thead>
                 <tbody>
-                  {colocData.channel_summary.map((row, idx) => (
+                  {channelSummaryForDisplay.map((row, idx) => (
                     <tr key={`${row.channel}-${idx}`}>
                       <td>{row.channel}</td>
                       <td>{row.biomarker || '-'}</td>
@@ -708,7 +810,28 @@ const ResultsVisualization: React.FC<ResultsVisualizationProps> = ({
 
           {baseReferenceRowsForFilter && baseReferenceRowsForFilter.length > 0 && (
             <div className="combo-table-container" style={{ marginTop: '1rem' }}>
-              <h5>Reference Object Table</h5>
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '16px',
+                  flexWrap: 'wrap',
+                  marginBottom: '8px',
+                }}
+              >
+                <h5 style={{ margin: 0 }}>Reference Object Table</h5>
+                <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={showDeltaIntensityColumns}
+                    onChange={(e) => setShowDeltaIntensityColumns(e.target.checked)}
+                  />
+                  Show ΔI (background-subtracted intensity)
+                </label>
+                {!showDeltaIntensityColumns && (
+                  <span style={{ color: '#666', fontSize: '13px' }}>ΔI columns hidden</span>
+                )}
+              </div>
               <div style={{ maxHeight: 300, overflowY: 'auto' }}>
                 <table className="combo-table">
                   <thead>
@@ -719,25 +842,76 @@ const ResultsVisualization: React.FC<ResultsVisualizationProps> = ({
                       <th>Area</th>
                       <th>Perimeter</th>
                       <th>Circularity</th>
+                      {showDeltaIntensityColumns &&
+                        colocMarkerChs.map((ch) => {
+                          const bgVal = colocData?.background_intensities?.[ch];
+                          const hasBg = bgVal != null && Number.isFinite(Number(bgVal));
+                          const markerLabel = (channelMarkers[ch] || ch).trim() || ch;
+                          return (
+                            <th
+                              key={`int-${ch}`}
+                              title={hasBg ? `Background mean: ${Number(bgVal).toFixed(1)}` : undefined}
+                            >
+                              <div>{markerLabel} ΔI</div>
+                              {hasBg && (
+                                <div style={{ fontSize: '11px', fontWeight: 400, color: '#555' }}>
+                                  BG: {Number(bgVal).toFixed(1)}
+                                </div>
+                              )}
+                            </th>
+                          );
+                        })}
                       <th>Combination</th>
                       <th>Positive Marker Count</th>
                       <th>Status</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {referenceRowsForDisplay.slice(0, 500).map((row, idx) => (
-                      <tr key={`${row.reference_object_id}-${idx}`}>
-                        <td>{row.reference_object_id}</td>
-                        <td>{row.reference_centroid_x?.toFixed?.(2) ?? row.reference_centroid_x}</td>
-                        <td>{row.reference_centroid_y?.toFixed?.(2) ?? row.reference_centroid_y}</td>
-                        <td>{row.reference_area?.toFixed?.(2) ?? row.reference_area}</td>
-                        <td>{row.reference_perimeter?.toFixed?.(2) ?? row.reference_perimeter}</td>
-                        <td>{row.reference_circularity?.toFixed?.(3) ?? row.reference_circularity}</td>
-                        <td>{mapChannelIdsToMarkersInLabel(row.biomarker_combination_label)}</td>
-                        <td>{row.total_positive_marker_count}</td>
-                        <td>{row.overall_status}</td>
-                      </tr>
-                    ))}
+                    {referenceRowsForDisplay.slice(0, 500).map((row, idx) => {
+                      const rr = row as unknown as Record<string, unknown>;
+                      const effCombo = effectiveCombinationLabel(rr, colocMarkerChs);
+                      const effCount = effectiveTotalPositiveMarkerCount(rr, colocMarkerChs);
+                      const effPos =
+                        colocMarkerChs.length > 0
+                          ? colocMarkerChs.some((ch) => geometryChannelPositive(rr, ch))
+                          : row.overall_status === 'Positive';
+                      return (
+                        <tr key={`${row.reference_object_id}-${idx}`}>
+                          <td>{row.reference_object_id}</td>
+                          <td>{row.reference_centroid_x?.toFixed?.(2) ?? row.reference_centroid_x}</td>
+                          <td>{row.reference_centroid_y?.toFixed?.(2) ?? row.reference_centroid_y}</td>
+                          <td>{row.reference_area?.toFixed?.(2) ?? row.reference_area}</td>
+                          <td>{row.reference_perimeter?.toFixed?.(2) ?? row.reference_perimeter}</td>
+                          <td>{row.reference_circularity?.toFixed?.(3) ?? row.reference_circularity}</td>
+                          {showDeltaIntensityColumns &&
+                            colocMarkerChs.map((ch) => {
+                              const geomPos = geometryChannelPositive(rr, ch);
+                              const raw = rr[`${ch}_intensity_bg_subtracted`];
+                              const v =
+                                raw === undefined || raw === null || raw === ''
+                                  ? null
+                                  : Number(raw);
+                              const showNumber =
+                                geomPos && v != null && Number.isFinite(v);
+                              const bgStyle: React.CSSProperties = !geomPos
+                                ? { backgroundColor: '#f8f9fa', color: '#868e96' }
+                                : !showNumber
+                                  ? { backgroundColor: '#f1f3f5', color: '#868e96' }
+                                  : v! > 0
+                                    ? { backgroundColor: '#d3f9d8' }
+                                    : { backgroundColor: '#e9ecef', color: '#495057' };
+                              return (
+                                <td key={`${ch}-ibg-${idx}`} style={{ ...bgStyle, textAlign: 'right' }}>
+                                  {showNumber ? v!.toFixed(1) : '—'}
+                                </td>
+                              );
+                            })}
+                          <td>{mapChannelIdsToMarkersInLabel(effCombo)}</td>
+                          <td>{effCount}</td>
+                          <td>{effPos ? 'Positive' : 'Negative'}</td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>

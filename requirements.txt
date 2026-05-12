@@ -61,4 +61,3 @@ jinja2>=3.1.0
 
 # Note on CUDA: PyTorch with CUDA support should be installed via conda:
 # conda install pytorch pytorch-cuda=12.1 -c pytorch -c nvidia
-

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
 
@@ -14,6 +15,7 @@ from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler
 
 try:
     import hdbscan
@@ -32,11 +34,12 @@ try:
 except ImportError:  # pragma: no cover
     umap = None
 
-from stage1_loader import ID_COL, PANEV_MARKER, POSITION_COL, RELEVANT_MARKERS, SAMPLE_COL, load_cygnus_object
+from stage1_loader import ID_COL, marker_base_columns, score_column, POSITION_COL, SAMPLE_COL, valid_marker_names, load_cygnus_object
 from stage3_preprocessing import apply_qc_filters, binarize_markers, normalize_by_panev, scale_expression_matrix
 
 
 sns.set_theme(style="whitegrid")
+_LOG = logging.getLogger(__name__)
 
 
 def _get_input_matrix(ao: Dict[str, Any], input_matrix: str) -> pd.DataFrame:
@@ -66,11 +69,15 @@ def _normalize_size(series: pd.Series, min_size: float = 8.0, max_size: float = 
 
 
 def _space_array(ao: Dict[str, Any], input_space: str) -> Tuple[np.ndarray, pd.Index]:
+    markers = [m for m in valid_marker_names(ao)]
     if input_space == "scaled":
         mat = ao["matrices"]["scaled_exp_matrix"]
         if mat is None:
             raise ValueError("scaled_exp_matrix is None.")
-        return mat[RELEVANT_MARKERS].to_numpy(), mat.index
+        cols = [m for m in markers if m in mat.columns]
+        if not cols:
+            raise ValueError("scaled_exp_matrix has no columns for valid markers.")
+        return mat[cols].to_numpy(), mat.index
     if input_space == "pca":
         df = ao["dim_red"]["pca"]
         if df is None:
@@ -107,14 +114,96 @@ def run_dim_reduction(
     """Run PCA/t-SNE/UMAP and return metadata-joined coordinates."""
     if n_components not in (2, 3):
         raise ValueError("n_components must be 2 or 3.")
-    mat = _get_input_matrix(ao, input_matrix=input_matrix)
-    sel_markers = list(markers) if markers is not None else list(RELEVANT_MARKERS)
-    missing = [m for m in sel_markers if m not in mat.columns]
+    vset = set(valid_marker_names(ao))
+    if markers is not None:
+        sel_markers = [m for m in markers if m in vset]
+    else:
+        sel_markers = [m for m in marker_base_columns(ao) if m in vset]
+    if not sel_markers:
+        raise ValueError("No valid markers for dimensionality reduction after NaN-rate filtering.")
+    missing = [m for m in sel_markers if m not in marker_base_columns(ao)]
     if missing:
-        raise ValueError(f"Markers not found in input matrix: {missing}")
+        raise ValueError(f"Unknown markers for this dataset: {missing}")
 
-    x = mat[sel_markers].to_numpy()
-    ids = mat.index.to_numpy()
+    use_raw_tiff = bool(ao.get("dim_red_uses_raw_tiff_mean"))
+    raw_cols_all: list = list(ao.get("marker_raw_tiff_mean_cols") or [])
+    raw_cols = [f"{m}_raw_tiff_mean" for m in sel_markers]
+    use_ibg = bool(ao.get("dim_red_uses_intensity_bg_subtracted")) and not use_raw_tiff
+    ibg_cols_all: list = list(ao.get("marker_intensity_bg_subtracted_cols") or [])
+    ibg_cols = [f"{m}_intensity_bg_subtracted" for m in sel_markers]
+
+    rim = ao.get("raw_intensity_matrix")
+    used_rim = False
+    if isinstance(rim, pd.DataFrame) and not rim.empty:
+        rim_cols = [m for m in sel_markers if m in rim.columns]
+        if rim_cols:
+            mat_ref = _get_input_matrix(ao, input_matrix=input_matrix)
+            ids = mat_ref.index
+            sub = rim.reindex(ids)[rim_cols].apply(pd.to_numeric, errors="coerce")
+            sub = sub.fillna(sub.median(numeric_only=True))
+            x = StandardScaler().fit_transform(sub.to_numpy(dtype=np.float64))
+            ids_arr = ids.to_numpy()
+            used_rim = True
+            _LOG.info(
+                "Dimensionality reduction (%s) using Results Viewer Raw Intensity matrix (z-scored per marker).",
+                method,
+            )
+    if not used_rim and use_raw_tiff and raw_cols_all and all(c in ao["cleaned_data"].columns for c in raw_cols):
+        mat_ref = _get_input_matrix(ao, input_matrix=input_matrix)
+        ids = mat_ref.index
+        work = ao["cleaned_data"].set_index(ID_COL)
+        try:
+            sub = work.reindex(ids)[raw_cols].apply(pd.to_numeric, errors="coerce")
+        except KeyError as exc:
+            raise ValueError(f"Missing *_raw_tiff_mean columns for dim reduction: {exc}") from exc
+        sub = sub.fillna(sub.median(numeric_only=True))
+        x = StandardScaler().fit_transform(sub.to_numpy(dtype=np.float64))
+        ids_arr = ids.to_numpy()
+        _LOG.info(
+            "Dimensionality reduction (%s) using *_raw_tiff_mean columns (z-scored per marker).",
+            method,
+        )
+    elif not used_rim and use_ibg and ibg_cols_all and all(c in ao["cleaned_data"].columns for c in ibg_cols):
+        mat_ref = _get_input_matrix(ao, input_matrix=input_matrix)
+        ids = mat_ref.index
+        work = ao["cleaned_data"].set_index(ID_COL)
+        try:
+            sub = work.reindex(ids)[ibg_cols].apply(pd.to_numeric, errors="coerce")
+        except KeyError as exc:
+            raise ValueError(f"Missing *_intensity_bg_subtracted columns for dim reduction: {exc}") from exc
+        sub = sub.fillna(sub.median(numeric_only=True))
+        x = StandardScaler().fit_transform(sub.to_numpy(dtype=np.float64))
+        ids_arr = ids.to_numpy()
+        _LOG.info(
+            "Dimensionality reduction (%s) using *_intensity_bg_subtracted columns (z-scored per marker).",
+            method,
+        )
+    elif not used_rim:
+        ibg_wanted = bool(ao.get("dim_red_uses_intensity_bg_subtracted")) and not use_raw_tiff
+        ibg_complete = bool(ibg_cols_all) and all(c in ao["cleaned_data"].columns for c in ibg_cols)
+        if ibg_wanted and not ibg_complete:
+            if not ao.get("_dim_red_logged_ibg_incomplete_fallback"):
+                _LOG.warning(
+                    "Using input_matrix=%r for %s: dim_red_uses_intensity_bg_subtracted is set but "
+                    "*_intensity_bg_subtracted columns are incomplete in cleaned_data.",
+                    input_matrix,
+                    method,
+                )
+                ao["_dim_red_logged_ibg_incomplete_fallback"] = True
+        elif not use_raw_tiff and not ao.get("_dim_red_logged_marker_matrix_fallback"):
+            _LOG.warning(
+                "Using input_matrix=%r (*_positive-derived expression matrix) for %s: "
+                "no complete *_raw_tiff_mean columns for dimensionality reduction.",
+                input_matrix,
+                method,
+            )
+            ao["_dim_red_logged_marker_matrix_fallback"] = True
+        mat = _get_input_matrix(ao, input_matrix=input_matrix)
+        missing_m = [m for m in sel_markers if m not in mat.columns]
+        if missing_m:
+            raise ValueError(f"Markers not found in input matrix: {missing_m}")
+        x = mat[sel_markers].to_numpy()
+        ids_arr = mat.index.to_numpy()
 
     if method == "pca":
         model = PCA(n_components=n_components, random_state=random_seed)
@@ -147,11 +236,13 @@ def run_dim_reduction(
         raise ValueError("method must be one of {'pca', 'tsne', 'umap'}.")
 
     coord_df = pd.DataFrame(coords, columns=comp_cols)
-    coord_df[ID_COL] = ids
+    coord_df[ID_COL] = ids_arr
 
     cleaned = ao["cleaned_data"]
-    meta_cols = [ID_COL, SAMPLE_COL, POSITION_COL, "center_x_um", "center_y_um", "area_um2", "circularity", PANEV_MARKER]
-    marker_cols = [m for m in RELEVANT_MARKERS if m in cleaned.columns]
+    sc = score_column(ao)
+    meta_cols = [ID_COL, SAMPLE_COL, POSITION_COL, "centroid_x", "centroid_y", "area", "circularity", sc]
+    marker_cols = [m for m in valid_marker_names(ao) if m in cleaned.columns]
+    meta_cols = [c for c in meta_cols if c in cleaned.columns]
     merged = coord_df.merge(cleaned[meta_cols + marker_cols], on=ID_COL, how="left")
 
     ao["dim_red"][method] = merged
@@ -188,7 +279,8 @@ def plot_dim_red(
     title = f"{method.upper()} colored by {color_by}"
     size_series = _normalize_size(df[size_by]) if size_by else None
 
-    hover_cols = [ID_COL, SAMPLE_COL, POSITION_COL, "center_x_um", "center_y_um", "area_um2", "circularity", PANEV_MARKER] + list(RELEVANT_MARKERS)
+    hover_cols = [ID_COL, SAMPLE_COL, POSITION_COL, "centroid_x", "centroid_y", "area", "circularity", score_column(ao)]
+    hover_cols += [m for m in valid_marker_names(ao) if m in df.columns]
     hover_cols = [c for c in hover_cols if c in df.columns]
 
     if interactive:
@@ -370,7 +462,8 @@ def plot_clusters(
         save_path=str(out / f"{method}_{dim_red}_clusters.png") if out and not interactive else str(out / f"{method}_{dim_red}_clusters.html") if out else None,
     )
 
-    merged = ao["cleaned_data"][[ID_COL, SAMPLE_COL, POSITION_COL] + list(RELEVANT_MARKERS)].copy()
+    markers = [m for m in valid_marker_names(ao) if m in ao["cleaned_data"].columns]
+    merged = ao["cleaned_data"][[ID_COL, SAMPLE_COL, POSITION_COL] + markers].copy()
     merged[label_col] = merged[ID_COL].map(labels).astype("Int64")
     merged = merged.dropna(subset=[label_col]).copy()
     merged[label_col] = merged[label_col].astype(int).astype(str)
@@ -406,7 +499,7 @@ def plot_clusters(
     if out:
         fig_position.savefig(out / f"{method}_composition_position.png", dpi=200, bbox_inches="tight")
 
-    cluster_mean = merged.groupby(label_col)[list(RELEVANT_MARKERS)].mean()
+    cluster_mean = merged.groupby(label_col)[markers].mean()
     fig_heat, ax_heat = plt.subplots(figsize=(8, 5))
     sns.heatmap(cluster_mean, cmap="viridis", linewidths=0.3, ax=ax_heat)
     ax_heat.set_title(f"{method} average marker expression per cluster")
@@ -433,11 +526,12 @@ if __name__ == "__main__":
     out_dir = Path("./output/stage5")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    run_dim_reduction(ao, method="pca", input_matrix="scaled", markers=RELEVANT_MARKERS, n_components=2)
-    run_dim_reduction(ao, method="tsne", input_matrix="scaled", markers=RELEVANT_MARKERS, n_components=2)
-    run_dim_reduction(ao, method="umap", input_matrix="scaled", markers=RELEVANT_MARKERS, n_components=2)
+    run_dim_reduction(ao, method="pca", input_matrix="scaled", markers=marker_base_columns(ao), n_components=2)
+    run_dim_reduction(ao, method="tsne", input_matrix="scaled", markers=marker_base_columns(ao), n_components=2)
+    run_dim_reduction(ao, method="umap", input_matrix="scaled", markers=marker_base_columns(ao), n_components=2)
 
-    default_colors = [SAMPLE_COL, POSITION_COL, PANEV_MARKER, "EpCAM", "MET"]
+    mn = marker_base_columns(ao)
+    default_colors = [SAMPLE_COL, POSITION_COL, score_column(ao)] + mn[: min(3, len(mn))]
     for method_name in ("pca", "tsne", "umap"):
         for color in default_colors:
             plot_dim_red(

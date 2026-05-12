@@ -17,7 +17,14 @@ import tifffile
 from io import BytesIO
 from PIL import Image
 import csv
+import time
 from collections import defaultdict
+
+try:
+    import openpyxl  # noqa: F401
+    _openpyxl_available = True
+except ImportError:
+    _openpyxl_available = False
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for React development server
@@ -350,25 +357,40 @@ def cygnus_health():
 
 @app.route('/api/cygnus/run', methods=['POST'])
 def run_cygnus_pipeline():
-    if 'file' not in request.files:
-        return jsonify({"success": False, "message": "No file provided."}), 400
+    from cygnus_upload_merge import merge_cygnus_upload_files
 
-    f = request.files['file']
-    if not f.filename or not f.filename.lower().endswith(".csv"):
-        return jsonify({"success": False, "message": "Only CSV files are supported."}), 400
+    uploads = [f for f in request.files.getlist("files") if getattr(f, "filename", None)]
+    if not uploads:
+        f0 = request.files.get("file")
+        if f0 and f0.filename:
+            uploads = [f0]
+
+    if not uploads:
+        return jsonify({"success": False, "message": "No file provided."}), 400
 
     tmp_path = None
     output_dir = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+        t_pipe = time.perf_counter()
+        from run_pipeline import cygnus_pipeline_log, run_full_pipeline
+
+        cygnus_pipeline_log("merge_files_start", t_pipe, detail=f"upload_count={len(uploads)}")
+        merged = merge_cygnus_upload_files(uploads, _openpyxl_available)
+        cygnus_pipeline_log(
+            "merge_files_done",
+            t_pipe,
+            detail=f"rows={len(merged)} cols={merged.shape[1]}",
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w", newline="") as tmp:
             tmp_path = tmp.name
-        f.save(tmp_path)
+        merged.to_csv(tmp_path, index=False)
+        cygnus_pipeline_log("temp_csv_written", t_pipe, detail=f"path={tmp_path}")
 
         output_dir = tempfile.mkdtemp()
+        cygnus_pipeline_log("temp_output_dir", t_pipe, detail=f"path={output_dir}")
 
-        from run_pipeline import run_full_pipeline
-
-        run_full_pipeline(filepath=tmp_path, output_dir=output_dir)
+        run_full_pipeline(filepath=tmp_path, output_dir=output_dir, pipeline_t0=t_pipe)
 
         report_path = os.path.join(output_dir, "cygnus_report.html")
         if not os.path.isfile(report_path):
@@ -377,8 +399,15 @@ def run_cygnus_pipeline():
         with open(report_path, encoding="utf-8") as rfile:
             report_html = rfile.read()
 
+        cygnus_pipeline_log(
+            "response_ready",
+            t_pipe,
+            detail=f"report_html_chars={len(report_html)}",
+        )
         return jsonify({"success": True, "report_html": report_html})
 
+    except ValueError as e:
+        return jsonify({"success": False, "message": str(e)}), 400
     except Exception as e:
         return jsonify({
             "success": False,

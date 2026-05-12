@@ -143,10 +143,12 @@ def load_rf_model(load_path: str) -> Tuple[RandomForestClassifier, Dict[str, Any
             f"Refusing to load RF model outside rf_models directory: {resolved_model_path}"
         )
     rf_idx = parts.index('rf_models')
-    if rf_idx < 1 or rf_idx >= len(parts) - 2:
+    # Allow legacy: <sample>/rf_models/<channel_key>/<position>_rf_model.pkl
+    # Or current: <sample>/rf_models/<stem>.pkl  (e.g. ch0.pkl)
+    remainder = parts[rf_idx + 1 :]
+    if rf_idx < 1 or len(remainder) < 1:
         raise ValueError(
-            f"Invalid RF model path layout, expected data_root/<sample>/rf_models/<channel>/<file>.pkl: "
-            f"{resolved_model_path}"
+            f"Invalid RF model path under rf_models: {resolved_model_path}"
         )
 
     if not resolved_model_path.exists():

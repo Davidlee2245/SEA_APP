@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import matplotlib
 
@@ -14,13 +14,15 @@ import plotly.express as px
 import seaborn as sns
 
 from stage1_loader import (
-    MARKER_COLS,
+    COORD_COLS,
+    ID_COL,
     MORPHOLOGY_COLS,
-    PANEV_MARKER,
     POSITION_COL,
     SAMPLE_COL,
-    RELEVANT_MARKERS,
     load_cygnus_object,
+    marker_base_columns,
+    score_column,
+    valid_marker_names,
 )
 
 
@@ -58,10 +60,13 @@ def plot_marker_distributions(
     group_col: Optional[str] = None,
     plot_type: str = "all",
     save_dir: Optional[str] = None,
+    valid_markers: Optional[Sequence[str]] = None,
 ) -> Dict[str, plt.Figure]:
     """Plot marker distributions globally or grouped by sample/position."""
-    if marker not in MARKER_COLS:
-        raise ValueError(f"Unknown marker '{marker}'. Expected one of {MARKER_COLS}.")
+    if marker not in df.columns:
+        raise ValueError(f"Column '{marker}' is not in dataframe.")
+    if valid_markers is not None and marker not in valid_markers:
+        raise ValueError(f"Unknown marker '{marker}'. Expected one of {list(valid_markers)}.")
 
     valid_groups = {None, SAMPLE_COL, POSITION_COL}
     if group_col not in valid_groups:
@@ -121,17 +126,33 @@ def plot_marker_distributions(
     return figs
 
 
-def plot_all_markers(df: pd.DataFrame, save_dir: Optional[str] = None) -> Dict[str, Dict[str, plt.Figure]]:
-    """Generate all marker distribution plots for global/sample/position groupings."""
+def plot_all_markers(
+    df: pd.DataFrame,
+    marker_cols: Sequence[str],
+    score_col: str,
+    save_dir: Optional[str] = None,
+) -> Dict[str, Dict[str, plt.Figure]]:
+    """Generate distribution plots for pan score and each per-marker column."""
     all_plots: Dict[str, Dict[str, plt.Figure]] = {}
-    for marker in MARKER_COLS:
+    valid = list(marker_cols)
+    for col in [score_col] + valid:
+        if col not in df.columns:
+            continue
         marker_plots: Dict[str, plt.Figure] = {}
-        marker_plots.update(plot_marker_distributions(df, marker, group_col=None, plot_type="all", save_dir=save_dir))
-        sample_plots = plot_marker_distributions(df, marker, group_col=SAMPLE_COL, plot_type="all", save_dir=save_dir)
+        marker_plots.update(
+            plot_marker_distributions(
+                df, col, group_col=None, plot_type="all", save_dir=save_dir, valid_markers=None
+            )
+        )
+        sample_plots = plot_marker_distributions(
+            df, col, group_col=SAMPLE_COL, plot_type="all", save_dir=save_dir, valid_markers=None
+        )
         marker_plots.update({f"{k}_by_sample": v for k, v in sample_plots.items()})
-        position_plots = plot_marker_distributions(df, marker, group_col=POSITION_COL, plot_type="all", save_dir=save_dir)
+        position_plots = plot_marker_distributions(
+            df, col, group_col=POSITION_COL, plot_type="all", save_dir=save_dir, valid_markers=None
+        )
         marker_plots.update({f"{k}_by_position": v for k, v in position_plots.items()})
-        all_plots[marker] = marker_plots
+        all_plots[col] = marker_plots
     return all_plots
 
 
@@ -146,29 +167,30 @@ def plot_spatial(
     """Plot spatial scatter of objects colored by marker or metadata."""
     if color_by not in df.columns:
         raise ValueError(f"'{color_by}' is not in dataframe columns.")
-    if size_by is not None and size_by not in {"area_um2", "circularity"}:
-        raise ValueError("size_by must be one of {'area_um2', 'circularity', None}.")
+    if size_by is not None and size_by not in {"area", "circularity"}:
+        raise ValueError("size_by must be one of {'area', 'circularity', None}.")
 
+    x_col, y_col = COORD_COLS[0], COORD_COLS[1]
     is_categorical = str(df[color_by].dtype) in ("category", "string") or df[color_by].dtype == "object"
     size_vals = _normalize_sizes(df[size_by]) if size_by else None
 
     if interactive:
-        hover_fields = {
-            "object_id": True,
-            "sample": True,
-            "position": True,
-            "center_x_um": ":.3f",
-            "center_y_um": ":.3f",
-            "area_um2": ":.3f",
+        hover_fields: Dict[str, Any] = {
+            ID_COL: True,
+            SAMPLE_COL: True,
+            POSITION_COL: True,
+            x_col: ":.3f",
+            y_col: ":.3f",
+            "area": ":.3f",
             "circularity": ":.3f",
         }
-        if color_by in MARKER_COLS:
+        if pd.api.types.is_numeric_dtype(df[color_by]):
             hover_fields[color_by] = ":.3f"
 
         fig = px.scatter(
             df,
-            x="center_x_um",
-            y="center_y_um",
+            x=x_col,
+            y=y_col,
             color=color_by,
             size=size_by,
             hover_data=hover_fields,
@@ -183,8 +205,8 @@ def plot_spatial(
         if is_categorical:
             sns.scatterplot(
                 data=df,
-                x="center_x_um",
-                y="center_y_um",
+                x=x_col,
+                y=y_col,
                 hue=color_by,
                 size=size_vals if size_by else None,
                 sizes=(20, 180) if size_by else None,
@@ -196,8 +218,8 @@ def plot_spatial(
             ax.legend(loc="best", frameon=True, title=color_by)
         else:
             scatter = ax.scatter(
-                df["center_x_um"],
-                df["center_y_um"],
+                df[x_col],
+                df[y_col],
                 c=df[color_by],
                 cmap="viridis",
                 s=size_vals if size_by else marker_size**2,
@@ -315,27 +337,38 @@ def plot_morphology_scatter(
 def run_stage2_visualizations(analysis_object: Dict[str, Any], save_dir: Optional[str] = None) -> Dict[str, Any]:
     """Generate all required stage-2 plots and store them in analysis_object."""
     df = analysis_object["cleaned_data"]
+    mn = valid_marker_names(analysis_object)
+    sc = score_column(analysis_object)
     base_dir = _ensure_dir(save_dir)
 
     dist_dir = str(base_dir / "distributions") if base_dir else None
     spatial_dir = str(base_dir / "spatial") if base_dir else None
     morph_dir = str(base_dir / "morphology") if base_dir else None
 
-    distribution_plots = plot_all_markers(df, save_dir=dist_dir)
+    distribution_plots = plot_all_markers(df, marker_cols=mn, score_col=sc, save_dir=dist_dir)
 
-    spatial_plots = {
-        "PanEV": plot_spatial(df, color_by=PANEV_MARKER, save_path=f"{spatial_dir}/spatial_PanEV.png" if spatial_dir else None),
-        "EpCAM": plot_spatial(df, color_by="EpCAM", save_path=f"{spatial_dir}/spatial_EpCAM.png" if spatial_dir else None),
-        "MET": plot_spatial(df, color_by="MET", save_path=f"{spatial_dir}/spatial_MET.png" if spatial_dir else None),
+    spatial_plots: Dict[str, Any] = {
         "sample": plot_spatial(df, color_by=SAMPLE_COL, save_path=f"{spatial_dir}/spatial_sample.png" if spatial_dir else None),
         "position": plot_spatial(df, color_by=POSITION_COL, save_path=f"{spatial_dir}/spatial_position.png" if spatial_dir else None),
-        "EpCAM_size_area_um2": plot_spatial(
-            df,
-            color_by="EpCAM",
-            size_by="area_um2",
-            save_path=f"{spatial_dir}/spatial_EpCAM_size_area_um2.png" if spatial_dir else None,
-        ),
     }
+    if sc in df.columns:
+        pan_key = sc[:-len("_score")] if sc.endswith("_score") else sc
+        spatial_plots[pan_key] = plot_spatial(
+            df, color_by=sc, save_path=f"{spatial_dir}/spatial_{pan_key}.png" if spatial_dir else None
+        )
+    for m in mn:
+        spatial_plots[m] = plot_spatial(
+            df, color_by=m, save_path=f"{spatial_dir}/spatial_{m}.png" if spatial_dir else None
+        )
+
+    if mn and "area" in df.columns:
+        m0 = mn[0]
+        spatial_plots[f"{m0}_size_area"] = plot_spatial(
+            df,
+            color_by=m0,
+            size_by="area",
+            save_path=f"{spatial_dir}/spatial_{m0}_size_area.png" if spatial_dir else None,
+        )
 
     morph_distributions = plot_morphology_distributions(df, save_dir=morph_dir)
 
@@ -346,17 +379,17 @@ def run_stage2_visualizations(analysis_object: Dict[str, Any], save_dir: Optiona
             morph_by_group[key] = plot_morphology_by_group(df, morph_col, grp, save_dir=morph_dir)
 
     morph_scatter: Dict[str, plt.Figure] = {}
-    morph_scatter["area_um2_vs_circularity_by_sample"] = plot_morphology_scatter(
+    morph_scatter["area_vs_circularity_by_sample"] = plot_morphology_scatter(
         df,
-        x_col="area_um2",
+        x_col="area",
         y_col="circularity",
         color_by=SAMPLE_COL,
         save_dir=morph_dir,
     )
-    for marker in MARKER_COLS:
-        morph_scatter[f"area_um2_vs_{marker}"] = plot_morphology_scatter(
+    for marker in mn:
+        morph_scatter[f"area_vs_{marker}"] = plot_morphology_scatter(
             df,
-            x_col="area_um2",
+            x_col="area",
             y_col=marker,
             color_by=None,
             save_dir=morph_dir,
@@ -385,4 +418,5 @@ if __name__ == "__main__":
     ao = load_cygnus_object("all_cells.csv")
     ao = run_stage2_visualizations(ao, save_dir="./output/stage2/")
     print("Stage 2 visualizations completed and stored in analysis_object['marker_analysis'].")
-    print(f"Relevant markers: {', '.join(RELEVANT_MARKERS)}")
+    print(f"Score column: {score_column(ao)} | Marker bases: {', '.join(marker_base_columns(ao))}")
+    print(f"Valid markers (analysis): {', '.join(valid_marker_names(ao))}")

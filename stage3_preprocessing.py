@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -11,10 +12,11 @@ import pandas as pd
 import seaborn as sns
 from skimage.filters import threshold_otsu
 
-from stage1_loader import ID_COL, PANEV_MARKER, RELEVANT_MARKERS, load_cygnus_object
+from stage1_loader import ID_COL, marker_base_columns, score_column, valid_marker_names, load_cygnus_object
 
 
 sns.set_theme(style="whitegrid")
+_LOG = logging.getLogger(__name__)
 
 
 def _get_input_df(ao: Dict[str, Any], use_filtered: bool = False) -> pd.DataFrame:
@@ -40,12 +42,15 @@ def apply_qc_filters(
     mask = pd.Series(True, index=df.index)
     applied_filters = []
 
+    markers = marker_base_columns(ao)
+    score = score_column(ao)
+
     if remove_zero_area:
-        mask &= df["area_um2"] > 0
+        mask &= df["area"] > 0
         applied_filters.append("remove_zero_area")
 
     if remove_zero_perimeter:
-        mask &= df["perimeter_um"] > 0
+        mask &= df["perimeter"] > 0
         applied_filters.append("remove_zero_perimeter")
 
     if remove_nan_circularity:
@@ -54,7 +59,7 @@ def apply_qc_filters(
 
     if area_range is not None:
         lo, hi = area_range
-        mask &= df["area_um2"].between(lo, hi, inclusive="both")
+        mask &= df["area"].between(lo, hi, inclusive="both")
         applied_filters.append(f"area_range={area_range}")
 
     if circularity_range is not None:
@@ -63,13 +68,13 @@ def apply_qc_filters(
         applied_filters.append(f"circularity_range={circularity_range}")
 
     if min_panev is not None:
-        mask &= df[PANEV_MARKER] >= min_panev
-        applied_filters.append(f"min_panev={min_panev}")
+        mask &= df[score] >= min_panev
+        applied_filters.append(f"min_pan_score({score})={min_panev}")
 
     if min_marker:
         for marker, min_val in min_marker.items():
-            if marker not in RELEVANT_MARKERS:
-                raise ValueError(f"min_marker contains invalid marker '{marker}'.")
+            if marker not in markers:
+                raise ValueError(f"min_marker contains invalid marker '{marker}'. Expected one of {markers}.")
             mask &= df[marker] >= min_val
             applied_filters.append(f"min_marker[{marker}]={min_val}")
 
@@ -108,20 +113,96 @@ def normalize_by_panev(
     epsilon: float = 1e-6,
     include_panev: bool = False,
 ) -> dict:
-    """Normalize relevant marker intensities by PanEV + epsilon."""
+    """Normalize per-marker intensities by a Pan-EV reference column + epsilon.
+
+    When ``ao['bg_subtracted_matrix']`` is present (Results Viewer **BG Subtracted** merge),
+    numerators use that matrix and ``bg__Pan-EV`` from the input dataframe as denominator.
+    Otherwise ``{marker}_raw_tiff_mean`` … (unchanged). Only markers in ``ao['valid_marker_names']``
+    are included in the output matrix. Sets ``ao['panev_intensity_col']`` to the denominator column name used.
+    """
     df = _get_input_df(ao, use_filtered=use_filtered)
-    panev = pd.to_numeric(df[PANEV_MARKER], errors="coerce")
+    markers_all = [m for m in marker_base_columns(ao) if m in set(valid_marker_names(ao))]
+    if not markers_all:
+        raise ValueError("No valid markers to normalize (ao['valid_marker_names'] is empty).")
+
+    bg_mat = ao.get("bg_subtracted_matrix")
+    use_rv_bg = (
+        isinstance(bg_mat, pd.DataFrame)
+        and not bg_mat.empty
+        and "bg__Pan-EV" in df.columns
+    )
+    if use_rv_bg:
+        num_cols = [m for m in markers_all if m in bg_mat.columns]
+        use_rv_bg = bool(num_cols)
+    raw_present = [m for m in markers_all if f"{m}_raw_tiff_mean" in df.columns]
+    use_raw = bool(raw_present) and not use_rv_bg
+    bg_present = [m for m in markers_all if f"{m}_intensity_bg_subtracted" in df.columns]
+    use_bg = bool(bg_present) and not use_raw and not use_rv_bg
+
+    if not use_raw and not use_bg and not use_rv_bg:
+        _LOG.warning(
+            "Raw TIFF mean columns not found; falling back to *_positive / score normalization",
+        )
+
+    def _pick_denominator_column() -> str:
+        for cand in ("Pan-EV_raw_tiff_mean", "Pan-EV"):
+            if cand in df.columns:
+                return cand
+        sc = score_column(ao)
+        if sc is None or sc not in df.columns:
+            raise ValueError(
+                "No Pan-EV intensity column (Pan-EV_raw_tiff_mean / Pan-EV) and no usable *_score column for normalization.",
+            )
+        return sc
+
+    if use_rv_bg:
+        den_col = "bg__Pan-EV"
+        oid_vals = df[ID_COL].to_numpy()
+        numer = pd.DataFrame(
+            {
+                m: pd.to_numeric(bg_mat.reindex(oid_vals)[m].to_numpy(), errors="coerce")
+                for m in num_cols
+            },
+            index=df.index,
+        )
+        _LOG.info("Using Results Viewer BG Subtracted matrix for normalization (denominator bg__Pan-EV).")
+    elif use_raw:
+        den_col = _pick_denominator_column()
+        num_cols = raw_present
+        numer = pd.concat(
+            [pd.to_numeric(df[f"{m}_raw_tiff_mean"], errors="coerce") for m in num_cols],
+            axis=1,
+        )
+        numer.columns = num_cols
+    elif use_bg:
+        den_col = _pick_denominator_column()
+        num_cols = bg_present
+        numer = pd.concat(
+            [pd.to_numeric(df[f"{m}_intensity_bg_subtracted"], errors="coerce") for m in num_cols],
+            axis=1,
+        )
+        numer.columns = num_cols
+        _LOG.info("Using intensity_bg_subtracted columns for normalization")
+    else:
+        den_col = score_column(ao)
+        if den_col is None or den_col not in df.columns:
+            raise ValueError("score_column(ao) is missing or not in dataframe for legacy normalization.")
+        num_cols = markers_all
+        numer = df[num_cols].apply(pd.to_numeric, errors="coerce")
+
+    panev = pd.to_numeric(df[den_col], errors="coerce")
     low_panev_flag = panev < epsilon
+    ao.setdefault("ev_meta", {})
     ao["ev_meta"]["low_panev_flag"] = low_panev_flag
+    ao["panev_intensity_col"] = den_col
 
     denom = panev + epsilon
-    cols = list(RELEVANT_MARKERS)
-    norm = df[cols].div(denom, axis=0)
+    norm = numer.div(denom, axis=0)
 
     if include_panev:
-        norm[PANEV_MARKER] = panev.div(denom)
-        cols = cols + [PANEV_MARKER]
-        norm = norm[cols]
+        ratio_col = den_col if den_col not in norm.columns else f"{den_col}_div_denom"
+        norm[ratio_col] = panev.div(denom)
+        norm = norm[list(num_cols) + [ratio_col]]
 
     norm.index = df[ID_COL].values
     norm.index.name = ID_COL
@@ -173,12 +254,13 @@ def scale_expression_matrix(
 def _resolve_thresholds(
     data: pd.DataFrame,
     method: str,
+    markers: List[str],
     thresholds: Optional[Dict[str, float]] = None,
     global_threshold: Optional[float] = None,
     percentile: float = 95.0,
 ) -> Dict[str, float]:
     thr: Dict[str, float] = {}
-    cols = [c for c in RELEVANT_MARKERS if c in data.columns]
+    cols = [c for c in markers if c in data.columns]
 
     if method == "manual":
         if not thresholds:
@@ -236,16 +318,35 @@ def binarize_markers(
     if mat is None:
         raise ValueError(f"Input matrix '{input_matrix}' is None.")
 
+    markers = marker_base_columns(ao)
+
+    if ao.get("markers_source_is_binary"):
+        raw = ao["matrices"]["Raw_Score"]
+        binary = pd.DataFrame(index=raw.index)
+        for marker in raw.columns:
+            binary[marker] = (
+                pd.to_numeric(raw[marker], errors="coerce").fillna(0.0) >= 0.5
+            ).astype("int8")
+        binary = binary.reindex(mat.index)
+        binary.index.name = ID_COL
+        ao["matrices"]["binary_exp_matrix"] = binary
+        ao["threshold_table"] = pd.DataFrame(
+            [{"marker": m, "threshold_value": 0.5, "method": "source_positive"} for m in markers if m in raw.columns],
+            columns=["marker", "threshold_value", "method"],
+        )
+        return ao
+
     thr = _resolve_thresholds(
         mat,
         method=method,
+        markers=markers,
         thresholds=thresholds,
         global_threshold=global_threshold,
         percentile=percentile,
     )
 
     binary = pd.DataFrame(index=mat.index)
-    for marker in RELEVANT_MARKERS:
+    for marker in markers:
         if marker in mat.columns:
             binary[marker] = (pd.to_numeric(mat[marker], errors="coerce") > thr[marker]).astype("int8")
     binary.index.name = ID_COL
@@ -263,8 +364,9 @@ def plot_threshold_preview(ao: dict, marker: str, save_path: Optional[str] = Non
     threshold_table = ao.get("threshold_table")
     if threshold_table is None or threshold_table.empty:
         raise ValueError("threshold_table is empty. Run binarize_markers first.")
-    if marker not in RELEVANT_MARKERS:
-        raise ValueError(f"marker must be one of {RELEVANT_MARKERS}.")
+    allowed = marker_base_columns(ao)
+    if marker not in allowed:
+        raise ValueError(f"marker must be one of {allowed}.")
 
     row = threshold_table.loc[threshold_table["marker"] == marker]
     if row.empty:
@@ -317,6 +419,6 @@ if __name__ == "__main__":
 
     out_dir = Path("./output/stage3")
     out_dir.mkdir(parents=True, exist_ok=True)
-    for marker_name in RELEVANT_MARKERS:
+    for marker_name in valid_marker_names(ao):
         plot_threshold_preview(ao, marker_name, save_path=str(out_dir / f"threshold_preview_{marker_name}.png"))
     print(f"\nSaved threshold previews to: {out_dir}")

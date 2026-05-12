@@ -169,7 +169,7 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
   const [backendStats, setBackendStats] = useState<Record<string, any>>({});
 
   // ── Method & parameters ──
-  const [alignMethod, setAlignMethod] = useState<AlignMethod>('frequency_domain_fft');
+  const [alignMethod, setAlignMethod] = useState<AlignMethod>('manual_diagonal');
   const [transformType, setTransformType] = useState('EuclideanTransform');
   const [refChannel, setRefChannel] = useState('');
   const [preprocParams, setPreprocParams] = useState<GridPreprocParams>(DEFAULT_PREPROC_PARAMS);
@@ -207,6 +207,7 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
   const [savedAt, setSavedAt] = useState<string | null>(null);
   const [pendingAutoLoad, setPendingAutoLoad] = useState(false);
   const autoLoadFiredRef = useRef(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // ── Crop tool ──
   const [cropRect, setCropRect] = useState<CropRect | null>(null);
@@ -424,6 +425,33 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
       void storage.saveStateToDisk(selectedSample, 'alignment', { byPosition: { [selectedPosition]: snap } });
     }
 
+    const inputStageForMirror = (lastAlignmentInputStage || selectedInputStage || 'raw').trim() || 'raw';
+    if (alignmentRunId !== null) {
+      try {
+        const mirrorRes = await fetch(`${getApiBase()}/api/input/align_save_mirror`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sample: selectedSample,
+            position: selectedPosition,
+            input_stage: inputStageForMirror,
+            crop_rect: cropRect
+              ? { x: cropRect.x, y: cropRect.y, w: cropRect.w, h: cropRect.h }
+              : null,
+          }),
+        });
+        const mirrorData = await mirrorRes.json().catch(() => ({}));
+        if (!mirrorRes.ok || !mirrorData.success) {
+          const msg = (mirrorData as { error?: string }).error || `HTTP ${mirrorRes.status}`;
+          setExportStatus(`Align mirror: ${msg}`);
+          setTimeout(() => setExportStatus(''), 8000);
+        }
+      } catch (e) {
+        setExportStatus(`Align mirror: ${String(e)}`);
+        setTimeout(() => setExportStatus(''), 8000);
+      }
+    }
+
     if (!tiffExportPref.autoDownload || alignmentRunId === null) return;
 
     const channelCount = Object.keys(shiftVectors).length;
@@ -520,9 +548,9 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
       const rawPreviews: PreviewStage = {};
       items.forEach(item => { if (item.preview_url) rawPreviews[item.key] = item.preview_url; });
 
-      // Query available processed stages
+      // Query available processed stages (raw is always offered separately in the UI)
       let availableStages: string[] = [];
-      let defaultInputStage = 'contrast_enhance';
+      let defaultInputStage = 'raw';
       try {
         const stateRes = await fetch(
           `${getApiBase()}/api/input/preprocess/state?sample=${encodeURIComponent(selectedSample)}&position=${encodeURIComponent(selectedPosition)}`
@@ -607,20 +635,16 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
     });
   };
 
-  const handleSelectImageFile = async () => {
-    if (!window.electronAPI?.selectImageFile) {
-      alert('Image file picker is available in the Electron app only.');
-      return;
-    }
+  const handleSelectImageFile = () => {
+    fileInputRef.current?.click();
+  };
 
-    try {
-      const selectedPath = await window.electronAPI.selectImageFile();
-      if (!selectedPath) return;
-      alert(`Selected image file:\n${selectedPath}\n\nUse Sample/Position selection for alignment workflow.`);
-    } catch (err) {
-      console.error('Failed to open image file dialog:', err);
-      alert(`Failed to open file dialog: ${err}`);
-    }
+  const handleImageFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const input = e.target;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) return;
+    alert(`Selected image file:\n${file.name}\n\nUse Sample/Position selection for alignment workflow.`);
   };
 
   // ── Stage A: Detect Features ────────────────────────────────────────────────
@@ -795,6 +819,7 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
 
   const stageLabel = (s: string) => {
     const map: Record<string, string> = {
+      raw: 'Raw',
       contrast_enhance: 'Contrast Enhanced',
       step1: 'Bkg Subtracted',
       step2: 'Clipped',
@@ -832,9 +857,7 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
   // the ternary below will fall through to getPreviewSrc() instead of the editor.
   const diagImageSrc = (() => {
     if (alignMethod !== 'manual_diagonal') return null;
-    const stageData = stages.processed ?? stages.raw;
-    if (!stageData) return null;
-    const url = stageData[selectedPreviewChannel];
+    const url = stages.processed?.[selectedPreviewChannel] ?? stages.raw?.[selectedPreviewChannel];
     if (!url) return null;
     return url.startsWith('http') ? url : `${getApiBase()}${url}`;
   })();
@@ -853,9 +876,15 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
       const b64 = channelLayers?.[selectedPreviewLayer] ?? channelLayers?.['detected'];
       if (b64) return `data:image/png;base64,${b64}`;
     }
-    const stageData = stages[currentStage];
-    if (!stageData) return null;
-    const url = stageData[selectedPreviewChannel];
+    let url: string | undefined;
+    if (currentStage === 'processed') {
+      // Per-channel: use raw preview when Image Processing did not produce one for this channel.
+      url = stages.processed?.[selectedPreviewChannel] ?? stages.raw?.[selectedPreviewChannel];
+    } else {
+      const stageData = stages[currentStage];
+      if (!stageData) return null;
+      url = stageData[selectedPreviewChannel];
+    }
     if (!url) return null;
     const abs = url.startsWith('http') ? url : `${getApiBase()}${url}`;
     const cacheBuster =
@@ -1001,8 +1030,10 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
 
   useEffect(() => {
     if (!loaded) return;
-    const stageData = stages[currentStage];
-    const stageUrl = stageData?.[selectedPreviewChannel] ?? null;
+    const stageUrl =
+      currentStage === 'processed'
+        ? stages.processed?.[selectedPreviewChannel] ?? stages.raw?.[selectedPreviewChannel] ?? null
+        : stages[currentStage]?.[selectedPreviewChannel] ?? null;
     const previewSrc = getPreviewSrc();
     const shiftForPreviewChannel = shiftVectors[selectedPreviewChannel] ?? null;
     console.log('[Alignment debug] preview/state snapshot', {
@@ -1071,6 +1102,13 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
                 disabled={!selectedSample || !selectedPosition || isLoadingPosition}>
                 {isLoadingPosition ? 'Loading...' : 'Load Position'}
               </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".tif,.tiff,.png,.jpg,.jpeg"
+                style={{ display: 'none' }}
+                onChange={handleImageFileInputChange}
+              />
               <button className="sidebar-btn btn-image" onClick={handleSelectImageFile}>
                 Load Image File
               </button>
@@ -1083,22 +1121,20 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
               <h3>📥 Input Stage</h3>
               <div className="sidebar-content">
                 <div style={{ background: '#e8f4f8', padding: '10px', borderRadius: 4, marginBottom: 10, border: '1px solid #3498db', fontSize: '0.85rem' }}>
-                  <strong style={{ color: '#2980b9' }}>Input Source:</strong> Images from <strong>Image Processing</strong> stage
+                  <strong style={{ color: '#2980b9' }}>Input Source:</strong> Use <strong>Raw</strong> (TIFFs after Load Position) or a <strong>preprocessed stage</strong> from Image Processing.
                 </div>
                 <div className="input-group">
                   <label>Input stage:</label>
                   <select value={selectedInputStage}
                     onChange={e => setSelectedInputStage(e.target.value)}
                     disabled={isAligning || isDetecting}>
-                    {availableProcessedStages.length > 0
-                      ? availableProcessedStages.map(s => <option key={s} value={s}>{stageLabel(s)}</option>)
-                      : <option value="">No processed stages available</option>}
+                    <option value="raw">
+                      {availableProcessedStages.length === 0 ? 'Raw (no preprocessing)' : 'Raw'}
+                    </option>
+                    {availableProcessedStages.map(s => (
+                      <option key={s} value={s}>{stageLabel(s)}</option>
+                    ))}
                   </select>
-                  {availableProcessedStages.length === 0 && (
-                    <p style={{ color: '#e74c3c', fontSize: '0.82rem', marginTop: 4 }}>
-                      ⚠️ Process images in the Image Processing tab first
-                    </p>
-                  )}
                 </div>
               </div>
             </div>
@@ -1418,7 +1454,7 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
           )}
 
           {/* 5. Stage A: Feature Detection */}
-          {loaded && availableProcessedStages.length > 0 && alignMethod !== 'manual_diagonal' && (
+          {loaded && alignMethod !== 'manual_diagonal' && (
             <div className="sidebar-section">
               <h3>🔍 Feature Detection</h3>
               <div className="sidebar-content">
@@ -1512,7 +1548,7 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
                 <button className="sidebar-btn" onClick={handleRunAlignment}
                   disabled={
                     isAligning || isDetecting ||
-                    availableProcessedStages.length === 0 ||
+                    !selectedInputStage ||
                     !readyToAlign
                   }
                   style={{ width: '100%' }}>
@@ -1520,11 +1556,6 @@ const Alignment: React.FC<AlignmentProps> = ({ isActive }) => {
                     ? `Aligning ${selectedChannels.size} channels…`
                     : `Run Alignment (${selectedChannels.size} ch)`}
                 </button>
-                {availableProcessedStages.length === 0 && (
-                  <div style={{ color: '#c62828', fontSize: '0.78rem', marginTop: 6 }}>
-                    ⚠️ No processed stages — run Image Processing first.
-                  </div>
-                )}
               </div>
             </div>
           )}

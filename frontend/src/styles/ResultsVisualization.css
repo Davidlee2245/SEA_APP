@@ -593,6 +593,12 @@
   font-weight: 600;
 }
 
+.coloc-success {
+  color: #1e8449;
+  margin-top: 0.75rem;
+  font-weight: 600;
+}
+
 .exosome-coloc-dashboard {
   margin-bottom: 1.5rem;
   padding: 1rem;

@@ -117,6 +117,7 @@ const ImageProcessing: React.FC<{ isActive?: boolean }> = ({ isActive = true }) 
   
   // Ref to track if we just reset (to prevent auto-fetch from restoring processed images)
   const justResetRef = useRef<string>('');
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Unified image processing state
   const [processingState, setProcessingState] = useState<ImageProcessingState>({
@@ -1134,20 +1135,16 @@ const ImageProcessing: React.FC<{ isActive?: boolean }> = ({ isActive = true }) 
     // User can re-apply preprocessing if needed
   };
 
-  const handleSelectImageFile = async () => {
-    if (!window.electronAPI?.selectImageFile) {
-      alert('Image file picker is available in the Electron app only.');
-      return;
-    }
+  const handleSelectImageFile = () => {
+    fileInputRef.current?.click();
+  };
 
-    try {
-      const selectedPath = await window.electronAPI.selectImageFile();
-      if (!selectedPath) return;
-      alert(`Selected image file:\n${selectedPath}\n\nUse Sample/Position selection for loading into SEA.`);
-    } catch (err) {
-      console.error('Failed to open image file dialog:', err);
-      alert(`Failed to open file dialog: ${err}`);
-    }
+  const handleImageFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const input = e.target;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) return;
+    alert(`Selected image file:\n${file.name}\n\nUse Sample/Position selection for loading into SEA.`);
   };
 
   return (
@@ -1205,6 +1202,13 @@ const ImageProcessing: React.FC<{ isActive?: boolean }> = ({ isActive = true }) 
                 {processingState.isLoadingPosition ? 'Loading...' : 'Load Position'}
               </button>
 
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".tif,.tiff,.png,.jpg,.jpeg"
+                style={{ display: 'none' }}
+                onChange={handleImageFileInputChange}
+              />
               <button className="sidebar-btn btn-image" onClick={handleSelectImageFile}>
                 Load Image File
               </button>

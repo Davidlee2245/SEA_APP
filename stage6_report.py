@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
 import os
 import pickle
 from datetime import datetime
@@ -19,7 +20,7 @@ from jinja2 import Template
 from scipy.stats import kruskal, mannwhitneyu
 from statsmodels.stats.multitest import multipletests
 
-from stage1_loader import ID_COL, MORPHOLOGY_COLS, PANEV_MARKER, POSITION_COL, RELEVANT_MARKERS, SAMPLE_COL, load_cygnus_object
+from stage1_loader import ID_COL, MORPHOLOGY_COLS, POSITION_COL, SAMPLE_COL, load_cygnus_object, marker_base_columns, score_column, valid_marker_names
 from stage2_visualization import (
     plot_marker_distributions,
     plot_morphology_by_group,
@@ -33,6 +34,7 @@ from stage3_preprocessing import (
     scale_expression_matrix,
 )
 from stage4_colocalization import (
+    REFERENCE_COLOC_COLUMNS,
     compute_colocalization,
     compute_reference_colocalization,
     plot_expression_heatmap,
@@ -51,6 +53,21 @@ from stage5_dimred_clustering import (
 
 
 sns.set_theme(style="whitegrid")
+
+_LOG = logging.getLogger(__name__)
+
+# Columns written by compare_samples for pairwise_tests (used when table is empty).
+PAIRWISE_TEST_COLUMNS = [
+    "marker",
+    "sample_1",
+    "sample_2",
+    "U_statistic",
+    "pvalue",
+    "effect_size_rbc",
+    "adj_pvalue",
+    "significance",
+    "sample_pair",
+]
 
 
 def _sig_label(pval: float) -> str:
@@ -88,7 +105,10 @@ def compare_samples(
         raise ValueError("correction_method must be 'bonferroni' or 'fdr_bh'.")
 
     mat = _get_matrix(ao, input_matrix=input_matrix)
-    marker_list = markers if markers is not None else [m for m in RELEVANT_MARKERS if m in mat.columns]
+    if markers is not None:
+        marker_list = markers
+    else:
+        marker_list = [m for m in valid_marker_names(ao) if m in mat.columns]
     meta = ao["cleaned_data"][[ID_COL, SAMPLE_COL]].copy()
     data = meta.merge(mat.reset_index(), on=ID_COL, how="inner")
     samples = [str(x) for x in sorted(data[SAMPLE_COL].dropna().unique())]
@@ -161,6 +181,8 @@ def compare_samples(
     summary_df = pd.DataFrame(summary_rows)
     kw_df = pd.DataFrame(kw_rows)
     pair_df = pd.DataFrame(pair_rows)
+    if pair_df.empty:
+        pair_df = pd.DataFrame(columns=PAIRWISE_TEST_COLUMNS)
 
     ao.setdefault("marker_analysis", {})
     ao["marker_analysis"]["sample_comparison"] = {
@@ -169,6 +191,14 @@ def compare_samples(
         "pairwise_tests": pair_df,
     }
     return ao
+
+
+def _placeholder_sample_comparison_fig(title: str, message: str) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(6, 4.5))
+    ax.axis("off")
+    ax.set_title(title, fontsize=11)
+    ax.text(0.5, 0.5, message, ha="center", va="center", fontsize=10, transform=ax.transAxes, wrap=True)
+    return fig
 
 
 def plot_sample_comparison(ao: dict, marker: str, save_dir: Optional[str] = None) -> Dict[str, plt.Figure]:
@@ -198,22 +228,40 @@ def plot_sample_comparison(ao: dict, marker: str, save_dir: Optional[str] = None
     ax_b.set_title(f"{marker} by sample (boxplot)")
     ax_b.tick_params(axis="x", rotation=45)
 
-    pair = sc["pairwise_tests"]
-    marker_pair = pair[pair["marker"] == marker].copy()
     samples = sorted(df[SAMPLE_COL].astype(str).unique())
-    pmat = pd.DataFrame(np.nan, index=samples, columns=samples)
-    np.fill_diagonal(pmat.values, 0.0)
-    for _, row in marker_pair.iterrows():
-        s1, s2 = str(row["sample_1"]), str(row["sample_2"])
-        pmat.loc[s1, s2] = row["adj_pvalue"]
-        pmat.loc[s2, s1] = row["adj_pvalue"]
+    pair = sc.get("pairwise_tests")
+    if not isinstance(pair, pd.DataFrame):
+        pair = pd.DataFrame(columns=PAIRWISE_TEST_COLUMNS)
+    pairwise_ok = not pair.empty and "marker" in pair.columns
+    if not pairwise_ok:
+        _LOG.warning(
+            "plot_sample_comparison(%r): pairwise_tests empty or missing 'marker' column "
+            "(common cause: only one sample level, so no sample–sample pairs). Using placeholder p-value heatmap.",
+            marker,
+        )
+        marker_pair = pd.DataFrame(columns=PAIRWISE_TEST_COLUMNS)
+        fig_hm = _placeholder_sample_comparison_fig(
+            f"{marker} pairwise adjusted p-values",
+            "No pairwise sample comparisons (need at least two samples with data).",
+        )
+    else:
+        marker_pair = pair[pair["marker"] == marker].copy()
+        pmat = pd.DataFrame(np.nan, index=samples, columns=samples)
+        np.fill_diagonal(pmat.values, 0.0)
+        for _, row in marker_pair.iterrows():
+            s1, s2 = str(row["sample_1"]), str(row["sample_2"])
+            pmat.loc[s1, s2] = row["adj_pvalue"]
+            pmat.loc[s2, s1] = row["adj_pvalue"]
 
-    fig_hm, ax_hm = plt.subplots(figsize=(6, 5))
-    sns.heatmap(pmat, cmap="viridis_r", annot=True, fmt=".2g", cbar_kws={"label": "adjusted p-value"}, ax=ax_hm)
-    ax_hm.set_title(f"{marker} pairwise adjusted p-values")
+        fig_hm, ax_hm = plt.subplots(figsize=(6, 5))
+        sns.heatmap(pmat, cmap="viridis_r", annot=True, fmt=".2g", cbar_kws={"label": "adjusted p-value"}, ax=ax_hm)
+        ax_hm.set_title(f"{marker} pairwise adjusted p-values")
 
     # Add simple bracket labels for significant pairs.
-    sig_pairs = marker_pair[marker_pair["significance"] != "ns"]
+    if marker_pair.empty or "significance" not in marker_pair.columns:
+        sig_pairs = pd.DataFrame()
+    else:
+        sig_pairs = marker_pair[marker_pair["significance"] != "ns"]
     if not sig_pairs.empty:
         ymax = float(df[marker].max())
         y_offset = (float(df[marker].max()) - float(df[marker].min()) + 1e-9) * 0.06
@@ -285,7 +333,8 @@ def run_position_qc(ao: dict, save_dir: Optional[str] = None) -> dict:
     ax_sp.set_ylabel("Count")
     ax_sp.tick_params(axis="x", rotation=45)
 
-    marker_means = df.groupby(POSITION_COL)[RELEVANT_MARKERS].mean()
+    marker_list = valid_marker_names(ao)
+    marker_means = df.groupby(POSITION_COL)[marker_list].mean()
     morph_means = df.groupby(POSITION_COL)[MORPHOLOGY_COLS].mean()
 
     if out:
@@ -295,12 +344,22 @@ def run_position_qc(ao: dict, save_dir: Optional[str] = None) -> dict:
     marker_violin_by_position: Dict[str, plt.Figure] = {}
     marker_box_by_position: Dict[str, plt.Figure] = {}
     # Per-marker distribution plots by position
-    for marker in RELEVANT_MARKERS:
+    for marker in marker_list:
         violin_fig = plot_marker_distributions(
-            df, marker=marker, group_col=POSITION_COL, plot_type="violin", save_dir=str(out) if out else None
+            df,
+            marker=marker,
+            group_col=POSITION_COL,
+            plot_type="violin",
+            save_dir=str(out) if out else None,
+            valid_markers=marker_list,
         )
         box_fig = plot_marker_distributions(
-            df, marker=marker, group_col=POSITION_COL, plot_type="boxplot", save_dir=str(out) if out else None
+            df,
+            marker=marker,
+            group_col=POSITION_COL,
+            plot_type="boxplot",
+            save_dir=str(out) if out else None,
+            valid_markers=marker_list,
         )
         if "violin" in violin_fig:
             marker_violin_by_position[marker] = violin_fig["violin"]
@@ -413,8 +472,10 @@ def export_all(ao: dict, output_dir: str = "./output/exports/") -> Dict[str, str
     if normalized is not None:
         meta = ao["cleaned_data"][[ID_COL, SAMPLE_COL, POSITION_COL]]
         merged = meta.merge(normalized.reset_index(), on=ID_COL, how="inner")
-        avg_sample = merged.groupby(SAMPLE_COL)[[c for c in normalized.columns if c in RELEVANT_MARKERS]].mean().reset_index()
-        avg_position = merged.groupby(POSITION_COL)[[c for c in normalized.columns if c in RELEVANT_MARKERS]].mean().reset_index()
+        mn = valid_marker_names(ao)
+        marker_cols = [c for c in normalized.columns if c in mn]
+        avg_sample = merged.groupby(SAMPLE_COL)[marker_cols].mean().reset_index()
+        avg_position = merged.groupby(POSITION_COL)[marker_cols].mean().reset_index()
         save_table("Average expression by sample", "avg_expression_by_sample", avg_sample)
         save_table("Average expression by position", "avg_expression_by_position", avg_position)
 
@@ -427,7 +488,9 @@ def export_all(ao: dict, output_dir: str = "./output/exports/") -> Dict[str, str
         "total_objects": int(len(ao["cleaned_data"])),
         "samples": sorted([str(x) for x in ao["cleaned_data"][SAMPLE_COL].astype(str).unique()]),
         "positions": sorted([str(x) for x in ao["cleaned_data"][POSITION_COL].astype(str).unique()]),
-        "markers": list(RELEVANT_MARKERS),
+        "markers": list(marker_base_columns(ao)),
+        "valid_markers": list(valid_marker_names(ao)),
+        "score_col": score_column(ao),
         "threshold_table": ao["threshold_table"].to_dict(orient="records") if ao.get("threshold_table") is not None else [],
         "export_paths": export_paths,
     }
@@ -498,19 +561,23 @@ def generate_report(
 
     top_coloc = (ao.get("colocalization") or {}).get("all_combinations")
     top_coloc = top_coloc.sort_values("fdr_pvalue").head(20) if isinstance(top_coloc, pd.DataFrame) and not top_coloc.empty else None
-    ref_epcam = (ao.get("colocalization") or {}).get("reference_centered", {}).get("EpCAM")
+    ref_centered = (ao.get("colocalization") or {}).get("reference_centered") or {}
+    ref_first_key = next(iter(ref_centered.keys()), None)
+    ref_centered_df = ref_centered.get(ref_first_key) if ref_first_key else None
 
     sc = marker_analysis.get("sample_comparison", {})
     sample_kw = sc.get("kruskal_wallis")
     pairwise_tests = sc.get("pairwise_tests")
     position_qc = marker_analysis.get("position_qc", {})
 
+    scol = score_column(ao)
+    mnames = valid_marker_names(ao)
     panev_stats = {}
-    if PANEV_MARKER in df.columns:
+    if scol in df.columns:
         panev_stats = {
-            "min": float(df[PANEV_MARKER].min()),
-            "max": float(df[PANEV_MARKER].max()),
-            "mean": float(df[PANEV_MARKER].mean()),
+            "min": float(df[scol].min()),
+            "max": float(df[scol].max()),
+            "mean": float(df[scol].mean()),
         }
 
     template = Template(
@@ -518,7 +585,7 @@ def generate_report(
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Cygnus Single EV Analysis Report</title>
+  <title>Single EV Analysis Report</title>
   <style>
     /* All rules scoped under .cygnus-report — standalone file uses body.cygnus-report; SPA mounts a div.cygnus-report */
     .cygnus-report {
@@ -616,7 +683,7 @@ def generate_report(
   </nav>
   <main>
     <section id="header">
-      <h1>Cygnus Single EV Analysis Report</h1>
+      <h1>Single EV Analysis Report</h1>
       <p class="muted">Generated: {{ generated_at }} | Input file: {{ input_file }}</p>
     </section>
     <section id="data-summary"><h2>Data Summary</h2>
@@ -642,7 +709,7 @@ def generate_report(
     <section id="sample-comparison"><h2>Sample-Level Comparison</h2>{{ sample_comparison|safe }}</section>
     <section id="position-qc"><h2>Position-Level QC</h2>{{ position_qc|safe }}</section>
     <section id="exports"><h2>Exported Files</h2>{{ exported_files|safe }}</section>
-    <footer><p class="muted">Generated by Cygnus Analysis Pipeline</p></footer>
+    <footer><p class="muted">Generated by SEA Analysis Pipeline</p></footer>
   </main>
 </body>
 </html>"""
@@ -663,29 +730,29 @@ def generate_report(
             morphology_html.append(embed_fig(fig))
 
     marker_dist_html = []
-    for marker in [PANEV_MARKER] + list(RELEVANT_MARKERS):
+    for marker in [scol] + mnames:
         mplots = distribution_plots.get(marker, {})
         for key in ("histogram", "density", "violin_by_sample", "violin_by_position"):
             if key in mplots:
                 marker_dist_html.append(embed_fig(mplots[key]))
 
     spatial_html = []
-    for k in ("sample", "position", "PanEV", "EpCAM", "MET"):
-        if k in spatial_plots:
-            spatial_html.append(embed_fig(spatial_plots[k]))
+    for k in spatial_plots:
+        spatial_html.append(embed_fig(spatial_plots[k]))
 
     panev_html = ""
-    if norm is not None and "EpCAM" in norm.columns and "EpCAM" in df.columns:
+    demo_marker = mnames[0] if mnames else None
+    if norm is not None and demo_marker is not None and demo_marker in norm.columns and demo_marker in df.columns:
         fig, ax = plt.subplots(1, 2, figsize=(10, 4))
-        sns.histplot(df["EpCAM"], kde=True, ax=ax[0])
-        ax[0].set_title("EpCAM before normalization")
-        sns.histplot(norm["EpCAM"], kde=True, ax=ax[1])
-        ax[1].set_title("EpCAM after normalization")
+        sns.histplot(df[demo_marker], kde=True, ax=ax[0])
+        ax[0].set_title(f"{demo_marker} before normalization")
+        sns.histplot(norm[demo_marker], kde=True, ax=ax[1])
+        ax[1].set_title(f"{demo_marker} after normalization")
         panev_html = embed_fig(fig)
 
     thr_table = _df_to_html(ao.get("threshold_table"))
     thr_plots: List[str] = []
-    for marker in RELEVANT_MARKERS:
+    for marker in mnames:
         try:
             thr_plots.append(embed_fig(plot_threshold_preview(ao, marker)))
         except Exception:
@@ -698,7 +765,7 @@ def generate_report(
         coloc_plots_only.append(embed_fig(col_plots["volcano"]))
     colocalization_block = _wrap_plot_grid(coloc_plots_only) + _df_to_html(top_coloc, max_rows=20)
 
-    ref_coloc_html = _df_to_html(ref_epcam, max_rows=20)
+    ref_coloc_html = _df_to_html(ref_centered_df, max_rows=20)
 
     heatmap_html = []
     if "heatmap_by_sample" in col_plots:
@@ -709,9 +776,12 @@ def generate_report(
     dimred_html = []
     if "scree" in dimred_plots:
         dimred_html.append(embed_fig(dimred_plots["scree"]))
-    for key in ("pca_sample", "pca_position", "umap_sample", "umap_position", "tsne_sample", "tsne_position", "umap_EpCAM", "umap_MET"):
+    for key in ("pca_sample", "pca_position", "umap_sample", "umap_position", "tsne_sample", "tsne_position"):
         if key in dimred_plots:
             dimred_html.append(embed_fig(dimred_plots[key]))
+    extra_umap = sorted(k for k in dimred_plots if k.startswith("umap_") and k not in ("umap_sample", "umap_position"))
+    for key in extra_umap:
+        dimred_html.append(embed_fig(dimred_plots[key]))
 
     cluster_html = []
     for method in ("kmeans", "hdbscan", "leiden"):
@@ -721,7 +791,7 @@ def generate_report(
                 cluster_html.append(embed_fig(block[key]))
 
     sc_html = []
-    top_markers = RELEVANT_MARKERS[:4]
+    top_markers = mnames[:4]
     for marker in top_markers:
         comp_block = marker_analysis.get("sample_comparison_plots", {}).get(marker, {})
         for key in ("violin", "pairwise_heatmap"):
@@ -737,7 +807,7 @@ def generate_report(
         fig = position_qc_plots.get(key)
         if fig is not None:
             pos_plots.append(embed_fig(fig))
-    for marker in RELEVANT_MARKERS[:3]:
+    for marker in mnames[:3]:
         fig = position_qc_plots.get("marker_violin_by_position", {}).get(marker)
         if fig is not None:
             pos_plots.append(embed_fig(fig))
@@ -786,7 +856,7 @@ def generate_report(
         total_objects=len(df),
         samples=", ".join(sorted(df[SAMPLE_COL].astype(str).unique())),
         positions=", ".join(sorted(df[POSITION_COL].astype(str).unique())),
-        markers=", ".join([PANEV_MARKER] + list(RELEVANT_MARKERS)),
+        markers=", ".join([scol] + mnames),
         morphology=", ".join(MORPHOLOGY_COLS),
         qc_filters=qc_description,
         morphology_qc=_wrap_plot_grid(morphology_html),
@@ -809,14 +879,16 @@ def generate_report(
 
 
 def _run_stage5_defaults(ao: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
-    run_dim_reduction(ao, method="pca", input_matrix="scaled", markers=RELEVANT_MARKERS, n_components=2)
-    run_dim_reduction(ao, method="tsne", input_matrix="scaled", markers=RELEVANT_MARKERS, n_components=2)
-    run_dim_reduction(ao, method="umap", input_matrix="scaled", markers=RELEVANT_MARKERS, n_components=2)
+    mn = valid_marker_names(ao)
+    run_dim_reduction(ao, method="pca", input_matrix="scaled", markers=mn, n_components=2)
+    run_dim_reduction(ao, method="tsne", input_matrix="scaled", markers=mn, n_components=2)
+    run_dim_reduction(ao, method="umap", input_matrix="scaled", markers=mn, n_components=2)
     run_kmeans(ao, n_clusters=5, input_space="umap")
     run_hdbscan(ao, min_cluster_size=50, min_samples=5, input_space="umap")
     run_leiden(ao, resolution=1.0, n_neighbors=15, input_space="umap")
 
     ao.setdefault("marker_analysis", {})
+    sc = score_column(ao)
     dim_plots = {
         "pca_sample": plot_dim_red(ao, "pca", SAMPLE_COL, interactive=True),
         "pca_position": plot_dim_red(ao, "pca", POSITION_COL, interactive=True),
@@ -824,10 +896,14 @@ def _run_stage5_defaults(ao: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
         "umap_position": plot_dim_red(ao, "umap", POSITION_COL, interactive=True),
         "tsne_sample": plot_dim_red(ao, "tsne", SAMPLE_COL, interactive=True),
         "tsne_position": plot_dim_red(ao, "tsne", POSITION_COL, interactive=True),
-        "umap_EpCAM": plot_dim_red(ao, "umap", "EpCAM", interactive=True),
-        "umap_MET": plot_dim_red(ao, "umap", "MET", interactive=True),
         "scree": plot_pca_scree(ao),
     }
+    for col in [sc] + mn[: min(3, len(mn))]:
+        if col not in ao["cleaned_data"].columns:
+            continue
+        safe = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in str(col))
+        dim_plots[f"umap_{safe}"] = plot_dim_red(ao, "umap", col, interactive=True)
+
     ao["marker_analysis"]["dimred_plots"] = dim_plots
     ao["marker_analysis"]["cluster_plots"] = {
         "kmeans": plot_clusters(ao, "kmeans", dim_red="umap", interactive=True, save_dir=str(out_dir / "kmeans")),
@@ -849,7 +925,18 @@ if __name__ == "__main__":
     ao = binarize_markers(ao, method="percentile", percentile=95.0, input_matrix="normalized")
 
     ao = compute_colocalization(ao)
-    compute_reference_colocalization(ao, reference_marker="EpCAM")
+    vm4 = valid_marker_names(ao)
+    if len(vm4) >= 2:
+        compute_reference_colocalization(ao, reference_marker=vm4[0])
+    elif len(vm4) == 1:
+        if ao.get("colocalization") is None:
+            ao["colocalization"] = {}
+        ao["colocalization"].setdefault("reference_centered", {})
+        ao["colocalization"]["reference_centered"][vm4[0]] = pd.DataFrame(columns=REFERENCE_COLOC_COLUMNS)
+    else:
+        if ao.get("colocalization") is None:
+            ao["colocalization"] = {}
+        ao["colocalization"].setdefault("reference_centered", {})
     ao.setdefault("marker_analysis", {})
     ao["marker_analysis"]["colocalization_plots"] = {
         "upset": plot_upset(ao),
@@ -861,7 +948,7 @@ if __name__ == "__main__":
     ao = _run_stage5_defaults(ao, output_root / "stage5")
     ao = compare_samples(ao, input_matrix="normalized")
     ao["marker_analysis"]["sample_comparison_plots"] = {
-        m: plot_sample_comparison(ao, m, save_dir=str(output_root / "stage6" / "sample_comparison")) for m in RELEVANT_MARKERS
+        m: plot_sample_comparison(ao, m, save_dir=str(output_root / "stage6" / "sample_comparison")) for m in valid_marker_names(ao)
     }
 
     ao = run_position_qc(ao, save_dir=str(output_root / "stage6" / "position_qc"))

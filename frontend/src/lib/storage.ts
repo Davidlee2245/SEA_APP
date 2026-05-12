@@ -1,7 +1,5 @@
 import { getApiBase } from './apiBase';
 
-const isElectron = (): boolean => window.electronAPI !== undefined;
-
 /** Short-lived cache so multiple tabs don't hammer GET /api/state/<sample>/load */
 const diskStateCache = new Map<string, { t: number; data: Record<string, unknown> }>();
 const DISK_CACHE_MS = 4000;
@@ -12,13 +10,9 @@ export function invalidateSampleStateDiskCache(sample: string): void {
 
 export async function get(key: string): Promise<string | null> {
   try {
-    if (isElectron() && window.electronAPI?.storeGet) {
-      const value = await window.electronAPI.storeGet(key);
-      if (value !== null) return value;
-    }
     return localStorage.getItem(key);
   } catch {
-    return localStorage.getItem(key);
+    return null;
   }
 }
 
@@ -28,14 +22,6 @@ export async function set(key: string, value: string): Promise<void> {
   } catch {
     // Ignore localStorage write failures.
   }
-
-  if (isElectron() && window.electronAPI?.storeSet) {
-    try {
-      await window.electronAPI.storeSet(key, value);
-    } catch {
-      // Never throw to keep caller flow stable.
-    }
-  }
 }
 
 export async function remove(key: string): Promise<void> {
@@ -43,14 +29,6 @@ export async function remove(key: string): Promise<void> {
     localStorage.removeItem(key);
   } catch {
     // Ignore localStorage remove failures.
-  }
-
-  if (isElectron() && window.electronAPI?.storeRemove) {
-    try {
-      await window.electronAPI.storeRemove(key);
-    } catch {
-      // Never throw to keep caller flow stable.
-    }
   }
 }
 
