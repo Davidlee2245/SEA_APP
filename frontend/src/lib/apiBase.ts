@@ -63,10 +63,11 @@ declare global {
       selectPython:        () => Promise<string | null>;
       selectDataRoot:      () => Promise<string | null>;
       selectImageFile:     () => Promise<string | null>;
-      launchAfterSettings: (config: { pythonExe: string; dataRoot: string | null }) => Promise<void>;
-      saveSettings:        (config: { pythonExe: string; dataRoot: string | null; openaiKey?: string | null; anthropicKey?: string | null }) => Promise<boolean>;
-      getConfig:           () => Promise<{ pythonExe?: string; dataRoot?: string }>;
+      launchAfterSettings: (config: Record<string, unknown>) => Promise<void>;
+      saveSettings:        (config: Record<string, unknown>) => Promise<boolean>;
+      getConfig:           () => Promise<Record<string, unknown>>;
       getDefaultDataRoot:  () => Promise<string>;
+      testOllamaConnection: () => Promise<{ ok: boolean; error?: string; modelCount?: number }>;
       onBackendPort:       (callback: (port: number) => void) => void;
       getBackendPort:      () => number | null;
       storeGet:            (key: string) => Promise<string | null>;

@@ -10,9 +10,10 @@ import Alignment from './components/Alignment';
 import AgentChat from './components/AgentChat';
 import ExosomeDetection, { type ExosomeDetectionImperativeHandle } from './components/ExosomeDetection';
 import DataAnalysis from './components/DataAnalysis';
+import Settings from './components/Settings';
 import './styles/App.css';
 
-type TabId = 'agent' | 'processing' | 'alignment' | 'exosome' | 'dataAnalysis' | 'viewer';
+type TabId = 'agent' | 'processing' | 'alignment' | 'exosome' | 'dataAnalysis' | 'viewer' | 'settings';
 
 /** Stable DOM hooks: ids + data-tab / data-active for CSS [data-tab='…'] and DevTools queries. */
 function tabPanelProps(tab: TabId, activeTab: TabId) {
@@ -86,6 +87,12 @@ const App: React.FC = () => {
         >
           📉 Data Analysis
         </button>
+        <button
+          className={`nav-tab nav-tab-settings ${activeTab === 'settings' ? 'active' : ''}`}
+          onClick={() => setActiveTab('settings')}
+        >
+          ⚙ Settings
+        </button>
       </nav>
 
       {/* All tabs are always mounted (hidden via CSS) to preserve state across tab switches */}
@@ -118,6 +125,10 @@ const App: React.FC = () => {
 
       <div className="tab-content" {...tabPanelProps('dataAnalysis', activeTab)}>
         <DataAnalysis />
+      </div>
+
+      <div className="tab-content" {...tabPanelProps('settings', activeTab)}>
+        <Settings />
       </div>
     </div>
   );

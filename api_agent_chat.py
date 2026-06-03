@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 import hashlib
 import argparse
+import sys
 
 # Try to import tifffile (optional, better for multi-page and 16-bit TIFF)
 try:
@@ -35,8 +36,142 @@ CORS(app)
 # Global manifest manager (will be initialized per run_id)
 _manifest_managers = {}  # run_id -> ManifestManager
 
-# Initialize OpenAI client
-client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+# Where LLM settings were loaded from (path or None)
+CONFIG_SOURCE_PATH: Optional[str] = None
+
+# True if API keys were already in the environment before sea-config.json was applied
+_OPENAI_ENV_AT_IMPORT = bool(os.getenv('OPENAI_API_KEY'))
+_ANTHROPIC_ENV_AT_IMPORT = bool(os.getenv('ANTHROPIC_API_KEY'))
+
+
+def _sea_config_search_paths() -> List[Path]:
+    """Candidate sea-config.json locations (Electron userData + local fallback)."""
+    home = Path.home()
+    paths: List[Path] = []
+    if sys.platform == 'darwin':
+        paths.append(
+            home / 'Library' / 'Application Support' / 'sea-exosome-analysis' / 'sea-config.json'
+        )
+    elif sys.platform == 'win32':
+        appdata = os.environ.get('APPDATA', '')
+        if appdata:
+            paths.append(Path(appdata) / 'sea-exosome-analysis' / 'sea-config.json')
+    else:
+        paths.append(home / '.config' / 'sea-exosome-analysis' / 'sea-config.json')
+    paths.append(Path(__file__).resolve().parent / 'sea-config.json')
+    return paths
+
+
+def load_sea_config_file() -> Tuple[Dict[str, Any], Optional[str]]:
+    """Load first existing sea-config.json; returns (data, path or None)."""
+    for path in _sea_config_search_paths():
+        if not path.is_file():
+            continue
+        try:
+            with open(path, encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data, str(path)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f'[SEA Agent] Warning: could not read config at {path}: {e}')
+    return {}, None
+
+
+def get_writable_config_path() -> Path:
+    """Primary sea-config.json path (created on write)."""
+    return _sea_config_search_paths()[0]
+
+
+def _mask_api_key(key: Optional[str]) -> Optional[str]:
+    if not key or not str(key).strip():
+        return None
+    k = str(key).strip()
+    if len(k) <= 8:
+        return '********...'
+    return k[:8] + '...'
+
+
+def apply_runtime_llm_config() -> None:
+    """Re-read LLM settings from env and recreate the OpenAI/Ollama client."""
+    global LLM_PROVIDER, OLLAMA_MODEL, client
+    LLM_PROVIDER = (os.getenv('LLM_PROVIDER') or 'openai').lower()
+    OLLAMA_MODEL = os.getenv('OLLAMA_MODEL') or 'llava'
+    client = _create_openai_client(LLM_PROVIDER)
+
+
+def llm_credentials_error_response():
+    """
+    If the active provider needs credentials that are missing, return (response, status).
+    Otherwise return None (caller may proceed).
+    """
+    if LLM_PROVIDER == 'ollama':
+        return None
+    if LLM_PROVIDER == 'anthropic':
+        if not os.getenv('ANTHROPIC_API_KEY'):
+            return jsonify({
+                'success': False,
+                'error': 'Anthropic API key not configured. Set ANTHROPIC_API_KEY or anthropicKey in config.',
+            }), 500
+        return None
+    if not os.getenv('OPENAI_API_KEY'):
+        return jsonify({
+            'success': False,
+            'error': 'OpenAI API key not configured. Please set OPENAI_API_KEY environment variable.',
+        }), 500
+    return None
+
+
+def resolve_llm_settings() -> Tuple[str, str, Optional[str]]:
+    """
+    Resolve LLM settings: env var > sea-config.json > default.
+    Applies openaiKey/anthropicKey from file to env when env is unset.
+    """
+    file_cfg, source_path = load_sea_config_file()
+
+    if not os.getenv('OPENAI_API_KEY'):
+        openai_key = file_cfg.get('openaiKey')
+        if openai_key and str(openai_key).strip():
+            os.environ['OPENAI_API_KEY'] = str(openai_key).strip()
+
+    if not os.getenv('ANTHROPIC_API_KEY'):
+        anthropic_key = file_cfg.get('anthropicKey')
+        if anthropic_key and str(anthropic_key).strip():
+            os.environ['ANTHROPIC_API_KEY'] = str(anthropic_key).strip()
+
+    provider = (
+        os.getenv('LLM_PROVIDER')
+        or file_cfg.get('llmProvider')
+        or 'openai'
+    )
+    ollama_model = (
+        os.getenv('OLLAMA_MODEL')
+        or file_cfg.get('ollamaModel')
+        or 'llava'
+    )
+    return str(provider).lower(), str(ollama_model), source_path
+
+
+def _create_openai_client(provider: str) -> OpenAI:
+    if provider == 'ollama':
+        return OpenAI(
+            base_url='http://localhost:11434/v1',
+            api_key='ollama',
+        )
+    return OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+
+
+# LLM provider: openai (default), anthropic, or ollama (local OpenAI-compatible API)
+LLM_PROVIDER, OLLAMA_MODEL, CONFIG_SOURCE_PATH = resolve_llm_settings()
+client = _create_openai_client(LLM_PROVIDER)
+
+
+def select_chat_model(has_image: bool) -> str:
+    """Pick model name for chat completions based on provider and input type."""
+    if LLM_PROVIDER == 'ollama':
+        return OLLAMA_MODEL
+    if has_image:
+        return 'gpt-4o'
+    return 'gpt-4o-mini'
 
 # Preview cache directory
 PREVIEW_CACHE_DIR = Path("previews")
@@ -474,14 +609,103 @@ def extract_params_from_agent_output(agent_output: Any) -> Dict[str, Any]:
     return {}
 
 
+@app.route('/api/agent/config', methods=['GET'])
+def get_agent_config():
+    """Return effective LLM config (API keys masked)."""
+    file_cfg, _ = load_sea_config_file()
+    openai_key = os.getenv('OPENAI_API_KEY') or file_cfg.get('openaiKey')
+    anthropic_key = os.getenv('ANTHROPIC_API_KEY') or file_cfg.get('anthropicKey')
+    return jsonify({
+        'ok': True,
+        'llmProvider': LLM_PROVIDER,
+        'ollamaModel': OLLAMA_MODEL,
+        'openaiKey': _mask_api_key(openai_key),
+        'anthropicKey': _mask_api_key(anthropic_key),
+        'openaiKeySet': bool(openai_key and str(openai_key).strip()),
+        'anthropicKeySet': bool(anthropic_key and str(anthropic_key).strip()),
+        'configPath': CONFIG_SOURCE_PATH,
+    })
+
+
+@app.route('/api/agent/config', methods=['POST'])
+def post_agent_config():
+    """
+    Update LLM settings: persist to sea-config.json, update env, reinit client.
+    Body: { llmProvider?, ollamaModel?, openaiKey?, anthropicKey? }
+    """
+    global CONFIG_SOURCE_PATH
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({'ok': False, 'error': 'JSON body required'}), 400
+
+    file_cfg, _ = load_sea_config_file()
+    out_cfg: Dict[str, Any] = dict(file_cfg)
+
+    if 'llmProvider' in data and data['llmProvider'] is not None:
+        provider = str(data['llmProvider']).strip().lower()
+        if provider not in ('openai', 'anthropic', 'ollama'):
+            return jsonify({'ok': False, 'error': 'Invalid llmProvider'}), 400
+        os.environ['LLM_PROVIDER'] = provider
+        out_cfg['llmProvider'] = provider
+
+    if 'ollamaModel' in data and data['ollamaModel'] is not None:
+        model = str(data['ollamaModel']).strip() or 'llava'
+        os.environ['OLLAMA_MODEL'] = model
+        out_cfg['ollamaModel'] = model
+
+    openai_in = data.get('openaiKey')
+    if openai_in is not None:
+        openai_val = str(openai_in).strip()
+        if openai_val:
+            os.environ['OPENAI_API_KEY'] = openai_val
+            if not _OPENAI_ENV_AT_IMPORT:
+                out_cfg['openaiKey'] = openai_val
+        elif not _OPENAI_ENV_AT_IMPORT:
+            out_cfg.pop('openaiKey', None)
+            os.environ.pop('OPENAI_API_KEY', None)
+
+    anthropic_in = data.get('anthropicKey')
+    if anthropic_in is not None:
+        anthropic_val = str(anthropic_in).strip()
+        if anthropic_val:
+            os.environ['ANTHROPIC_API_KEY'] = anthropic_val
+            if not _ANTHROPIC_ENV_AT_IMPORT:
+                out_cfg['anthropicKey'] = anthropic_val
+        elif not _ANTHROPIC_ENV_AT_IMPORT:
+            out_cfg.pop('anthropicKey', None)
+            os.environ.pop('ANTHROPIC_API_KEY', None)
+
+    config_path = get_writable_config_path()
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(out_cfg, f, indent=2)
+        CONFIG_SOURCE_PATH = str(config_path)
+    except OSError as e:
+        return jsonify({'ok': False, 'error': f'Failed to write config: {e}'}), 500
+
+    apply_runtime_llm_config()
+    print(f'[SEA Agent] Config updated via API → provider={LLM_PROVIDER}, model={OLLAMA_MODEL}')
+    return jsonify({'ok': True, 'configPath': str(config_path)})
+
+
 @app.route('/api/agent/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
+    if LLM_PROVIDER == 'ollama':
+        return jsonify({
+            'status': 'ok',
+            'llm_provider': LLM_PROVIDER,
+            'ollama_model': OLLAMA_MODEL,
+            'openai_configured': True,
+            'message': f'Agent Chat API running with Ollama ({OLLAMA_MODEL})',
+        })
     api_key_set = bool(os.getenv('OPENAI_API_KEY'))
     return jsonify({
         'status': 'ok',
+        'llm_provider': LLM_PROVIDER,
         'openai_configured': api_key_set,
-        'message': 'Agent Chat API is running' if api_key_set else 'OpenAI API key not configured'
+        'message': 'Agent Chat API is running' if api_key_set else 'OpenAI API key not configured',
     })
 
 
@@ -502,13 +726,10 @@ def agent_chat():
         "run_id": "unique_run_id" (optional, defaults to 'agent_session')
     }
     """
-    # Check if API key is configured
-    if not os.getenv('OPENAI_API_KEY'):
-        return jsonify({
-            'success': False,
-            'error': 'OpenAI API key not configured. Please set OPENAI_API_KEY environment variable.'
-        }), 500
-    
+    creds_err = llm_credentials_error_response()
+    if creds_err is not None:
+        return creds_err
+
     try:
         data = request.json or {}
         user_message = data.get('message', '').strip()
@@ -587,15 +808,15 @@ def agent_chat():
                     }
                 }
             ]
-            model = "gpt-4o"  # Vision-capable model
+            model = select_chat_model(has_image=True)
         else:
             # Text-only
             user_content = user_message
-            model = "gpt-4o-mini"  # Fast and cost-effective
+            model = select_chat_model(has_image=False)
         
         messages.append({"role": "user", "content": user_content})
         
-        # Call OpenAI API
+        # Call LLM API (OpenAI cloud or Ollama-compatible local endpoint)
         response = client.chat.completions.create(
             model=model,
             messages=messages,
@@ -761,9 +982,9 @@ def quick_recommend():
             {"role": "user", "content": user_content}
         ]
         
-        # Call OpenAI API
+        # Call LLM API (OpenAI cloud or Ollama-compatible local endpoint)
         response = client.chat.completions.create(
-            model="gpt-4o",  # Vision-capable model
+            model=select_chat_model(has_image=True),
             messages=messages,
             temperature=0.7,
             max_tokens=1500
@@ -1530,17 +1751,26 @@ if __name__ == '__main__':
     print("=" * 60)
     print("Agent Chat API Server")
     print("=" * 60)
-    
-    # Check OpenAI API key
-    api_key = os.getenv('OPENAI_API_KEY')
-    if api_key:
-        print(f"✅ OpenAI API key configured (length: {len(api_key)})")
+
+    if CONFIG_SOURCE_PATH:
+        print(f"[SEA Agent] Config source: {CONFIG_SOURCE_PATH}")
     else:
-        print("⚠️  OpenAI API key NOT configured!")
-        print("   Set environment variable: export OPENAI_API_KEY='your-key-here'")
-    
+        print("[SEA Agent] Config source: (none — using env vars / defaults only)")
+    print(f"[SEA Agent] LLM Provider: {LLM_PROVIDER}")
+    if LLM_PROVIDER == 'ollama':
+        print(f"[SEA Agent] Ollama Model: {OLLAMA_MODEL}")
+    else:
+        api_key = os.getenv('OPENAI_API_KEY')
+        if api_key:
+            print(f"[SEA Agent] OpenAI API key: configured (length: {len(api_key)})")
+        else:
+            print("[SEA Agent] OpenAI API key: NOT configured")
+            print("   Set OPENAI_API_KEY or add openaiKey to sea-config.json")
+
     print("")
     print("Available endpoints:")
+    print("  GET  /api/agent/config - Get LLM config (masked keys)")
+    print("  POST /api/agent/config - Update LLM config (live reload)")
     print("  GET  /api/agent/health - Health check")
     print("  POST /api/agent/chat - Chat with agent (auto-saves to manifest)")
     print("  POST /api/agent/quick-recommend - Quick preprocessing recommendations")

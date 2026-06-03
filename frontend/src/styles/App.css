@@ -60,6 +60,10 @@ code {
   border-bottom-color: #3498db;
 }
 
+.nav-tab-settings {
+  margin-left: auto;
+}
+
 .tab-content {
   flex: 1 1 0;
   min-height: 0;

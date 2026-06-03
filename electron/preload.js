@@ -83,6 +83,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   /** Open a URL in the system browser (settings page). */
   openExternal: (url) => ipcRenderer.invoke('open-external', url),
 
+  /** Ping localhost Ollama API (settings test button). */
+  testOllamaConnection: () => ipcRenderer.invoke('test-ollama-connection'),
+
   // ── Runtime ──────────────────────────────────────────────────────────────
 
   /**

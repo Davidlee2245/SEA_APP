@@ -18,6 +18,8 @@ const os           = require('os');
 const path       = require('path');
 const fs         = require('fs');
 const net        = require('net');
+const https      = require('https');
+const http       = require('http');
 const { pathToFileURL } = require('url');
 
 // ---------------------------------------------------------------------------
@@ -64,6 +66,385 @@ function saveConfig(config) {
     fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf8');
   } catch (e) {
     console.error('[Config] Failed to save config:', e.message);
+  }
+}
+
+const OLLAMA_API_URL = 'http://127.0.0.1:11434';
+const OLLAMA_DEFAULT_MODEL = 'llava';
+const OLLAMA_LINUX_USER_BIN = path.join(os.homedir(), '.local', 'bin', 'ollama');
+
+let ollamaProcess = null;
+/** Resolved absolute path to ollama binary for spawn() calls. */
+let ollamaBinaryPath = null;
+
+function getLlmDefaults() {
+  return { llmProvider: 'openai', ollamaModel: OLLAMA_DEFAULT_MODEL };
+}
+
+/** Layer LLM provider settings into a child-process environment. */
+function applyLlmEnv(childEnv, config) {
+  const cfg = config || loadConfig() || {};
+  const defaults = getLlmDefaults();
+  childEnv.LLM_PROVIDER = cfg.llmProvider || defaults.llmProvider;
+  childEnv.OLLAMA_MODEL = cfg.ollamaModel || defaults.ollamaModel;
+  if (cfg.openaiKey) childEnv.OPENAI_API_KEY = cfg.openaiKey;
+  if (cfg.anthropicKey) childEnv.ANTHROPIC_API_KEY = cfg.anthropicKey;
+}
+
+function updateSplashStatus(message) {
+  if (!splashWindow || splashWindow.isDestroyed()) return;
+  splashWindow.webContents
+    .executeJavaScript(
+      `(function(){ var p=document.querySelector('p'); if(p) p.textContent=${JSON.stringify(message)}; })();`
+    )
+    .catch(() => {});
+}
+
+function runCommand(cmd, args, options = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, {
+      env: process.env,
+      shell: false,
+      ...options,
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout?.on('data', (d) => { stdout += d.toString(); });
+    child.stderr?.on('data', (d) => { stderr += d.toString(); });
+    child.on('close', (code) => {
+      resolve({ code: code ?? 1, stdout, stderr });
+    });
+    child.on('error', (err) => {
+      resolve({ code: 1, stdout, stderr: err.message });
+    });
+  });
+}
+
+function checkOllamaVersion(binary) {
+  return new Promise((resolve) => {
+    const child = spawn(binary, ['--version'], {
+      env: process.env,
+      shell: false,
+      windowsHide: true,
+    });
+    child.on('error', () => resolve(false));
+    child.on('close', (code) => resolve(code === 0));
+  });
+}
+
+function resolveOllamaBinary(config) {
+  const cfg = config || loadConfig() || {};
+  if (cfg.ollamaBinaryPath && fs.existsSync(cfg.ollamaBinaryPath)) {
+    return cfg.ollamaBinaryPath;
+  }
+  if (fs.existsSync(OLLAMA_LINUX_USER_BIN)) {
+    return OLLAMA_LINUX_USER_BIN;
+  }
+  return 'ollama';
+}
+
+function downloadFile(url, destPath, onProgress) {
+  return new Promise((resolve, reject) => {
+    const follow = (requestUrl) => {
+      const lib = requestUrl.startsWith('https') ? https : http;
+      lib.get(requestUrl, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          res.resume();
+          follow(res.headers.location);
+          return;
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          reject(new Error(`Download failed: HTTP ${res.statusCode}`));
+          return;
+        }
+        const total = parseInt(res.headers['content-length'], 10) || 0;
+        let downloaded = 0;
+        const file = fs.createWriteStream(destPath);
+        res.on('data', (chunk) => {
+          downloaded += chunk.length;
+          if (onProgress && total > 0) onProgress(downloaded / total);
+        });
+        res.pipe(file);
+        file.on('finish', () => {
+          file.close(() => resolve(destPath));
+        });
+        file.on('error', reject);
+      }).on('error', reject);
+    };
+    follow(url);
+  });
+}
+
+function appendPathToBashrcIfNeeded() {
+  const bashrc = path.join(os.homedir(), '.bashrc');
+  const line = 'export PATH="$HOME/.local/bin:$PATH"';
+  try {
+    const existing = fs.existsSync(bashrc) ? fs.readFileSync(bashrc, 'utf8') : '';
+    if (!existing.includes('.local/bin')) {
+      fs.appendFileSync(bashrc, `\n# Added by SEA for Ollama\n${line}\n`);
+    }
+  } catch (e) {
+    console.warn('[Ollama] Could not update ~/.bashrc:', e.message);
+  }
+  const localBin = path.dirname(OLLAMA_LINUX_USER_BIN);
+  if (!process.env.PATH.split(path.delimiter).includes(localBin)) {
+    process.env.PATH = `${localBin}${path.delimiter}${process.env.PATH}`;
+  }
+}
+
+async function installOllamaLinux(statusFn) {
+  statusFn('Installing Ollama (system installer)…');
+  const official = await runCommand('sh', [
+    '-c',
+    'curl -fsSL https://ollama.com/install.sh | sh',
+  ], { shell: false });
+
+  if (official.code === 0) {
+    const binary = resolveOllamaBinary({});
+    if (await checkOllamaVersion(binary)) {
+      return { success: true, binaryPath: binary };
+    }
+  }
+
+  statusFn('System install unavailable — installing to ~/.local/bin…');
+  fs.mkdirSync(path.dirname(OLLAMA_LINUX_USER_BIN), { recursive: true });
+  const dl = await runCommand('curl', [
+    '-L', 'https://ollama.com/download/ollama-linux-amd64',
+    '-o', OLLAMA_LINUX_USER_BIN,
+  ]);
+  if (dl.code !== 0) {
+    return { success: false, message: dl.stderr || 'Failed to download Ollama binary.' };
+  }
+  fs.chmodSync(OLLAMA_LINUX_USER_BIN, 0o755);
+  appendPathToBashrcIfNeeded();
+  return { success: true, binaryPath: OLLAMA_LINUX_USER_BIN };
+}
+
+async function installOllamaWindows(statusFn) {
+  const dest = path.join(os.tmpdir(), 'OllamaSetup.exe');
+  statusFn('Downloading Ollama installer…');
+  try {
+    await downloadFile(
+      'https://ollama.com/download/OllamaSetup.exe',
+      dest,
+      (pct) => statusFn(`Downloading Ollama… ${Math.round(pct * 100)}%`),
+    );
+  } catch (e) {
+    return { success: false, message: e.message };
+  }
+  statusFn('Running Ollama installer (silent)…');
+  const install = spawnSync(dest, ['/S'], {
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 600_000,
+  });
+  if (install.status !== 0) {
+    return {
+      success: false,
+      message: (install.stderr || install.stdout || 'Installer exited with an error.').trim(),
+    };
+  }
+  return { success: true, binaryPath: 'ollama' };
+}
+
+async function installOllamaDarwin(statusFn) {
+  statusFn('Opening Ollama download page…');
+  await shell.openExternal('https://ollama.com/download/Ollama-darwin.dmg');
+  const choice = dialog.showMessageBoxSync({
+    type: 'info',
+    title: 'Install Ollama',
+    message: 'After installing Ollama from the downloaded disk image, click Continue.',
+    buttons: ['Continue', 'Cancel'],
+    defaultId: 0,
+    cancelId: 1,
+  });
+  if (choice !== 0) {
+    return { success: false, message: 'Installation cancelled.' };
+  }
+  const binary = resolveOllamaBinary({});
+  if (!(await checkOllamaVersion(binary))) {
+    return { success: false, message: 'Ollama is still not available. Install it and try again.' };
+  }
+  return { success: true, binaryPath: binary };
+}
+
+async function installOllama(statusFn) {
+  const status = statusFn || (() => {});
+  if (process.platform === 'linux') return installOllamaLinux(status);
+  if (process.platform === 'win32') return installOllamaWindows(status);
+  if (process.platform === 'darwin') return installOllamaDarwin(status);
+  return { success: false, message: `Ollama auto-install is not supported on ${process.platform}.` };
+}
+
+async function isOllamaApiUp() {
+  try {
+    const res = await fetch(`${OLLAMA_API_URL}/api/tags`);
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+function waitForOllamaApi(timeoutMs = 60_000, intervalMs = 500) {
+  const started = Date.now();
+  return new Promise((resolve) => {
+    const tick = async () => {
+      if (await isOllamaApiUp()) {
+        resolve(true);
+        return;
+      }
+      if (Date.now() - started >= timeoutMs) {
+        resolve(false);
+        return;
+      }
+      setTimeout(tick, intervalMs);
+    };
+    tick();
+  });
+}
+
+function startOllamaPull(binary, model) {
+  console.log('[Ollama] Pulling model in background:', model);
+  const pull = spawn(binary, ['pull', model], {
+    env: process.env,
+    shell: false,
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  pull.stdout.on('data', (chunk) => {
+    process.stdout.write('[Ollama pull] ' + chunk.toString());
+  });
+  pull.stderr.on('data', (chunk) => {
+    process.stderr.write('[Ollama pull] ' + chunk.toString());
+  });
+  pull.on('close', (code) => {
+    console.log(`[Ollama] pull ${model} finished with code ${code}`);
+  });
+}
+
+async function ensureOllamaServeRunning(binary, model, statusFn) {
+  const status = statusFn || (() => {});
+  ollamaBinaryPath = binary;
+
+  if (await isOllamaApiUp()) {
+    status('Ollama is running.');
+    startOllamaPull(binary, model);
+    return true;
+  }
+
+  status('Starting Ollama server…');
+  ollamaProcess = spawn(binary, ['serve'], {
+    env: process.env,
+    shell: false,
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  ollamaProcess.stdout?.on('data', (chunk) => {
+    process.stdout.write('[Ollama] ' + chunk.toString());
+  });
+  ollamaProcess.stderr?.on('data', (chunk) => {
+    process.stderr.write('[Ollama] ' + chunk.toString());
+  });
+  ollamaProcess.on('exit', (code, signal) => {
+    console.log(`[Ollama] serve exited — code: ${code}, signal: ${signal}`);
+    ollamaProcess = null;
+  });
+  ollamaProcess.on('error', (err) => {
+    console.warn('[Ollama] serve failed to start:', err.message);
+    ollamaProcess = null;
+  });
+
+  const ready = await waitForOllamaApi(90_000);
+  if (!ready) {
+    console.warn('[Ollama] API did not become ready within timeout.');
+    return false;
+  }
+
+  status(`Ollama ready — downloading model "${model}" if needed…`);
+  startOllamaPull(binary, model);
+  return true;
+}
+
+function fallbackConfigToOpenAI(config, reason) {
+  const next = { ...config, llmProvider: 'openai' };
+  saveConfig(next);
+  dialog.showMessageBoxSync({
+    type: 'warning',
+    title: 'Ollama Unavailable',
+    message: 'Could not use local Ollama — falling back to OpenAI.',
+    detail: reason || 'Install Ollama later from Settings and choose the Ollama provider.',
+    buttons: ['OK'],
+  });
+  return next;
+}
+
+/**
+ * When llmProvider is ollama: detect/install binary, start serve, pull model.
+ * On failure or user skip, switches config to openai.
+ */
+async function ensureOllamaReady(config, statusFn) {
+  const cfg = { ...getLlmDefaults(), ...config };
+  if (cfg.llmProvider !== 'ollama') {
+    return cfg;
+  }
+
+  const status = statusFn || (() => {});
+  const model = cfg.ollamaModel || OLLAMA_DEFAULT_MODEL;
+  let binary = resolveOllamaBinary(cfg);
+
+  if (!(await checkOllamaVersion(binary))) {
+    const install = dialog.showMessageBoxSync({
+      type: 'question',
+      title: 'Install Ollama',
+      message: 'Ollama (local AI) is not installed. Install it now? (~500MB)',
+      buttons: ['Install', 'Skip - Use OpenAI instead'],
+      defaultId: 0,
+      cancelId: 1,
+    });
+    if (install !== 0) {
+      return fallbackConfigToOpenAI(cfg, 'Ollama installation was skipped.');
+    }
+
+    status('Installing Ollama…');
+    const result = await installOllama(status);
+    if (!result.success) {
+      return fallbackConfigToOpenAI(
+        cfg,
+        result.message || 'Ollama installation failed.'
+      );
+    }
+    binary = result.binaryPath;
+    cfg.ollamaBinaryPath = binary;
+    saveConfig(cfg);
+
+    if (!(await checkOllamaVersion(binary))) {
+      return fallbackConfigToOpenAI(cfg, 'Ollama was installed but `ollama --version` still fails.');
+    }
+    status('Ollama installed successfully.');
+  } else {
+    ollamaBinaryPath = binary;
+  }
+
+  const running = await ensureOllamaServeRunning(binary, model, status);
+  if (!running) {
+    return fallbackConfigToOpenAI(cfg, 'Ollama server did not start on localhost:11434.');
+  }
+
+  cfg.ollamaBinaryPath = binary;
+  return cfg;
+}
+
+function killOllama() {
+  if (ollamaProcess && ollamaProcess.pid) {
+    const pid = ollamaProcess.pid;
+    console.log('[Ollama] Terminating tracked serve process PID', pid);
+    terminatePidTree(pid, 'Ollama serve (tracked)');
+    try {
+      ollamaProcess.removeAllListeners?.();
+    } catch (_) {}
+    ollamaProcess = null;
   }
 }
 
@@ -445,11 +826,9 @@ function startPythonBackend(pythonExe, dataRoot, port) {
     console.log('[Backend] Spawning:', pythonExe, scriptPath);
     console.log('[Backend] Port:', port, '| Data root:', dataRoot);
 
-    // Build environment — inherit parent env then layer in API keys from config
     const childEnv = { ...process.env };
     const config   = loadConfig() || {};
-    if (config.openaiKey)    childEnv['OPENAI_API_KEY']    = config.openaiKey;
-    if (config.anthropicKey) childEnv['ANTHROPIC_API_KEY'] = config.anthropicKey;
+    applyLlmEnv(childEnv, config);
 
     pythonProcess = spawn(pythonExe, [
       scriptPath,
@@ -524,8 +903,7 @@ function startAgentBackend(pythonExe, port) {
   const scriptPath = path.join(APP_DIR, 'api_agent_chat.py');
   const childEnv = { ...process.env };
   const config = loadConfig() || {};
-  if (config.openaiKey) childEnv['OPENAI_API_KEY'] = config.openaiKey;
-  if (config.anthropicKey) childEnv['ANTHROPIC_API_KEY'] = config.anthropicKey;
+  applyLlmEnv(childEnv, config);
 
   console.log('[Agent] Spawning:', pythonExe, scriptPath);
   console.log('[Agent] Port:', port);
@@ -778,12 +1156,16 @@ async function launchWithConfig(config) {
   createSplashWindow();
 
   try {
+    updateSplashStatus('Checking local AI (Ollama)…');
+    const resolvedConfig = await ensureOllamaReady(config, updateSplashStatus);
+
     await ensurePreferredBackendPortFree();
     const port     = await findFreePort(BACKEND_PREFERRED_PORT);
-    const dataRoot = config.dataRoot || DEFAULT_DATA_ROOT;
+    const dataRoot = resolvedConfig.dataRoot || DEFAULT_DATA_ROOT;
 
-    await startPythonBackend(config.pythonExe, dataRoot, port);
-    startAgentBackend(config.pythonExe, port + 1);
+    updateSplashStatus('Starting Python backend — this may take up to 90 s on first run…');
+    await startPythonBackend(resolvedConfig.pythonExe, dataRoot, port);
+    startAgentBackend(resolvedConfig.pythonExe, port + 1);
 
     closeSplash();
     isLaunching = false;
@@ -907,6 +1289,21 @@ ipcMain.handle('open-external', async (_event, url) => {
   return true;
 });
 
+/** Ping Ollama HTTP API (settings "Test Connection"). */
+ipcMain.handle('test-ollama-connection', async () => {
+  try {
+    const res = await fetch(`${OLLAMA_API_URL}/api/tags`);
+    if (!res.ok) {
+      return { ok: false, error: `HTTP ${res.status}` };
+    }
+    const data = await res.json();
+    const count = Array.isArray(data.models) ? data.models.length : 0;
+    return { ok: true, modelCount: count };
+  } catch (e) {
+    return { ok: false, error: e.message || String(e) };
+  }
+});
+
 ipcMain.handle('store:get', async (_event, key) => {
   if (typeof key !== 'string' || !key) return null;
   const store = loadStore();
@@ -941,8 +1338,9 @@ app.on('window-all-closed', () => {
   // the splash window may have just closed and the main window isn't open yet.
   if (isLaunching) return;
   if (process.platform !== 'darwin') {
-    console.log('[Backend Lifecycle] window-all-closed (non-macOS): stopping Python backends before quit');
+    console.log('[Backend Lifecycle] window-all-closed (non-macOS): stopping backends before quit');
     killPython();
+    killOllama();
     app.quit();
   }
 });
@@ -974,23 +1372,30 @@ function killPython() {
 }
 
 app.on('before-quit', () => {
-  console.log('[Backend Lifecycle] before-quit: stopping Python backends');
+  console.log('[Backend Lifecycle] before-quit: stopping backends');
   killPython();
+  killOllama();
 });
 
 // Fires on clean quit (Cmd+Q, window close, app.quit())
 app.on('will-quit', () => {
-  console.log('[Backend Lifecycle] will-quit: ensuring Python backends are stopped');
+  console.log('[Backend Lifecycle] will-quit: ensuring backends are stopped');
   killPython();
+  killOllama();
 });
 
 // Belt-and-suspenders: also fires on process.exit() and uncaught crashes
-// so Python doesn't become an orphan if Electron hard-crashes.
-process.on('exit',           killPython);
-process.on('SIGINT',         () => { killPython(); process.exit(0); });
-process.on('SIGTERM',        () => { killPython(); process.exit(0); });
+// so child processes don't become orphans if Electron hard-crashes.
+function killAllChildProcesses() {
+  killPython();
+  killOllama();
+}
+
+process.on('exit',           killAllChildProcesses);
+process.on('SIGINT',         () => { killAllChildProcesses(); process.exit(0); });
+process.on('SIGTERM',        () => { killAllChildProcesses(); process.exit(0); });
 process.on('uncaughtException', (err) => {
   console.error('[Main] Uncaught exception:', err);
-  killPython();
+  killAllChildProcesses();
   process.exit(1);
 });

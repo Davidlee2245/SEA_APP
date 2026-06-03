@@ -5,6 +5,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import '../styles/AgentChat.css';
 import { getAgentBase } from '../lib/apiBase';
+import { getConfig, type LlmProvider } from '../lib/config';
 import { copyText } from '../lib/clipboard';
 
 interface UploadedImage {
@@ -61,6 +62,7 @@ const AgentChat: React.FC = () => {
   const [inputValue, setInputValue] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [apiConfigured, setApiConfigured] = useState<boolean | null>(null);
+  const [llmProvider, setLlmProvider] = useState<LlmProvider>('openai');
   const [uploadedImages, setUploadedImages] = useState<UploadedImage[]>([]);  // Array of uploaded images
   const [runId] = useState<string>('agent_session');  // Default run ID
   const [editingParams, setEditingParams] = useState<{messageIndex: number; params: any} | null>(null);
@@ -79,9 +81,22 @@ const AgentChat: React.FC = () => {
     }
   }, [hasImage, uploadedImages.length, apiConfigured]);
 
-  // Check if OpenAI API is configured on mount
+  // Load LLM provider from config; check backend health
   useEffect(() => {
-    checkApiHealth();
+    let cancelled = false;
+    (async () => {
+      const config = await getConfig();
+      const provider: LlmProvider = config.llmProvider || 'openai';
+      if (cancelled) return;
+      setLlmProvider(provider);
+      if (provider === 'ollama') {
+        setApiConfigured(true);
+      }
+      await checkApiHealth(provider);
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Auto-scroll to bottom when new messages arrive
@@ -89,16 +104,28 @@ const AgentChat: React.FC = () => {
     scrollToBottom();
   }, [messages]);
 
-  const checkApiHealth = async () => {
+  const checkApiHealth = async (provider: LlmProvider = llmProvider) => {
+    if (provider === 'ollama') {
+      setApiConfigured(true);
+    }
     try {
       const response = await fetch(`${getAgentBase()}/api/agent/health`);
       const data = await response.json();
-      setApiConfigured(data.openai_configured);
+      if (provider === 'ollama' || data.llm_provider === 'ollama') {
+        setApiConfigured(true);
+      } else {
+        setApiConfigured(!!data.openai_configured);
+      }
     } catch (err) {
       console.error('Failed to check API health:', err);
-      setApiConfigured(false);
+      if (provider !== 'ollama') {
+        setApiConfigured(false);
+      }
     }
   };
+
+  const isOllamaMode = llmProvider === 'ollama';
+  const showApiKeyWarning = !isOllamaMode && apiConfigured === false;
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -638,10 +665,13 @@ Just type your question or upload an image below! 🚀`,
             {apiConfigured === null && (
               <span className="status-checking">Checking API...</span>
             )}
-            {apiConfigured === true && (
+            {apiConfigured === true && isOllamaMode && (
+              <span className="status-ready">✅ Ollama Ready</span>
+            )}
+            {apiConfigured === true && !isOllamaMode && (
               <span className="status-ready">✅ OpenAI API Ready</span>
             )}
-            {apiConfigured === false && (
+            {showApiKeyWarning && (
               <span className="status-error">⚠️ API Not Configured</span>
             )}
           </div>
@@ -652,8 +682,8 @@ Just type your question or upload an image below! 🚀`,
             onClick={handleQuickRecommend}
             disabled={isLoading || !apiConfigured || !hasImage}
             title={
-              !apiConfigured 
-                ? "OpenAI API not configured. Check server status." 
+              showApiKeyWarning
+                ? "OpenAI API not configured. Check server status."
                 : !hasImage 
                   ? "Upload an image first to use Quick Recommend" 
                   : isLoading
@@ -678,7 +708,7 @@ Just type your question or upload an image below! 🚀`,
         </div>
       </div>
 
-      {!apiConfigured && apiConfigured !== null && (
+      {showApiKeyWarning && (
         <div className="api-warning">
           <h3>⚠️ OpenAI API Not Configured</h3>
           <p>To use the Agent Chat, you need to:</p>
@@ -687,7 +717,7 @@ Just type your question or upload an image below! 🚀`,
               <code>export OPENAI_API_KEY='your-key-here'</code>
             </li>
             <li>Start the agent API server:
-              <code>python api_agent_chat.py</code>
+              <code>python api_agent_chat.py --port 8766</code>
             </li>
             <li>Refresh this page</li>
           </ol>

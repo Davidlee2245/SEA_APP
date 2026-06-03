@@ -99,6 +99,35 @@
       color: #c8e0f8;
     }
 
+    .input-row select {
+      flex: 1;
+      padding: 7px 10px;
+      background: #0d0d1a;
+      border: 1px solid #2a3a4a;
+      border-radius: 4px;
+      color: #c8d8e8;
+      font-size: 12px;
+      outline: none;
+    }
+    .input-row select:focus {
+      border-color: #e94560;
+    }
+
+    .secondary-btn {
+      padding: 7px 14px;
+      background: #1a2a3a;
+      border: 1px solid #2a4a6a;
+      border-radius: 4px;
+      color: #90b8d8;
+      font-size: 12px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .secondary-btn:hover {
+      background: #243848;
+      color: #c8e0f8;
+    }
+
     /* ── Validation message ── */
     .validation {
       font-size: 11px;
@@ -281,6 +310,32 @@
       </div>
     </div>
 
+    <hr class="divider" />
+
+    <div class="field" id="field-llm">
+      <label>LLM Provider</label>
+      <div class="hint">
+        Choose OpenAI (cloud), Anthropic (cloud), or Ollama (local). Ollama runs on your machine at localhost:11434.
+      </div>
+      <div class="input-row">
+        <select id="llmProvider">
+          <option value="openai">OpenAI (cloud)</option>
+          <option value="anthropic">Anthropic (cloud)</option>
+          <option value="ollama">Ollama (local)</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="field" id="field-ollama-model" style="display:none;">
+      <label>Ollama Model</label>
+      <div class="hint">Vision model recommended for image analysis (e.g. llava, llava:13b).</div>
+      <div class="input-row">
+        <input type="text" id="ollamaModel" placeholder="llava" spellcheck="false" />
+        <button type="button" class="secondary-btn" id="testOllamaBtn">Test Connection</button>
+      </div>
+      <div class="validation" id="val-ollama"></div>
+    </div>
+
     </div><!-- #manualFormSections -->
 
   </div>
@@ -311,6 +366,38 @@
     const setupProgressLog     = document.getElementById('setupProgressLog');
     const manualFormSections   = document.getElementById('manualFormSections');
     const condaBanner          = document.getElementById('condaBanner');
+    const llmProviderSelect    = document.getElementById('llmProvider');
+    const ollamaModelField     = document.getElementById('field-ollama-model');
+    const ollamaModelInput     = document.getElementById('ollamaModel');
+    const valOllama            = document.getElementById('val-ollama');
+
+    function updateLlmProviderUi() {
+      const isOllama = llmProviderSelect.value === 'ollama';
+      ollamaModelField.style.display = isOllama ? 'block' : 'none';
+      valOllama.textContent = '';
+      valOllama.className = 'validation';
+    }
+
+    llmProviderSelect.addEventListener('change', updateLlmProviderUi);
+
+    document.getElementById('testOllamaBtn').addEventListener('click', async () => {
+      valOllama.textContent = 'Testing…';
+      valOllama.className = 'validation';
+      try {
+        const result = await api.testOllamaConnection();
+        if (result && result.ok) {
+          const n = result.modelCount != null ? ` (${result.modelCount} model(s))` : '';
+          valOllama.textContent = '✓ Ollama is reachable at localhost:11434' + n;
+          valOllama.className = 'validation ok';
+        } else {
+          valOllama.textContent = '✗ ' + (result.error || 'Could not reach Ollama');
+          valOllama.className = 'validation err';
+        }
+      } catch (e) {
+        valOllama.textContent = '✗ ' + (e.message || String(e));
+        valOllama.className = 'validation err';
+      }
+    });
 
     if (isEditMode) {
       headerTitle.textContent = '🔬 SEA — Settings';
@@ -360,6 +447,9 @@
       if (config.dataRoot)     dataInput.value = config.dataRoot;
       if (config.openaiKey)    document.getElementById('openaiKey').value    = config.openaiKey;
       if (config.anthropicKey) document.getElementById('anthropicKey').value = config.anthropicKey;
+      if (config.llmProvider)  llmProviderSelect.value = config.llmProvider;
+      if (config.ollamaModel)  ollamaModelInput.value = config.ollamaModel;
+      updateLlmProviderUi();
 
       // Update placeholder with resolved default path
       dataInput.placeholder = `Default: ${defaultRoot}`;
@@ -450,6 +540,8 @@
       const dataRoot     = dataInput.value.trim() || null;
       const openaiKey    = document.getElementById('openaiKey').value.trim()    || null;
       const anthropicKey = document.getElementById('anthropicKey').value.trim() || null;
+      const llmProvider  = llmProviderSelect.value || 'openai';
+      const ollamaModel  = ollamaModelInput.value.trim() || 'llava';
 
       if (!pythonExe) return;
 
@@ -459,6 +551,9 @@
       dataInput.disabled   = true;
       document.getElementById('openaiKey').disabled    = true;
       document.getElementById('anthropicKey').disabled = true;
+      llmProviderSelect.disabled = true;
+      ollamaModelInput.disabled = true;
+      document.getElementById('testOllamaBtn').disabled = true;
       document.getElementById('browsePython').disabled = true;
       document.getElementById('browseData').disabled   = true;
 
@@ -469,14 +564,14 @@
 
       try {
         if (isEditMode) {
-          await api.saveSettings({ pythonExe, dataRoot, openaiKey, anthropicKey });
+          await api.saveSettings({ pythonExe, dataRoot, openaiKey, anthropicKey, llmProvider, ollamaModel });
           statusMsg.textContent = '✓ Settings saved. Restart app to apply backend path/data root changes.';
           statusMsg.className = 'status-msg';
           setTimeout(() => window.close(), 350);
           return;
         }
 
-        await api.launchAfterSettings({ pythonExe, dataRoot, openaiKey, anthropicKey });
+        await api.launchAfterSettings({ pythonExe, dataRoot, openaiKey, anthropicKey, llmProvider, ollamaModel });
         // If we reach here the main window opened — settings window closes itself
       } catch (err) {
         statusMsg.textContent = '✗ ' + (err.message || 'Unknown error. Check the console.');
@@ -488,6 +583,9 @@
         dataInput.disabled   = false;
         document.getElementById('openaiKey').disabled    = false;
         document.getElementById('anthropicKey').disabled = false;
+        llmProviderSelect.disabled = false;
+        ollamaModelInput.disabled = false;
+        document.getElementById('testOllamaBtn').disabled = false;
         document.getElementById('browsePython').disabled = false;
         document.getElementById('browseData').disabled   = false;
       }

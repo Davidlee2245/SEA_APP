@@ -285,6 +285,17 @@ npm run dev
 # Open http://localhost:3000
 ```
 
+**Agent Chat (optional third terminal):** The agent API reads LLM settings from `~/.config/sea-exosome-analysis/sea-config.json` (same file Electron uses) — set `llmProvider` / `ollamaModel` / API keys there, or in the in-app **Settings** tab (Electron). Env vars still override the file when set.
+
+```bash
+cd frontend
+npm run server   # agent only on :8766
+# or
+npm run start    # agent + Vite together
+```
+
+Ensure Ollama is running when using `llmProvider: "ollama"`: `ollama serve`
+
 See `QUICKSTART_VISUALIZATION.md` for detailed instructions.
 
 ### Documentation
